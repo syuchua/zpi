@@ -4,19 +4,35 @@
 const std = @import("std");
 const model = @import("model");
 const agent = @import("agent");
+const compaction = @import("compaction");
 
 pub const max_session_bytes = 128 * 1024 * 1024;
 pub const max_record_bytes = 8 * 1024 * 1024;
 
-pub const EntryView = struct { id: []const u8, parent_id: ?[]const u8, message: model.Message };
+pub const CompactionView = struct {
+    summary: []const u8,
+    first_kept_id: ?[]const u8 = null,
+    tokens_before: u64 = 0,
+};
+
+pub const EntryView = struct {
+    id: []const u8,
+    parent_id: ?[]const u8,
+    message: model.Message,
+    compaction: ?CompactionView = null,
+};
+
 const Record = struct {
-    type: enum { session, message, leaf },
+    type: enum { session, message, leaf, compaction },
     version: u32 = 1,
     format: []const u8 = "zpi",
     cwd: ?[]const u8 = null,
     id: ?[]const u8 = null,
     parent_id: ?[]const u8 = null,
     message: ?model.Message = null,
+    summary: ?[]const u8 = null,
+    first_kept_id: ?[]const u8 = null,
+    tokens_before: ?u64 = null,
 };
 
 /// Publish a linear transcript under a new path after all records are written.
@@ -141,6 +157,43 @@ pub const Store = struct {
         self.active_leaf = id;
         return id;
     }
+    pub fn appendCompaction(self: *Store, summary: []const u8, first_kept_id: ?[]const u8, tokens_before: u64) ![]const u8 {
+        if (self.failed) return error.SessionWriteFailed;
+        if (self.next_id == std.math.maxInt(u64)) return error.SessionIdExhausted;
+        if (summary.len == 0 or !std.unicode.utf8ValidateSlice(summary)) return error.InvalidCompactionSummary;
+        if (first_kept_id) |kept| {
+            if (self.find(kept) == null) return error.UnknownSessionEntry;
+        }
+        const a = self.arena.allocator();
+        const id = try std.fmt.allocPrint(a, "{x:0>16}", .{self.next_id});
+        const owned_summary = try a.dupe(u8, summary);
+        const owned_kept = if (first_kept_id) |k| try a.dupe(u8, k) else null;
+        const formatted = try compaction.formatSummaryUserText(a, owned_summary);
+        const content = try a.dupe(model.Content, &.{.{ .text = formatted }});
+        const synthetic = model.Message{ .role = .user, .content = content };
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+        try self.writeRecord(.{
+            .type = .compaction,
+            .version = 1,
+            .id = id,
+            .parent_id = self.active_leaf,
+            .summary = owned_summary,
+            .first_kept_id = owned_kept,
+            .tokens_before = tokens_before,
+        });
+        self.entries.appendAssumeCapacity(.{
+            .id = id,
+            .parent_id = self.active_leaf,
+            .message = synthetic,
+            .compaction = .{ .summary = owned_summary, .first_kept_id = owned_kept, .tokens_before = tokens_before },
+        });
+        self.id_index.putAssumeCapacityNoClobber(id, self.entries.items.len - 1);
+        self.next_id += 1;
+        self.active_leaf = id;
+        return id;
+    }
+
     pub fn branch(self: *Store, target: []const u8) !void {
         const index = self.find(target) orelse return error.UnknownSessionEntry;
         return self.setLeaf(self.entries.items[index].id);
@@ -155,6 +208,49 @@ pub const Store = struct {
     }
     pub fn activePath(self: *const Store, allocator: std.mem.Allocator) ![]EntryView {
         return self.pathFrom(allocator, self.active_leaf);
+    }
+    pub fn projectedActivePath(self: *const Store, allocator: std.mem.Allocator) ![]EntryView {
+        return self.projectedPathFrom(allocator, self.active_leaf);
+    }
+    /// Projects the active branch up to `target`, applying the latest active
+    /// compaction entry while preserving the latest system prompt checkpoint.
+    pub fn projectedPathFrom(self: *const Store, allocator: std.mem.Allocator, target: ?[]const u8) ![]EntryView {
+        const raw = try self.pathFrom(allocator, target);
+        var comp_idx: ?usize = null;
+        for (raw, 0..) |entry, idx| {
+            if (entry.compaction != null) comp_idx = idx;
+        }
+        const cidx = comp_idx orelse return raw;
+        defer allocator.free(raw);
+        const comp = raw[cidx].compaction.?;
+        const first_kept_idx = if (comp.first_kept_id) |kept_id| blk: {
+            if (std.mem.eql(u8, kept_id, raw[cidx].id)) break :blk cidx;
+            var found: ?usize = null;
+            for (raw[0..cidx], 0..) |entry, idx| {
+                if (std.mem.eql(u8, entry.id, kept_id)) {
+                    found = idx;
+                    break;
+                }
+            }
+            break :blk found orelse return error.InvalidCompactionRange;
+        } else cidx;
+
+        var latest_sys: ?usize = null;
+        for (raw[0..cidx], 0..) |entry, idx| {
+            if (entry.message.role == .system) latest_sys = idx;
+        }
+        var out: std.ArrayList(EntryView) = .empty;
+        errdefer out.deinit(allocator);
+        if (latest_sys) |sidx| try out.append(allocator, raw[sidx]);
+        try out.append(allocator, raw[cidx]);
+        for (raw[first_kept_idx..cidx]) |entry| {
+            if (entry.message.role == .system or entry.compaction != null) continue;
+            try out.append(allocator, entry);
+        }
+        for (raw[cidx + 1 ..]) |entry| {
+            try out.append(allocator, entry);
+        }
+        return out.toOwnedSlice(allocator);
     }
     /// Inspect a proposed branch before committing the active-leaf record.
     pub fn pathFrom(self: *const Store, allocator: std.mem.Allocator, target: ?[]const u8) ![]EntryView {
@@ -210,7 +306,7 @@ pub const Store = struct {
             const record = parsed.value;
             if (!std.mem.eql(u8, record.format, "zpi")) return error.UnsupportedSessionVersion;
             switch (record.type) {
-                .session, .leaf => if (record.version != 1) return error.UnsupportedSessionVersion,
+                .session, .leaf, .compaction => if (record.version != 1) return error.UnsupportedSessionVersion,
                 .message => {
                     if (record.version != 1 and record.version != 2) return error.UnsupportedSessionVersion;
                     if (record.message != null and record.message.?.system_prompt_replace != (record.version == 2)) return error.UnsupportedSystemPromptCheckpointVersion;
@@ -236,6 +332,40 @@ pub const Store = struct {
                         .id = try a.dupe(u8, id),
                         .parent_id = if (record.parent_id) |p| try a.dupe(u8, p) else null,
                         .message = restored_message,
+                    };
+                    try self.entries.ensureUnusedCapacity(self.allocator, 1);
+                    try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+                    self.entries.appendAssumeCapacity(entry);
+                    self.id_index.putAssumeCapacityNoClobber(entry.id, self.entries.items.len - 1);
+                    self.active_leaf = entry.id;
+                    self.next_id = @max(self.next_id, number + 1);
+                },
+                .compaction => {
+                    if (!header_seen) return error.MissingSessionHeader;
+                    const id = record.id orelse return error.InvalidSessionEntry;
+                    if (self.find(id) != null) return error.DuplicateSessionEntry;
+                    const number = std.fmt.parseInt(u64, id, 16) catch return error.InvalidSessionEntry;
+                    if (number == std.math.maxInt(u64)) return error.SessionIdExhausted;
+                    if (record.parent_id) |parent| if (self.find(parent) == null) return error.UnknownParentEntry;
+                    const summary = record.summary orelse return error.InvalidSessionEntry;
+                    if (summary.len == 0 or !std.unicode.utf8ValidateSlice(summary)) return error.InvalidSessionEntry;
+                    if (record.first_kept_id) |kept| {
+                        if (!std.mem.eql(u8, kept, id) and self.find(kept) == null) return error.InvalidCompactionRange;
+                    }
+                    const a = self.arena.allocator();
+                    const owned_summary = try a.dupe(u8, summary);
+                    const owned_kept = if (record.first_kept_id) |k| try a.dupe(u8, k) else null;
+                    const formatted = try compaction.formatSummaryUserText(a, owned_summary);
+                    const content = try a.dupe(model.Content, &.{.{ .text = formatted }});
+                    const entry = EntryView{
+                        .id = try a.dupe(u8, id),
+                        .parent_id = if (record.parent_id) |p| try a.dupe(u8, p) else null,
+                        .message = .{ .role = .user, .content = content },
+                        .compaction = .{
+                            .summary = owned_summary,
+                            .first_kept_id = owned_kept,
+                            .tokens_before = record.tokens_before orelse 0,
+                        },
                     };
                     try self.entries.ensureUnusedCapacity(self.allocator, 1);
                     try self.id_index.ensureUnusedCapacity(self.allocator, 1);

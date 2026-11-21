@@ -24,6 +24,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "model", .module = model }},
     });
+    const compaction = b.addModule("compaction", .{
+        .root_source_file = b.path("src/compaction.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "context_budget", .module = context_budget } },
+    });
     const agent = b.addModule("agent", .{
         .root_source_file = b.path("src/agent.zig"),
         .target = target,
@@ -34,7 +40,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/session.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "agent", .module = agent } },
+        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "agent", .module = agent }, .{ .name = "compaction", .module = compaction } },
     });
     const replacements = b.addModule("replacements", .{
         .root_source_file = b.path("src/replacements.zig"),
@@ -137,6 +143,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "replacements", .module = replacements },
             .{ .name = "mcp", .module = mcp },
             .{ .name = "mcp_tools", .module = mcp_tools },
+            .{ .name = "context_budget", .module = context_budget },
+            .{ .name = "compaction", .module = compaction },
         },
     });
     const skills = b.createModule(.{ .root_source_file = b.path("src/cli/skills.zig"), .target = target, .optimize = optimize });
@@ -189,6 +197,7 @@ pub fn build(b: *std.Build) void {
     const http_header_tests = b.addTest(.{ .name = "http-header-tests", .root_module = http_headers });
     const model_tests = b.addTest(.{ .name = "model-tests", .root_module = model });
     const context_budget_tests = b.addTest(.{ .name = "context-budget-tests", .root_module = context_budget });
+    const compaction_tests = b.addTest(.{ .name = "compaction-tests", .root_module = compaction });
     const mcp_tests = b.addTest(.{ .name = "mcp-tests", .root_module = mcp });
     const mcp_tool_tests = b.addTest(.{ .name = "mcp-tool-tests", .root_module = mcp_tools });
     const replacement_tests = b.addTest(.{ .name = "replacement-tests", .root_module = replacements });
@@ -351,6 +360,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(http_header_tests).step);
     test_step.dependOn(&b.addRunArtifact(model_tests).step);
     test_step.dependOn(&b.addRunArtifact(context_budget_tests).step);
+    test_step.dependOn(&b.addRunArtifact(compaction_tests).step);
     test_step.dependOn(&b.addRunArtifact(mcp_tests).step);
     test_step.dependOn(&b.addRunArtifact(mcp_tool_tests).step);
     test_step.dependOn(&b.addRunArtifact(prompt_template_tests).step);
@@ -375,6 +385,7 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(http_header_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(model_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(context_budget_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(compaction_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(mcp_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(mcp_tool_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(prompt_template_tests, .{}).step);

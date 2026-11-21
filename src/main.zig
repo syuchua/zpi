@@ -232,7 +232,7 @@ fn run(init: std.process.Init) !void {
         native_loaded += 1;
         registered_tools = try zpi.native_tools.combine(a, module, registered_tools);
     }
-    const previous = try store.pathFrom(a, options.branch orelse store.active_leaf);
+    const previous = try store.projectedPathFrom(a, options.branch orelse store.active_leaf);
     defer a.free(previous);
     const instructions_update: ?[]const u8 = if (replacement != null or additions.len > 0) blk: {
         var base: []const u8 = system_prompt.default_prompt;
@@ -297,7 +297,25 @@ fn run(init: std.process.Init) !void {
         try runtime.append(.{ .role = .system, .content = &.{.{ .text = system_prompt.default_prompt }} });
         _ = try store.appendMessage(runtime.messages.items[0]);
     }
-    var app = App{ .allocator = init.gpa, .io = init.io, .runtime = &runtime, .store = &store, .mode = options.mode, .extension_host = if (extension_host) |*host| host else null, .interrupt = if (interrupt) |*int| int else null, .skills = discovered_skills, .prompt_templates = discovered_templates };
+    var app = App{
+        .allocator = init.gpa,
+        .io = init.io,
+        .runtime = &runtime,
+        .store = &store,
+        .provider = provider,
+        .tools = enabled_tools,
+        .context_window = selection.context_window,
+        .mode = options.mode,
+        .extension_host = if (extension_host) |*host| host else null,
+        .interrupt = if (interrupt) |*int| int else null,
+        .skills = discovered_skills,
+        .prompt_templates = discovered_templates,
+    };
+    runtime.compaction_hook = .{
+        .context = &app,
+        .before_turn = App.beforeTurnCompactErased,
+        .recover_overflow = App.recoverOverflowErased,
+    };
     if (extension_host) |*host| {
         host.event_context = &app;
         host.on_event = App.extensionEvent;
@@ -322,6 +340,7 @@ fn run(init: std.process.Init) !void {
         }
         const base = try std.mem.join(a, "\n", active.items);
         const indexed = try system_prompt.compose(a, base, &.{skills_prompt});
+        app.skills_system_prompt = indexed;
         try runtime.append(.{ .role = .system, .content = &.{.{ .text = indexed }}, .system_prompt_replace = true });
     }
     if (prompt.len > 0) try app.submit(prompt);
@@ -346,6 +365,7 @@ fn run(init: std.process.Init) !void {
             .allocator = init.gpa,
             .cwd = cwd,
             .commands = slash_commands.items,
+            .compact = App.compactErased,
         });
     }
 }
@@ -355,6 +375,10 @@ const App = struct {
     io: std.Io,
     runtime: *agent.Agent,
     store: *zpi.session.Store,
+    provider: zpi.model.Provider,
+    tools: []const agent.Tool,
+    context_window: u32 = 0,
+    skills_system_prompt: ?[]const u8 = null,
     mode: args_module.OutputMode,
     extension_host: ?*zpi.extensions.Host = null,
     interrupt: ?*zpi.model.Interrupt = null,
@@ -363,6 +387,78 @@ const App = struct {
     fn resetCancelErased(context: *anyopaque) void {
         const self: *App = @ptrCast(@alignCast(context));
         if (self.interrupt) |int| int.reset();
+    }
+    fn compactErased(context: *anyopaque, focus: []const u8) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        const compacted = try self.runCompaction(if (focus.len > 0) focus else null, false, true);
+        if (!compacted and self.mode == .interactive) {
+            try std.Io.File.stderr().writeStreamingAll(self.io, "[nothing to compact]\n");
+        }
+    }
+    fn beforeTurnCompactErased(context: *anyopaque) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        _ = try self.runCompaction(null, true, false);
+    }
+    fn recoverOverflowErased(context: *anyopaque) anyerror!bool {
+        const self: *App = @ptrCast(@alignCast(context));
+        return try self.runCompaction(null, true, true);
+    }
+    fn runCompaction(self: *App, custom_instructions: ?[]const u8, automatic: bool, force: bool) !bool {
+        const defs = try self.allocator.alloc(zpi.model.ToolDefinition, self.tools.len);
+        defer self.allocator.free(defs);
+        for (self.tools, defs) |tool, *def| def.* = tool.definition;
+
+        if (automatic) {
+            if (!try zpi.compaction.shouldCompact(self.allocator, self.runtime.messages.items, defs, self.context_window, .{})) {
+                return false;
+            }
+        }
+
+        const projected = try self.store.projectedActivePath(self.allocator);
+        defer self.allocator.free(projected);
+        if (projected.len == 0) return false;
+
+        const msgs = try self.allocator.alloc(zpi.model.Message, projected.len);
+        defer self.allocator.free(msgs);
+        for (projected, msgs) |entry, *m| m.* = entry.message;
+
+        const keep_recent: u64 = if (self.context_window > 0)
+            @min(@as(u64, 20000), @max(@as(u64, 512), @as(u64, self.context_window) / 3))
+        else
+            20000;
+        const plan = try zpi.compaction.findPlan(self.allocator, msgs, keep_recent, force) orelse return false;
+        if (plan.cut_index <= plan.summarize_start) return false;
+
+        const tokens_before = try zpi.context_budget.estimateInputTokens(self.allocator, self.runtime.messages.items, defs);
+        const summary = try zpi.compaction.summarize(
+            self.allocator,
+            self.provider,
+            msgs[plan.summarize_start..plan.cut_index],
+            plan.previous_summary,
+            custom_instructions,
+        );
+        defer self.allocator.free(summary);
+
+        const first_kept_id: ?[]const u8 = if (plan.cut_index < projected.len) projected[plan.cut_index].id else null;
+        _ = try self.store.appendCompaction(summary, first_kept_id, tokens_before);
+        try self.rebuildRuntimeMessages();
+        try App.emit(self, .{ .compacted = .{
+            .tokens_before = tokens_before,
+            .summary = summary,
+            .first_kept_id = first_kept_id,
+            .automatic = automatic,
+        } });
+        return true;
+    }
+    fn rebuildRuntimeMessages(self: *App) !void {
+        const reprojected = try self.store.projectedActivePath(self.allocator);
+        defer self.allocator.free(reprojected);
+        self.runtime.messages.clearRetainingCapacity();
+        _ = self.runtime.arena.reset(.retain_capacity);
+        for (reprojected) |entry| try self.runtime.append(entry.message);
+        if (self.skills_system_prompt) |indexed| {
+            try self.runtime.append(.{ .role = .system, .content = &.{.{ .text = indexed }}, .system_prompt_replace = true });
+        }
     }
     fn extensionEvent(context: ?*anyopaque, event: std.json.Value) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context.?));
@@ -508,6 +604,29 @@ const App = struct {
                             }
                         }
                     }
+                }
+            },
+            .retry_scheduled => |r| {
+                if (self.mode == .json) {
+                    try self.json(.{ .type = "auto_retry_start", .attempt = r.attempt, .max_attempts = r.max_attempts, .delay_ms = r.delay_ms, .error_code = r.error_code });
+                } else if (self.mode == .interactive) {
+                    var msg: [160]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&msg, "\n[retrying {d}/{d} in {d}ms: {s}]\n", .{ r.attempt, r.max_attempts, r.delay_ms, r.error_code });
+                    try std.Io.File.stderr().writeStreamingAll(self.io, line);
+                }
+            },
+            .retry_finished => |r| {
+                if (self.mode == .json) {
+                    try self.json(.{ .type = "auto_retry_end", .success = r.success, .attempt = r.attempt, .error_code = r.error_code });
+                }
+            },
+            .compacted => |c| {
+                if (self.mode == .json) {
+                    try self.json(.{ .type = "compaction", .tokens_before = c.tokens_before, .first_kept_id = c.first_kept_id, .automatic = c.automatic });
+                } else if (self.mode == .interactive) {
+                    var msg: [160]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&msg, "\n[compacted: {d} tokens before compaction]\n", .{c.tokens_before});
+                    try std.Io.File.stderr().writeStreamingAll(self.io, line);
                 }
             },
             .settled => if (self.mode == .json) {

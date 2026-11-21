@@ -14,18 +14,44 @@ pub const Client = struct {
     proxy_policy: ProxyPolicy = .system,
     cancel: ?model.Cancel = null,
     status: ?std.http.Status = null,
+    retry_after_ms: ?u64 = null,
 
     pub fn provider(self: *Client) model.Provider {
-        return .{ .context = self, .run_fn = runErased };
+        return .{ .context = self, .run_fn = runErased, .retry_info_fn = retryInfoErased };
     }
     fn runErased(context: *anyopaque, allocator: std.mem.Allocator, messages: []const model.Message, tools: []const model.ToolDefinition, sink: model.EventSink) anyerror!void {
         const self: *Client = @ptrCast(@alignCast(context));
         return self.run(allocator, messages, tools, sink);
     }
+    fn retryInfoErased(context: *anyopaque, err: anyerror) ?model.RetryHint {
+        const self: *const Client = @ptrCast(@alignCast(context));
+        return self.retryHint(err);
+    }
+    pub fn retryHint(self: *const Client, err: anyerror) model.RetryHint {
+        return switch (err) {
+            error.HttpRequestFailed => if (self.status) |st| blk: {
+                if (st == .payload_too_large) break :blk .{ .retryable = false, .context_overflow = true };
+                if (http_headers.isRetryableHttpStatus(st)) break :blk .{ .retryable = true, .retry_after_ms = self.retry_after_ms };
+                break :blk .{ .retryable = false };
+            } else .{ .retryable = false },
+            error.RequestTimeout,
+            error.TruncatedStream,
+            error.ResponseReadFailed,
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.ConnectionTimedOut,
+            error.NetworkUnreachable,
+            error.HostUnreachable,
+            error.TemporaryNameServerFailure,
+            => .{ .retryable = true },
+            else => .{ .retryable = false },
+        };
+    }
     pub fn run(self: *Client, allocator: std.mem.Allocator, messages: []const model.Message, tools: []const model.ToolDefinition, sink: model.EventSink) !void {
         if (self.config.timeout_ms <= 0) return error.InvalidTimeout;
         if (self.cancel) |cancel| if (cancel.isCanceled()) return error.Canceled;
         self.status = null;
+        self.retry_after_ms = null;
         var cancel_socket: model.CancelSocket = .{};
         const Completion = union(enum) { request: anyerror!void, timer: std.Io.Cancelable!void, cancel: std.Io.Cancelable!void };
         var results: [3]Completion = undefined;
@@ -110,7 +136,10 @@ pub const Client = struct {
         try req.sendBodyComplete(payload);
         var response = try req.receiveHead(&.{});
         self.status = response.head.status;
-        if (response.head.status != .ok) return error.HttpRequestFailed;
+        if (response.head.status != .ok) {
+            self.retry_after_ms = http_headers.parseRetryAfterMs(response.head);
+            return error.HttpRequestFailed;
+        }
         if (response.head.content_encoding != .identity) return error.UnsupportedContentEncoding;
         const content_type = response.head.content_type orelse return error.InvalidContentType;
         const delimiter = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;

@@ -286,14 +286,26 @@ test "interrupt trigger wakes select and reset clears state for reuse" {
     try std.testing.expect(!token.isCanceled());
 }
 
+pub const RetryHint = struct {
+    retryable: bool,
+    retry_after_ms: ?u64 = null,
+    context_overflow: bool = false,
+};
+
 /// Synchronous function delivering zero or more events into the sink. This is
 /// a push stream, not a returned one-shot chunk. Implementations propagate sink
 /// errors and provider errors without emitting a successful `done`.
 pub const Provider = struct {
     context: *anyopaque,
     run_fn: *const fn (*anyopaque, std.mem.Allocator, []const Message, []const ToolDefinition, EventSink) anyerror!void,
+    retry_info_fn: ?*const fn (*anyopaque, anyerror) ?RetryHint = null,
 
     pub fn run(self: Provider, allocator: std.mem.Allocator, messages: []const Message, tools: []const ToolDefinition, sink: EventSink) !void {
         return self.run_fn(self.context, allocator, messages, tools, sink);
+    }
+
+    pub fn retryHint(self: Provider, err: anyerror) ?RetryHint {
+        const query = self.retry_info_fn orelse return null;
+        return query(self.context, err);
     }
 };

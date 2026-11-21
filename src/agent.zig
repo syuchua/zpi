@@ -19,11 +19,27 @@ pub const Tool = struct {
     context: ?*anyopaque = null,
     execute: *const fn (?*anyopaque, ToolContext, std.json.Value) anyerror!ToolResult,
 };
+pub const RetryPolicy = struct {
+    enabled: bool = true,
+    max_retries: u8 = 3,
+    base_delay_ms: u64 = 1000,
+    max_delay_ms: u64 = 60_000,
+};
+
+pub const CompactionHook = struct {
+    context: *anyopaque,
+    before_turn: ?*const fn (*anyopaque) anyerror!void = null,
+    recover_overflow: ?*const fn (*anyopaque) anyerror!bool = null,
+};
+
 pub const Event = union(enum) {
     provider: model.Event,
     tool_start: model.ToolCall,
     tool_update: struct { call: model.ToolCall, result: ToolResult },
     tool_end: struct { call: model.ToolCall, result: ToolResult },
+    retry_scheduled: struct { attempt: u8, max_attempts: u8, delay_ms: u64, error_code: []const u8 },
+    retry_finished: struct { success: bool, attempt: u8, error_code: ?[]const u8 = null },
+    compacted: struct { tokens_before: u64, summary: []const u8, first_kept_id: ?[]const u8 = null, automatic: bool = false },
     /// A complete message has entered the conversation. The message is
     /// borrowed for this callback; persist or copy it synchronously.
     message_appended: model.Message,
@@ -43,6 +59,8 @@ pub const Agent = struct {
     io: std.Io,
     cwd: []const u8,
     cancel: ?model.Cancel = null,
+    retry: RetryPolicy = .{},
+    compaction_hook: ?CompactionHook = null,
     max_turns: usize = 32,
     running: bool = false,
     /// An interrupted tool batch requires reconciliation before another prompt.
@@ -119,14 +137,39 @@ pub const Agent = struct {
         const definitions = try self.allocator.alloc(model.ToolDefinition, self.tools.len);
         defer self.allocator.free(definitions);
         for (self.tools, definitions) |tool, *definition| definition.* = tool.definition;
+        var overflow_recovered = false;
         for (0..self.max_turns) |_| {
             if (self.cancel) |cancel| if (cancel.isCanceled()) return error.Canceled;
+            if (self.compaction_hook) |hook| {
+                if (hook.before_turn) |prepare| try prepare(hook.context);
+            }
             var turn_arena = std.heap.ArenaAllocator.init(self.allocator);
             defer turn_arena.deinit();
             const turn_alloc = turn_arena.allocator();
             var collected = Collector{ .allocator = turn_alloc, .sink = sink };
-            try self.provider.run(self.allocator, self.messages.items, definitions, .{ .context = &collected, .emit = Collector.emit });
-            const reason = collected.reason orelse return error.MissingProviderCompletion;
+            self.callProviderWithRetry(turn_alloc, definitions, &collected, sink) catch |err| {
+                const hint = self.provider.retryHint(err);
+                if (!overflow_recovered and hint != null and hint.?.context_overflow and self.compaction_hook != null and self.compaction_hook.?.recover_overflow != null) {
+                    if (try self.compaction_hook.?.recover_overflow.?(self.compaction_hook.?.context)) {
+                        overflow_recovered = true;
+                        collected = .{ .allocator = turn_alloc, .sink = sink };
+                        try self.callProviderWithRetry(turn_alloc, definitions, &collected, sink);
+                    } else return err;
+                } else return err;
+            };
+            var reason = collected.reason orelse return error.MissingProviderCompletion;
+            if (reason == .length and collected.text.items.len == 0 and collected.calls.items.len == 0 and !overflow_recovered) {
+                if (self.compaction_hook) |hook| {
+                    if (hook.recover_overflow) |recover| {
+                        if (try recover(hook.context)) {
+                            overflow_recovered = true;
+                            collected = .{ .allocator = turn_alloc, .sink = sink };
+                            try self.callProviderWithRetry(turn_alloc, definitions, &collected, sink);
+                            reason = collected.reason orelse return error.MissingProviderCompletion;
+                        }
+                    }
+                }
+            }
             if (reason == .aborted) return error.Canceled;
             if (reason == .error_response) return error.ProviderFailed;
             if (reason == .deferred) return error.DeferredResponseUnsupported;
@@ -161,6 +204,82 @@ pub const Agent = struct {
             self.unresolved_tools = false;
         }
         return error.TurnLimitExceeded;
+    }
+
+    fn callProviderWithRetry(self: *Agent, turn_alloc: std.mem.Allocator, definitions: []const model.ToolDefinition, collected: *Collector, sink: Sink) !void {
+        var attempt: u8 = 0;
+        while (true) {
+            if (self.cancel) |cancel| if (cancel.isCanceled()) {
+                if (attempt > 0) sink.emit(sink.context, .{ .retry_finished = .{ .success = false, .attempt = attempt, .error_code = "Canceled" } }) catch {};
+                return error.Canceled;
+            };
+            self.provider.run(self.allocator, self.messages.items, definitions, .{ .context = collected, .emit = Collector.emit }) catch |err| {
+                if (err == error.Canceled or err == error.OutOfMemory) {
+                    if (attempt > 0) sink.emit(sink.context, .{ .retry_finished = .{ .success = false, .attempt = attempt, .error_code = @errorName(err) } }) catch {};
+                    return err;
+                }
+                const hint = self.provider.retryHint(err);
+                const can_retry = self.retry.enabled and
+                    attempt < self.retry.max_retries and
+                    collected.text.items.len == 0 and
+                    collected.calls.items.len == 0 and
+                    (hint != null and hint.?.retryable);
+                if (!can_retry) {
+                    if (attempt > 0) sink.emit(sink.context, .{ .retry_finished = .{ .success = false, .attempt = attempt, .error_code = @errorName(err) } }) catch {};
+                    return err;
+                }
+                const shift: u6 = @intCast(@min(attempt, 30));
+                const exp_delay = std.math.mul(u64, self.retry.base_delay_ms, @as(u64, 1) << shift) catch self.retry.max_delay_ms;
+                const delay_ms = @min(self.retry.max_delay_ms, @max(hint.?.retry_after_ms orelse 0, exp_delay));
+                attempt += 1;
+                try sink.emit(sink.context, .{ .retry_scheduled = .{
+                    .attempt = attempt,
+                    .max_attempts = self.retry.max_retries,
+                    .delay_ms = delay_ms,
+                    .error_code = @errorName(err),
+                } });
+                sleepCancellable(self.io, delay_ms, self.cancel) catch |sleep_err| {
+                    sink.emit(sink.context, .{ .retry_finished = .{ .success = false, .attempt = attempt, .error_code = @errorName(sleep_err) } }) catch {};
+                    return sleep_err;
+                };
+                collected.* = .{ .allocator = turn_alloc, .sink = sink };
+                continue;
+            };
+            if (attempt > 0) {
+                try sink.emit(sink.context, .{ .retry_finished = .{ .success = true, .attempt = attempt } });
+            }
+            return;
+        }
+    }
+
+    fn sleepCancellable(io: std.Io, delay_ms: u64, cancel_opt: ?model.Cancel) !void {
+        if (delay_ms == 0) return;
+        const cancel = cancel_opt orelse {
+            io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake) catch return error.Canceled;
+            return;
+        };
+        if (cancel.isCanceled()) return error.Canceled;
+        const Completion = union(enum) { timer: std.Io.Cancelable!void, cancel: std.Io.Cancelable!void };
+        var storage: [2]Completion = undefined;
+        var select = std.Io.Select(Completion).init(io, &storage);
+        defer select.cancelDiscard();
+        try select.concurrent(.timer, waitDelay, .{ io, delay_ms });
+        try select.concurrent(.cancel, waitCancel, .{ cancel, io });
+        switch (try select.await()) {
+            .timer => |res| try res,
+            .cancel => |res| {
+                try res;
+                return error.Canceled;
+            },
+        }
+    }
+
+    fn waitDelay(io: std.Io, delay_ms: u64) std.Io.Cancelable!void {
+        try io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake);
+    }
+
+    fn waitCancel(cancel: model.Cancel, io: std.Io) std.Io.Cancelable!void {
+        try cancel.wait(io);
     }
     fn notifyCommit(self: *Agent, sink: Sink) !void {
         sink.emit(sink.context, .{ .message_appended = self.messages.items[self.messages.items.len - 1] }) catch |err| {

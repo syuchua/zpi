@@ -240,3 +240,45 @@ test "jsonl session reloads messages" {
     try std.testing.expectEqual(@as(usize, 1), active.len);
     try std.testing.expectEqualStrings("hello", active[0].message.content[0].text);
 }
+
+test "compaction entries persist project kept span preserve system prompt and keep raw branch intact" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/compacted.jsonl", .{&tmp.sub_path});
+    defer a.free(path);
+
+    var store = try session.Store.create(a, std.testing.io, path, "/workspace");
+    _ = try store.appendMessage(.{ .role = .system, .content = &.{.{ .text = "sys-v1" }} });
+    const user1 = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "old question" }} });
+    const asst1 = try store.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "old answer" }} });
+    const a1_owned = try a.dupe(u8, asst1);
+    defer a.free(a1_owned);
+    _ = user1;
+    const user2 = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "kept question" }} });
+    const u2_owned = try a.dupe(u8, user2);
+    defer a.free(u2_owned);
+    _ = try store.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "kept answer" }} });
+    _ = try store.appendCompaction("## Goal\nKeep going", u2_owned, 5000);
+    _ = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "follow up" }} });
+    store.deinit();
+
+    var reopened = try session.Store.open(a, std.testing.io, path);
+    defer reopened.deinit();
+    const projected = try reopened.projectedActivePath(a);
+    defer a.free(projected);
+    try std.testing.expectEqual(@as(usize, 5), projected.len);
+    try std.testing.expectEqual(model.Role.system, projected[0].message.role);
+    try std.testing.expectEqualStrings("sys-v1", projected[0].message.content[0].text);
+    try std.testing.expect(projected[1].compaction != null);
+    try std.testing.expect(std.mem.indexOf(u8, projected[1].message.content[0].text, "## Goal\nKeep going") != null);
+    try std.testing.expectEqualStrings("kept question", projected[2].message.content[0].text);
+    try std.testing.expectEqualStrings("kept answer", projected[3].message.content[0].text);
+    try std.testing.expectEqualStrings("follow up", projected[4].message.content[0].text);
+
+    // Branching to an entry before compaction still sees the raw uncompacted history.
+    const pre_branch = try reopened.projectedPathFrom(a, a1_owned);
+    defer a.free(pre_branch);
+    try std.testing.expectEqual(@as(usize, 3), pre_branch.len);
+    try std.testing.expectEqualStrings("old answer", pre_branch[2].message.content[0].text);
+}

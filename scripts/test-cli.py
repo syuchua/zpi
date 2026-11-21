@@ -52,6 +52,49 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['stream'] is True
+            if self.path == '/auto-compact/chat/completions':
+                messages = request['messages']
+                user = [m['content'] for m in messages if m['role'] == 'user'][-1]
+                if user.startswith('<conversation>\n'):
+                    assert 'auto-compact-1:' in user, user
+                    response = self.text('## Goal\nAuto compacted summary')
+                elif user.startswith('auto-compact-1:'):
+                    response = self.text('auto 1 ok')
+                elif user.startswith('auto-compact-2:'):
+                    response = self.text('auto 2 ok')
+                elif user.startswith('auto-compact-3:'):
+                    assert any('<summary>\n## Goal\nAuto compacted summary\n</summary>' in m['content']
+                               for m in messages if m['role'] == 'user'), messages
+                    response = self.text('auto compact ok')
+                else:
+                    raise AssertionError(f'Unexpected auto-compact prompt: {user[:80]}')
+                data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if self.path == '/retry-fixture/chat/completions':
+                self.server.retry_request_count += 1
+                if self.server.retry_request_count == 1:
+                    self.send_response(429)
+                    self.send_header('Retry-After', '2')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                if self.server.retry_request_count == 2:
+                    self.send_response(503)
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                data = ('data: ' + json.dumps(self.text('retry recovered')) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/unexpected-redirect':
                 raise AssertionError('Provider request followed a redirect')
             if self.path in ('/error-fixture/chat/completions', '/error-fixture/v1/messages',
@@ -258,6 +301,22 @@ class Handler(BaseHTTPRequestHandler):
                 response = self.text('bash recovered')
             elif user == 'cancel-prompt-ok':
                 response = self.text('prompt recovered')
+            elif user.startswith('<conversation>\n'):
+                if 'Additional focus: keep api notes' in user:
+                    assert 'compact-turn-1' in user and 'compact-turn-2' in user, user
+                    response = self.text('## Goal\nCompacted summary')
+                else:
+                    response = self.text('## Goal\nAuto compacted summary')
+            elif user in ('compact-turn-1', 'compact-turn-2'):
+                response = self.text(f'{user} ok')
+            elif user == 'after-compact':
+                assert len(messages) == 3, messages
+                assert '<summary>\n## Goal\nCompacted summary\n</summary>' in messages[1]['content'], messages
+                response = self.text('after compact ok')
+            elif user == 'after-compact-reload':
+                assert len(messages) == 5, messages
+                assert '<summary>\n## Goal\nCompacted summary\n</summary>' in messages[1]['content'], messages
+                response = self.text('after compact reload ok')
             elif user == 'hello zig world':
                 response = self.text('editor-left-ok')
             elif user == 're: hello zig world':
@@ -875,6 +934,93 @@ def terminal_editor_check(common, environment, root):
             process.wait(timeout=5)
 
 
+def terminal_compact_check(common, environment, root):
+    compact_session = root / 'compact-session.jsonl'
+    args = common.copy()
+    args[-1] = str(compact_session)
+    master, slave = pty.openpty()
+    before = termios.tcgetattr(slave)
+    process = subprocess.Popen(cli_command(args), stdin=slave, stdout=slave, stderr=slave,
+                               env=environment, close_fds=True)
+    os.close(slave)
+    transcript = bytearray()
+
+    def read_until(marker, start=0):
+        deadline = time.monotonic() + 10
+        while transcript.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('terminal compact timed out', marker, bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('terminal exited early', marker, bytes(transcript))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+        return transcript.find(marker, start)
+
+    def read_prompt(start=0):
+        deadline = time.monotonic() + 10
+        while True:
+            for marker in (b'>\x1b[0m ', b'> '):
+                pos = transcript.find(marker, start)
+                if pos != -1:
+                    return pos + len(marker)
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('terminal compact prompt timed out', bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('terminal exited early', bytes(transcript[start:]))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+
+    try:
+        p = read_prompt(read_until(b'Ctrl-D exits'))
+        os.write(master, b'compact-turn-1\n')
+        p = read_prompt(read_until(b'compact-turn-1 ok', p))
+        os.write(master, b'compact-turn-2\n')
+        p = read_prompt(read_until(b'compact-turn-2 ok', p))
+        os.write(master, b'/compact keep api notes\n')
+        p = read_prompt(read_until(b'[compacted:', p))
+        os.write(master, b'after-compact\n')
+        p = read_prompt(read_until(b'after compact ok', p))
+        os.write(master, b'/exit\n')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+        after = termios.tcgetattr(master)
+        pendin = getattr(termios, 'PENDIN', 0)
+        assert (after[:3], after[3] & ~pendin, after[4:]) == (before[:3], before[3] & ~pendin, before[4:])
+    finally:
+        if master != -1:
+            os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    reloaded = run_repo_cli(args + ['-p', 'after-compact-reload'], input='', text=True,
+                            capture_output=True, env=environment, timeout=20)
+    assert reloaded.returncode == 0 and reloaded.stdout == 'after compact reload ok\n', reloaded.stderr
+
+
 def check_pi_import(root, resume_args, environment, server):
     project = root / 'pi-import-project'
     project.mkdir()
@@ -1112,6 +1258,7 @@ def main():
     server.expected_budget = 0
     server.expected_budget_path = ''
     server.failure_request_count = 0
+    server.retry_request_count = 0
     server.cancel_stream_release = threading.Event()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1177,6 +1324,29 @@ def main():
                 assert server.failure_request_count == before_failure_count + 1
                 if route == 'redirect-fixture':
                     assert all('Unexpected provider GET:' not in error for error in server.failures), server.failures
+            retry_config = root / 'retry.json'
+            retry_config.write_text(json.dumps({'providers': {'retry-fixture': {
+                'api': 'openai-completions',
+                'baseUrl': f'http://127.0.0.1:{server.server_port}/retry-fixture',
+                'apiKey': 'retry-key',
+                'models': [{'id': 'fixture-model'}],
+            }}}))
+            retry_session = root / 'retry-session.jsonl'
+            retried = run_repo_cli([
+                str(BINARY), '--no-proxy', '--models-file', str(retry_config),
+                '--provider', 'retry-fixture', '--session', str(retry_session),
+                '--no-tools', '--mode', 'json', 'Trigger retry',
+            ], input='', text=True, capture_output=True, env=environment, timeout=20)
+            assert retried.returncode == 0, (retried.stderr, retried.stdout)
+            retry_events = [json.loads(line) for line in retried.stdout.splitlines()]
+            assert [e.get('attempt') for e in retry_events if e.get('type') == 'auto_retry_start'] == [1, 2], retry_events
+            assert [e.get('delay_ms') for e in retry_events if e.get('type') == 'auto_retry_start'] == [2000, 2000], retry_events
+            assert any(e.get('type') == 'auto_retry_end' and e.get('success') is True and e.get('attempt') == 2
+                       for e in retry_events), retry_events
+            assert any(e.get('type') == 'message_end' and
+                       e.get('message', {}).get('content') == [{'text': 'retry recovered'}]
+                       for e in retry_events), retry_events
+            assert server.retry_request_count == 3
             route_config = root / 'routes.json'
             route_providers = {
                 name: {'baseUrl': f'http://127.0.0.1:{server.server_port}/route/{index}',
@@ -1920,6 +2090,32 @@ for line in sys.stdin:
             terminal_check(common, environment, session, expected_results)
             terminal_cancel_check(common, environment, root, server)
             terminal_editor_check(common, environment, root)
+            terminal_compact_check(common, environment, root)
+            auto_compact_config = root / 'auto-compact.json'
+            auto_compact_config.write_text(json.dumps({'providers': {'fixture': {
+                'api': 'openai-completions',
+                'baseUrl': f'http://127.0.0.1:{server.server_port}/auto-compact',
+                'apiKey': 'fake-key',
+                'models': [{'id': 'compact-model', 'contextWindow': 22000, 'maxTokens': 1024}],
+            }}}))
+            auto_compact_session = root / 'auto-compact.jsonl'
+            auto_args = [str(BINARY), '--no-proxy', '--models-file', str(auto_compact_config),
+                         '--provider', 'fixture', '--model', 'compact-model',
+                         '--cwd', directory, '--session', str(auto_compact_session)]
+            first_auto = run_repo_cli(auto_args + ['-p', 'auto-compact-1:' + ('x' * 10000)],
+                                      input='', text=True, capture_output=True, env=environment, timeout=20)
+            assert first_auto.returncode == 0 and first_auto.stdout == 'auto 1 ok\n', first_auto.stderr
+            second_auto = run_repo_cli(auto_args + ['-p', 'auto-compact-2:' + ('y' * 10000)],
+                                       input='', text=True, capture_output=True, env=environment, timeout=20)
+            assert second_auto.returncode == 0 and second_auto.stdout == 'auto 2 ok\n', second_auto.stderr
+            third_auto = run_repo_cli(auto_args + ['--mode', 'json', 'auto-compact-3:' + ('z' * 20000)],
+                                      input='', text=True, capture_output=True, env=environment, timeout=20)
+            assert third_auto.returncode == 0, (third_auto.stderr, third_auto.stdout)
+            auto_events = [json.loads(line) for line in third_auto.stdout.splitlines()]
+            assert any(e.get('type') == 'compaction' and e.get('automatic') is True for e in auto_events), auto_events
+            assert any(e.get('type') == 'message_end' and
+                       e.get('message', {}).get('content') == [{'text': 'auto compact ok'}]
+                       for e in auto_events), auto_events
             spill_session = root / 'bash-spill.jsonl'
             spill_env = dict(environment, TMPDIR=str(root))
             spill_run = run_repo_cli(common[:-1] + [str(spill_session), '--mode', 'json', 'bash-spill'],

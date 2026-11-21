@@ -278,3 +278,108 @@ test "agent cancellation between tools stops remaining calls and reconciles unkn
     try std.testing.expectEqualStrings("c2", runtime.messages.items[3].tool_call_id.?);
     try std.testing.expect(runtime.messages.items[3].is_error);
 }
+
+test "agent retries transient errors with backoff respects partial-output safety and cancels during sleep" {
+    const RetryFake = struct {
+        attempts: usize = 0,
+        fail_count: usize = 2,
+        emit_partial_before_fail: bool = false,
+        retryable: bool = true,
+        retry_after_ms: ?u64 = 15,
+
+        fn run(context: *anyopaque, _: std.mem.Allocator, _: []const model.Message, _: []const model.ToolDefinition, sink: model.EventSink) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.attempts += 1;
+            if (self.attempts <= self.fail_count) {
+                if (self.emit_partial_before_fail) {
+                    try sink.emit(sink.context, .start);
+                    try sink.emit(sink.context, .{ .text_delta = "partial" });
+                }
+                return error.HttpRequestFailed;
+            }
+            try sink.emit(sink.context, .start);
+            try sink.emit(sink.context, .{ .text_delta = "ok" });
+            try sink.emit(sink.context, .{ .done = .stop });
+        }
+
+        fn hint(context: *anyopaque, err: anyerror) ?model.RetryHint {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (err == error.HttpRequestFailed) return .{ .retryable = self.retryable, .retry_after_ms = self.retry_after_ms };
+            return null;
+        }
+    };
+    const RetryCapture = struct {
+        scheduled: usize = 0,
+        finished_ok: usize = 0,
+        finished_fail: usize = 0,
+        last_delay: u64 = 0,
+
+        fn emit(context: *anyopaque, event: agent.Event) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            switch (event) {
+                .retry_scheduled => |r| {
+                    self.scheduled += 1;
+                    self.last_delay = r.delay_ms;
+                },
+                .retry_finished => |r| {
+                    if (r.success) self.finished_ok += 1 else self.finished_fail += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    // 1. Retries transient failures and succeeds on attempt 3.
+    var fake = RetryFake{};
+    var runtime = agent.Agent.init(std.testing.allocator, std.testing.io, .{ .context = &fake, .run_fn = RetryFake.run, .retry_info_fn = RetryFake.hint }, &.{}, "/tmp");
+    defer runtime.deinit();
+    runtime.retry = .{ .enabled = true, .max_retries = 3, .base_delay_ms = 5, .max_delay_ms = 100 };
+    var cap = RetryCapture{};
+    try runtime.prompt("retry-ok", .{ .context = &cap, .emit = RetryCapture.emit });
+    try std.testing.expectEqual(@as(usize, 3), fake.attempts);
+    try std.testing.expectEqual(@as(usize, 2), cap.scheduled);
+    try std.testing.expectEqual(@as(usize, 1), cap.finished_ok);
+    try std.testing.expectEqual(@as(u64, 15), cap.last_delay);
+
+    // 2. Non-retryable error fails fast without sleeping.
+    var non_retry = RetryFake{ .retryable = false, .fail_count = 5 };
+    var rt2 = agent.Agent.init(std.testing.allocator, std.testing.io, .{ .context = &non_retry, .run_fn = RetryFake.run, .retry_info_fn = RetryFake.hint }, &.{}, "/tmp");
+    defer rt2.deinit();
+    var cap2 = RetryCapture{};
+    try std.testing.expectError(error.HttpRequestFailed, rt2.prompt("fail-fast", .{ .context = &cap2, .emit = RetryCapture.emit }));
+    try std.testing.expectEqual(@as(usize, 1), non_retry.attempts);
+    try std.testing.expectEqual(@as(usize, 0), cap2.scheduled);
+
+    // 3. Partial output streamed before failure is never retried (avoids duplicate tokens).
+    var partial = RetryFake{ .emit_partial_before_fail = true, .fail_count = 5 };
+    var rt3 = agent.Agent.init(std.testing.allocator, std.testing.io, .{ .context = &partial, .run_fn = RetryFake.run, .retry_info_fn = RetryFake.hint }, &.{}, "/tmp");
+    defer rt3.deinit();
+    var cap3 = RetryCapture{};
+    try std.testing.expectError(error.HttpRequestFailed, rt3.prompt("partial-fail", .{ .context = &cap3, .emit = RetryCapture.emit }));
+    try std.testing.expectEqual(@as(usize, 1), partial.attempts);
+    try std.testing.expectEqual(@as(usize, 0), cap3.scheduled);
+
+    // 4. Cancellation interrupts retry backoff immediately.
+    var interrupt = try model.Interrupt.init();
+    defer interrupt.deinit(std.testing.io);
+    const Trigger = struct {
+        target: *model.Interrupt,
+        fn run(self: *@This(), io: std.Io) std.Io.Cancelable!void {
+            try io.sleep(.fromMilliseconds(40), .awake);
+            self.target.trigger();
+        }
+    };
+    var trig = Trigger{ .target = &interrupt };
+    var trig_task = try std.Io.concurrent(std.testing.io, Trigger.run, .{ &trig, std.testing.io });
+    defer _ = trig_task.cancel(std.testing.io) catch {};
+    var sleeping = RetryFake{ .fail_count = 5, .retry_after_ms = 5000 };
+    var rt4 = agent.Agent.init(std.testing.allocator, std.testing.io, .{ .context = &sleeping, .run_fn = RetryFake.run, .retry_info_fn = RetryFake.hint }, &.{}, "/tmp");
+    defer rt4.deinit();
+    rt4.cancel = interrupt.cancel();
+    rt4.retry = .{ .enabled = true, .max_retries = 3, .base_delay_ms = 5000, .max_delay_ms = 10_000 };
+    var cap4 = RetryCapture{};
+    try std.testing.expectError(error.Canceled, rt4.prompt("cancel-sleep", .{ .context = &cap4, .emit = RetryCapture.emit }));
+    try trig_task.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 1), cap4.scheduled);
+    try std.testing.expectEqual(@as(usize, 1), cap4.finished_fail);
+}

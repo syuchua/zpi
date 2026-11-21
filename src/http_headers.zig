@@ -55,6 +55,34 @@ pub fn get(headers: []const std.http.Header, name: []const u8) ?[]const u8 {
     return null;
 }
 
+pub fn parseRetryAfterMs(head: std.http.Client.Response.Head) ?u64 {
+    var it = head.iterateHeaders();
+    while (it.next()) |header| {
+        if (it.is_trailer) continue;
+        const trimmed = std.mem.trim(u8, header.value, " \t\r");
+        if (trimmed.len == 0 or trimmed.len > 16) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "retry-after-ms")) {
+            const ms = std.fmt.parseInt(u64, trimmed, 10) catch continue;
+            return @min(ms, 60_000);
+        }
+        if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+            const secs = std.fmt.parseInt(u64, trimmed, 10) catch continue;
+            return @as(u64, @min(secs, 60)) * 1000;
+        }
+    }
+    return null;
+}
+
+pub fn isRetryableHttpStatus(status: std.http.Status) bool {
+    const code = @backingInt(status);
+    return status == .too_many_requests or
+        status == .internal_server_error or
+        status == .bad_gateway or
+        status == .service_unavailable or
+        status == .gateway_timeout or
+        (code >= 520 and code <= 529);
+}
+
 test "header validation rejects malformed and reserved request fields" {
     try validate(.{ .name = "x-fixture", .value = "ok" });
     try validate(.{ .name = "x-fixture", .value = "tab\tvalue" });
@@ -104,4 +132,24 @@ test "header merge replaces names case-insensitively in place" {
     try std.testing.expectEqualStrings("four", merged[2].value);
     try std.testing.expectEqualStrings("three", get(merged, "x-a").?);
     try std.testing.expectEqualStrings("four", get(merged, "X-C").?);
+}
+
+test "retry helpers parse bounded Retry-After headers and retryable statuses" {
+    const raw = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\n\r\n";
+    var head = try std.http.Client.Response.Head.parse(raw);
+    try std.testing.expectEqual(@as(?u64, 3000), parseRetryAfterMs(head));
+    try std.testing.expect(isRetryableHttpStatus(head.status));
+
+    const clamped = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 999\r\n\r\n";
+    head = try std.http.Client.Response.Head.parse(clamped);
+    try std.testing.expectEqual(@as(?u64, 60_000), parseRetryAfterMs(head));
+    try std.testing.expect(isRetryableHttpStatus(head.status));
+
+    const ms_hdr = "HTTP/1.1 429 Too Many Requests\r\nRetry-After-Ms: 250\r\n\r\n";
+    head = try std.http.Client.Response.Head.parse(ms_hdr);
+    try std.testing.expectEqual(@as(?u64, 250), parseRetryAfterMs(head));
+
+    try std.testing.expect(!isRetryableHttpStatus(.unauthorized));
+    try std.testing.expect(!isRetryableHttpStatus(.bad_request));
+    try std.testing.expect(isRetryableHttpStatus(@fromBackingInt(@intCast(524))));
 }
