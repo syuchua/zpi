@@ -258,6 +258,38 @@ class Handler(BaseHTTPRequestHandler):
                 response = self.text('bash recovered')
             elif user == 'cancel-prompt-ok':
                 response = self.text('prompt recovered')
+            elif user == 'hello zig world':
+                response = self.text('editor-left-ok')
+            elif user == 're: hello zig world':
+                response = self.text('editor-history-ok')
+            elif user == 'line1\nline2':
+                response = self.text('editor-paste-ok')
+            elif user == '@tab-target.txt':
+                response = self.text('editor-at-ok')
+            elif user == 'edit-preview':
+                results = [m for m in messages if m['role'] == 'tool']
+                if not results:
+                    response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'preview-edit', 'type': 'function',
+                        'function': {'name': 'edit', 'arguments': json.dumps({
+                            'path': 'preview.txt', 'oldText': 'beta', 'newText': 'BETA',
+                        })},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+                else:
+                    response = self.text('preview complete')
+            elif user == 'bash-spill':
+                results = [m for m in messages if m['role'] == 'tool']
+                if not results:
+                    response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'spill-bash', 'type': 'function',
+                        'function': {'name': 'bash', 'arguments': json.dumps({
+                            'command': 'i=1; while [ $i -le 2005 ]; do echo B$i; i=$((i+1)); done',
+                            'timeout': 10,
+                        })},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+                else:
+                    assert '[Showing lines 6-2005 of 2005. Full output: ' in results[0]['content'], results[0]
+                    response = self.text('bash spill complete')
             elif user == 'filtered-completion':
                 assert not any(m['role'] == 'tool' for m in messages), messages
                 response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
@@ -590,7 +622,11 @@ def terminal_check(common, environment, session, tool_count):
         read_until(b'resumed correctly')
         os.write(master, b'/exit\n')
         assert process.wait(timeout=5) == 0, bytes(transcript)
-        assert __import__('termios').tcgetattr(slave) == before, 'terminal settings changed'
+        after = termios.tcgetattr(slave)
+        pendin = getattr(termios, 'PENDIN', 0)
+        assert (after[:3], after[3] & ~pendin, after[4:]) == (before[:3], before[3] & ~pendin, before[4:]), (
+            'terminal settings changed', before, after
+        )
         assert b'\x1b[?1049h' not in transcript, 'regular UI switched screen'
     finally:
         if process.poll() is None:
@@ -724,6 +760,114 @@ def terminal_cancel_check(common, environment, root, server):
         assert 'Interrupted tool call: execution outcome is unknown' in reconciled[0]['content'][0]['text']
     finally:
         server.cancel_stream_release.set()
+        if master != -1:
+            os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def terminal_editor_check(common, environment, root):
+    (root / 'tab-target.txt').write_text('target\n')
+    (root / 'preview.txt').write_text('alpha\nbeta\ngamma\n')
+    editor_session = root / 'editor-session.jsonl'
+    args = common.copy()
+    args[-1] = str(editor_session)
+    master, slave = pty.openpty()
+    before = termios.tcgetattr(slave)
+    process = subprocess.Popen(cli_command(args), stdin=slave, stdout=slave, stderr=slave,
+                               env=environment, close_fds=True)
+    os.close(slave)
+    transcript = bytearray()
+
+    def read_until(marker, start=0):
+        deadline = time.monotonic() + 10
+        while transcript.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('terminal editor timed out', marker, bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('terminal exited early', marker, bytes(transcript))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+        return transcript.find(marker, start)
+
+    def read_prompt(start=0):
+        deadline = time.monotonic() + 10
+        while True:
+            for marker in (b'>\x1b[0m ', b'> '):
+                pos = transcript.find(marker, start)
+                if pos != -1:
+                    return pos + len(marker)
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('terminal editor prompt timed out', bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('terminal exited early', bytes(transcript[start:]))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+
+    try:
+        read_until(b'Ctrl-D exits')
+        p = read_prompt()
+        # 1. Tab completes /he -> /help
+        os.write(master, b'/he\t\n')
+        p = read_prompt(read_until(b'Tab completes /commands and @paths', p))
+
+        # 2. Left-arrow cursor editing
+        os.write(master, b'hello world\x1b[D\x1b[D\x1b[D\x1b[D\x1b[Dzig \n')
+        p = read_prompt(read_until(b'editor-left-ok', p))
+
+        # 3. Up-arrow history + Ctrl-A Home insertion
+        os.write(master, b'\x1b[A\x01re: \n')
+        p = read_prompt(read_until(b'editor-history-ok', p))
+
+        # 4. Bracketed paste keeps newline as part of one multi-line prompt
+        os.write(master, b'\x1b[200~line1\nline2\x1b[201~\n')
+        p = read_prompt(read_until(b'editor-paste-ok', p))
+
+        # 5. @path Tab completion
+        os.write(master, b'@tab-tar\t\n')
+        p = read_prompt(read_until(b'editor-at-ok', p))
+
+        # 6. Interactive edit tool displays diff preview lines
+        mark = len(transcript)
+        os.write(master, b'edit-preview\n')
+        p = read_prompt(read_until(b'preview complete', mark))
+        snippet = transcript[mark:p]
+        assert b'-2 beta' in snippet and b'+2 BETA' in snippet, snippet
+
+        # 7. Ctrl-D on empty line exits cleanly with status 0 and restored termios
+        os.write(master, b'\x04')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+        after = termios.tcgetattr(master)
+        pendin = getattr(termios, 'PENDIN', 0)
+        assert (after[:3], after[3] & ~pendin, after[4:]) == (before[:3], before[3] & ~pendin, before[4:]), (
+            'terminal settings changed', before, after
+        )
+    finally:
         if master != -1:
             os.close(master)
         if process.poll() is None:
@@ -1775,6 +1919,26 @@ for line in sys.stdin:
                        for e in events)
             terminal_check(common, environment, session, expected_results)
             terminal_cancel_check(common, environment, root, server)
+            terminal_editor_check(common, environment, root)
+            spill_session = root / 'bash-spill.jsonl'
+            spill_env = dict(environment, TMPDIR=str(root))
+            spill_run = run_repo_cli(common[:-1] + [str(spill_session), '--mode', 'json', 'bash-spill'],
+                                     input='', text=True, capture_output=True, env=spill_env, timeout=20)
+            assert spill_run.returncode == 0, spill_run.stderr
+            spill_events = [json.loads(line) for line in spill_run.stdout.splitlines()]
+            spill_end = [e for e in spill_events if e.get('type') == 'tool_execution_end'][0]['result']
+            assert spill_end['details']['truncation']['truncated'] is True, spill_end
+            spill_path = Path(spill_end['details']['fullOutputPath'])
+            assert spill_path.parent == root and spill_path.exists(), spill_path
+            assert (spill_path.stat().st_mode & 0o777) == 0o600, oct(spill_path.stat().st_mode)
+            spill_lines = spill_path.read_text().splitlines()
+            assert len(spill_lines) == 2005 and spill_lines[0] == 'B1' and spill_lines[-1] == 'B2005'
+            spill_path.unlink()
+            # Also verify edit details.diff & firstChangedLine survived in original session JSONL.
+            edit_results = [r['message'] for r in records if r['type'] == 'message'
+                            and r['message']['role'] == 'tool_result'
+                            and r['message'].get('details') and 'diff' in r['message']['details']]
+            assert len(edit_results) == 1 and edit_results[0]['details']['firstChangedLine'] == 2, edit_results
             filtered_session = root / 'filtered.jsonl'
             filtered = run_repo_cli(common[:-1] + [str(filtered_session), '--mode', 'json', 'filtered-completion'],
                                       input='', text=True, capture_output=True, env=environment, timeout=20)

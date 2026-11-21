@@ -39,6 +39,8 @@ test "core tools write edit and read project files" {
     try std.testing.expect(std.mem.indexOf(u8, write_result.text, "Wrote") != null);
     const edit_result = try Fixture.run(set.tools[2], fixture.context(), "{\"path\":\"nested/file.txt\",\"oldText\":\"two\",\"newText\":\"three\"}");
     try std.testing.expect(std.mem.indexOf(u8, edit_result.text, "Edited") != null);
+    try std.testing.expectEqual(@as(i64, 2), edit_result.details.?.object.get("firstChangedLine").?.integer);
+    try std.testing.expectEqualStrings(" 1 one\n-2 two\n+2 three", edit_result.details.?.object.get("diff").?.string);
     const read_result = try Fixture.run(set.tools[0], fixture.context(), "{\"path\":\"nested/file.txt\",\"offset\":2}");
     try std.testing.expectEqualStrings("three\n", read_result.text);
     try std.testing.expectError(error.OffsetBeyondEnd, Fixture.run(set.tools[0], fixture.context(), "{\"path\":\"nested/file.txt\",\"offset\":4}"));
@@ -233,4 +235,54 @@ test "bash interrupt cancels and terminates the process group" {
     try trig_task.await(std.testing.io);
     try std.Io.sleep(std.testing.io, .fromSeconds(2), .awake);
     try std.testing.expectError(error.FileNotFound, fixture.tmp.dir.statFile(std.testing.io, "canceled-late-marker", .{}));
+}
+
+test "bash truncates tail by lines and bytes and spills full output to temp file" {
+    const a = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const cwd = try std.process.currentPathAlloc(std.testing.io, a);
+    defer a.free(cwd);
+    const spill_dir = try std.fs.path.resolveAlloc(a, &.{ cwd, ".zig-cache", "tmp", &tmp_dir.sub_path });
+    defer a.free(spill_dir);
+
+    var set = try tools_mod.ToolSet.initWithTempDir(a, spill_dir);
+    defer set.deinit();
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    // 1. Line-limit tail truncation (2005 lines, < 50 KiB).
+    const by_lines = try Fixture.run(set.tools[3], fixture.context(), "{\"command\":\"i=1; while [ $i -le 2005 ]; do echo L$i; i=$((i+1)); done\",\"timeout\":10}");
+    try std.testing.expect(!by_lines.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, by_lines.text, "L6\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, by_lines.text, "\nL5\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, by_lines.text, "L2005\n\n[Showing lines 6-2005 of 2005. Full output: ") != null);
+    const lines_details = by_lines.details.?.object;
+    const lines_trunc = lines_details.get("truncation").?.object;
+    try std.testing.expectEqualStrings("lines", lines_trunc.get("truncatedBy").?.string);
+    try std.testing.expectEqual(@as(i64, 2005), lines_trunc.get("totalLines").?.integer);
+    try std.testing.expectEqual(@as(i64, 2000), lines_trunc.get("outputLines").?.integer);
+    const lines_spill = lines_details.get("fullOutputPath").?.string;
+    const full_lines = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, lines_spill, a, .limited(1024 * 1024));
+    defer a.free(full_lines);
+    try std.testing.expect(std.mem.startsWith(u8, full_lines, "L1\nL2\n"));
+    try std.testing.expect(std.mem.endsWith(u8, full_lines, "L2004\nL2005\n"));
+
+    // 2. Single oversized UTF-8 line (> 50 KiB) truncates at a valid UTF-8 boundary.
+    const wide = try a.alloc(u8, 54 * 1024);
+    defer a.free(wide);
+    for (0..18 * 1024) |i| @memcpy(wide[i * 3 ..][0..3], "中");
+    try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wide.txt", .data = wide });
+    const by_bytes = try Fixture.run(set.tools[3], fixture.context(), "{\"command\":\"cat wide.txt\",\"timeout\":10}");
+    try std.testing.expect(!by_bytes.is_error);
+    const byte_details = by_bytes.details.?.object;
+    const byte_trunc = byte_details.get("truncation").?.object;
+    try std.testing.expectEqualStrings("bytes", byte_trunc.get("truncatedBy").?.string);
+    try std.testing.expect(byte_trunc.get("lastLinePartial").?.bool);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(byte_trunc.get("content").?.string));
+    try std.testing.expect(std.mem.indexOf(u8, by_bytes.text, "of line 1 (line is 54.0KB). Full output: ") != null);
+    const bytes_spill = byte_details.get("fullOutputPath").?.string;
+    const full_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, bytes_spill, a, .limited(1024 * 1024));
+    defer a.free(full_bytes);
+    try std.testing.expectEqual(@as(usize, 54 * 1024), full_bytes.len);
 }

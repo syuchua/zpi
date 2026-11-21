@@ -8,30 +8,42 @@ const search = @import("search");
 pub const ToolSet = struct {
     arena: std.heap.ArenaAllocator,
     tools: [7]agent.Tool,
+    temp_dir: []const u8,
 
     pub fn init(allocator: std.mem.Allocator) !ToolSet {
+        return initWithTempDir(allocator, "/tmp");
+    }
+
+    pub fn initWithTempDir(allocator: std.mem.Allocator, temp_dir: []const u8) !ToolSet {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
+        const owned_temp = try a.dupe(u8, if (temp_dir.len > 0) temp_dir else "/tmp");
+        const bash_ctx: *BashContext = try a.create(BashContext);
+        bash_ctx.* = .{ .temp_dir = owned_temp };
         const definitions = [7]agent.Tool{
-            try definition(a, "read", "Read a text file. Output is truncated to 2000 lines or 50 KiB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Maximum number of lines to read\"}},\"required\":[\"path\"],\"additionalProperties\":false}", read),
-            try definition(a, "write", "Create or overwrite a text file, creating parent directories.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}", write),
-            try definition(a, "edit", "Make precise unique exact replacements. All edits match the original file; overlapping edits, duplicates and no-ops are rejected.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"oldText\",\"newText\"],\"additionalProperties\":false},\"minItems\":1,\"maxItems\":1024}},\"required\":[\"path\"],\"additionalProperties\":false}", edit),
-            try definition(a, "bash", "Execute a shell command in the project directory. Optional timeout in seconds (default 60, maximum 3600). Fails with StreamTooLong above 1 MiB of combined output; timeout/output errors stop the process group.", "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":3600}},\"required\":[\"command\"],\"additionalProperties\":false}", bash),
-            try definition(a, "grep", "Search with installed ripgrep, respecting gitignore. Returns paths and line numbers; bounded to 50 KiB and an optional match limit.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"ignoreCase\":{\"type\":\"boolean\"},\"literal\":{\"type\":\"boolean\"},\"context\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", grep),
-            try definition(a, "find", "Find paths with installed fd/fdfind using glob patterns and gitignore rules. Results are relative to the search directory.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", find),
-            try definition(a, "ls", "List directory entries including dotfiles, sorted by ASCII case-insensitive name; directory names end with a slash.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"additionalProperties\":false}", ls),
+            try definition(a, "read", "Read a text file. Output is truncated to 2000 lines or 50 KiB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Maximum number of lines to read\"}},\"required\":[\"path\"],\"additionalProperties\":false}", null, read),
+            try definition(a, "write", "Create or overwrite a text file, creating parent directories.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}", null, write),
+            try definition(a, "edit", "Make precise unique exact replacements. All edits match the original file; overlapping edits, duplicates and no-ops are rejected.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"oldText\",\"newText\"],\"additionalProperties\":false},\"minItems\":1,\"maxItems\":1024}},\"required\":[\"path\"],\"additionalProperties\":false}", null, edit),
+            try definition(a, "bash", "Execute a shell command in the project directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optional timeout in seconds (default 60, maximum 3600).", "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":3600}},\"required\":[\"command\"],\"additionalProperties\":false}", bash_ctx, bash),
+            try definition(a, "grep", "Search with installed ripgrep, respecting gitignore. Returns paths and line numbers; bounded to 50 KiB and an optional match limit.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"ignoreCase\":{\"type\":\"boolean\"},\"literal\":{\"type\":\"boolean\"},\"context\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, grep),
+            try definition(a, "find", "Find paths with installed fd/fdfind using glob patterns and gitignore rules. Results are relative to the search directory.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, find),
+            try definition(a, "ls", "List directory entries including dotfiles, sorted by ASCII case-insensitive name; directory names end with a slash.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"additionalProperties\":false}", null, ls),
         };
-        return .{ .arena = arena, .tools = definitions };
+        return .{ .arena = arena, .tools = definitions, .temp_dir = owned_temp };
     }
     pub fn deinit(self: *ToolSet) void {
         self.arena.deinit();
     }
 };
 
-fn definition(a: std.mem.Allocator, name: []const u8, description: []const u8, schema: []const u8, execute: @FieldType(agent.Tool, "execute")) !agent.Tool {
+const BashContext = struct {
+    temp_dir: []const u8,
+};
+
+fn definition(a: std.mem.Allocator, name: []const u8, description: []const u8, schema: []const u8, context: ?*anyopaque, execute: @FieldType(agent.Tool, "execute")) !agent.Tool {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, schema, .{});
-    return .{ .definition = .{ .name = name, .description = description, .parameters = parsed.value }, .execute = execute, .builtin = true };
+    return .{ .definition = .{ .name = name, .description = description, .parameters = parsed.value }, .context = context, .execute = execute, .builtin = true };
 }
 fn string(args: std.json.Value, key: []const u8) ![]const u8 {
     if (args != .object) return error.ExpectedObject;
@@ -227,10 +239,21 @@ fn edit(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!a
             .newText = try string(args, "newText"),
         });
     }
-    const updated = try replacements.apply(ctx.allocator, content, entries.items);
-    defer ctx.allocator.free(updated);
-    try save(ctx, path, updated);
-    return .{ .text = try std.fmt.allocPrint(ctx.allocator, "Edited {d} block(s) in {s}", .{ entries.items.len, path }) };
+    const updated = try replacements.applyWithDiff(ctx.allocator, content, entries.items);
+    defer {
+        ctx.allocator.free(updated.content);
+        ctx.allocator.free(updated.diff);
+    }
+    try save(ctx, path, updated.content);
+    const encoded = try std.json.Stringify.valueAlloc(ctx.allocator, .{
+        .diff = updated.diff,
+        .firstChangedLine = updated.first_changed_line,
+    }, .{});
+    defer ctx.allocator.free(encoded);
+    return .{
+        .text = try std.fmt.allocPrint(ctx.allocator, "Edited {d} block(s) in {s}", .{ entries.items.len, path }),
+        .details = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, encoded, .{ .allocate = .alloc_always }),
+    };
 }
 fn grep(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     try validate(args, &.{ "pattern", "path", "glob", "ignoreCase", "literal", "context", "limit" });
@@ -275,7 +298,9 @@ fn ls(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!age
     const result = try search.ls(ctx.allocator, ctx.io, .{ .path = resolved, .limit = limit });
     return .{ .text = result.text };
 }
-fn bash(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+fn bash(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+    const bash_ctx: ?*const BashContext = if (context) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    const temp_dir = if (bash_ctx) |b| b.temp_dir else "/tmp";
     try validate(args, &.{ "command", "timeout" });
     const command = try string(args, "command");
     const seconds = try positive(args, "timeout", 60);
@@ -289,7 +314,7 @@ fn bash(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!a
     var select = std.Io.Select(Completion).init(ctx.io, &storage);
     defer select.cancelDiscard();
     try select.concurrent(.timer, shellTimer, .{ ctx.io, seconds });
-    try select.concurrent(.process, shellRun, .{ ctx, command });
+    try select.concurrent(.process, shellRun, .{ ctx, temp_dir, command });
     if (ctx.cancel) |cancel| try select.concurrent(.cancel, shellCancel, .{ cancel, ctx.io });
     return switch (try select.await()) {
         .process => |result| result,
@@ -310,25 +335,223 @@ fn shellTimer(io: std.Io, seconds: usize) std.Io.Cancelable!void {
 fn shellCancel(cancel: agent.model.Cancel, io: std.Io) std.Io.Cancelable!void {
     try cancel.wait(io);
 }
-fn shellDrain(ctx: agent.ToolContext, stdout: std.Io.File) anyerror![]u8 {
-    var buffer: std.Io.File.MultiReader.Buffer(1) = undefined;
-    var reader: std.Io.File.MultiReader = undefined;
-    reader.init(ctx.allocator, ctx.io, buffer.toStreams(), &.{stdout});
-    defer reader.deinit();
-    while (reader.fill(4096, .none)) |_| {
-        if (reader.reader(0).bufferedLen() > 1024 * 1024) {
-            // The same selected group owner performs the bounded drain and
-            // escalates to KILL if ordinary descendants ignore TERM.
-            return error.StreamTooLong;
+
+const bash_max_lines: usize = 2000;
+const bash_max_bytes: usize = 50 * 1024;
+const bash_tail_keep_bytes: usize = 64 * 1024;
+const bash_tail_compact_threshold: usize = 128 * 1024;
+const bash_max_spill_bytes: usize = 32 * 1024 * 1024;
+
+const BashAccumulator = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    temp_dir: []const u8,
+    tail: std.ArrayList(u8) = .empty,
+    total_bytes: usize = 0,
+    newline_count: usize = 0,
+    ended_with_nl: bool = false,
+    prev_line_bytes: usize = 0,
+    current_line_bytes: usize = 0,
+    spill_file: ?std.Io.File = null,
+    spill_path: ?[]u8 = null,
+
+    fn deinitAndCleanupOnError(self: *BashAccumulator) void {
+        if (self.spill_file) |f| {
+            f.close(self.io);
+            self.spill_file = null;
         }
-    } else |err| switch (err) {
-        error.EndOfStream => {},
-        else => return err,
+        if (self.spill_path) |path| {
+            std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
+            self.allocator.free(path);
+            self.spill_path = null;
+        }
+        self.tail.deinit(self.allocator);
     }
-    try reader.checkAnyError();
-    return reader.toOwnedSlice(0);
+
+    fn closeSpillFile(self: *BashAccumulator) void {
+        if (self.spill_file) |f| {
+            f.close(self.io);
+            self.spill_file = null;
+        }
+    }
+
+    fn openSpillFile(self: *BashAccumulator) !void {
+        if (self.spill_file != null) return;
+        const dir = blk: {
+            const trimmed = std.mem.trimEnd(u8, self.temp_dir, "/");
+            break :blk if (trimmed.len == 0) "/" else trimmed;
+        };
+        var attempts: usize = 0;
+        while (attempts < 8) : (attempts += 1) {
+            var rand_bytes: [8]u8 = undefined;
+            self.io.random(&rand_bytes);
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/zpi-bash-{x}.log", .{ dir, rand_bytes });
+            errdefer self.allocator.free(path);
+            const file = std.Io.Dir.cwd().createFile(self.io, path, .{
+                .exclusive = true,
+                .permissions = .fromMode(0o600),
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => {
+                    self.allocator.free(path);
+                    continue;
+                },
+                else => return err,
+            };
+            self.spill_file = file;
+            self.spill_path = path;
+            return;
+        }
+        return error.TempFileExhausted;
+    }
+
+    fn append(self: *BashAccumulator, chunk: []const u8) !void {
+        if (chunk.len == 0) return;
+        const next_total = std.math.add(usize, self.total_bytes, chunk.len) catch return error.StreamTooLong;
+        if (next_total > bash_max_spill_bytes) return error.StreamTooLong;
+
+        for (chunk) |b| {
+            if (b == '\n') {
+                self.newline_count += 1;
+                self.prev_line_bytes = self.current_line_bytes;
+                self.current_line_bytes = 0;
+                self.ended_with_nl = true;
+            } else {
+                self.current_line_bytes += 1;
+                self.ended_with_nl = false;
+            }
+        }
+        self.total_bytes = next_total;
+
+        if (self.spill_file) |f| {
+            try f.writeStreamingAll(self.io, chunk);
+        } else if (self.total_bytes > bash_max_bytes) {
+            try self.openSpillFile();
+            if (self.tail.items.len > 0) try self.spill_file.?.writeStreamingAll(self.io, self.tail.items);
+            try self.spill_file.?.writeStreamingAll(self.io, chunk);
+        }
+
+        try self.tail.appendSlice(self.allocator, chunk);
+        if (self.tail.items.len > bash_tail_compact_threshold) {
+            const drop = self.tail.items.len - bash_tail_keep_bytes;
+            std.mem.copyForwards(u8, self.tail.items[0..bash_tail_keep_bytes], self.tail.items[drop..]);
+            self.tail.items.len = bash_tail_keep_bytes;
+        }
+    }
+
+    fn totalLines(self: *const BashAccumulator) usize {
+        if (self.total_bytes == 0) return 0;
+        return if (self.ended_with_nl) self.newline_count else self.newline_count + 1;
+    }
+
+    fn lastLineBytes(self: *const BashAccumulator) usize {
+        if (self.total_bytes == 0) return 0;
+        return if (self.ended_with_nl) self.prev_line_bytes else self.current_line_bytes;
+    }
+
+    fn ensureSpilledIfTruncated(self: *BashAccumulator) !void {
+        if (self.totalLines() > bash_max_lines or self.total_bytes > bash_max_bytes) {
+            if (self.spill_path == null) {
+                try self.openSpillFile();
+                if (self.tail.items.len > 0) try self.spill_file.?.writeStreamingAll(self.io, self.tail.items);
+            }
+        }
+        self.closeSpillFile();
+    }
+};
+
+fn shellDrain(ctx: agent.ToolContext, temp_dir: []const u8, stdout: std.Io.File) anyerror!BashAccumulator {
+    var acc = BashAccumulator{ .allocator = ctx.allocator, .io = ctx.io, .temp_dir = temp_dir };
+    errdefer acc.deinitAndCleanupOnError();
+    var buf: [16 * 1024]u8 = undefined;
+    var reader = stdout.readerStreaming(ctx.io, &buf);
+    while (true) {
+        var read_buf: [8192]u8 = undefined;
+        const n = reader.interface.readSliceShort(&read_buf) catch |err| switch (err) {
+            error.ReadFailed => return reader.err orelse error.ReadFailed,
+        };
+        if (n == 0) break;
+        try acc.append(read_buf[0..n]);
+    }
+    return acc;
 }
-fn shellRun(ctx: agent.ToolContext, command: []const u8) anyerror!agent.ToolResult {
+
+fn truncateTailText(a: std.mem.Allocator, acc: *const BashAccumulator) !struct {
+    content: []const u8,
+    truncated: bool,
+    truncated_by: ?[]const u8,
+    total_lines: usize,
+    total_bytes: usize,
+    output_lines: usize,
+    output_bytes: usize,
+    last_line_partial: bool,
+} {
+    const total_lines = acc.totalLines();
+    const total_bytes = acc.total_bytes;
+    const raw = acc.tail.items;
+    const trimmed = if (raw.len > 0 and raw[raw.len - 1] == '\n') raw[0 .. raw.len - 1] else raw;
+
+    if (total_lines <= bash_max_lines and total_bytes <= bash_max_bytes) {
+        return .{
+            .content = raw,
+            .truncated = false,
+            .truncated_by = null,
+            .total_lines = total_lines,
+            .total_bytes = total_bytes,
+            .output_lines = total_lines,
+            .output_bytes = total_bytes,
+            .last_line_partial = false,
+        };
+    }
+
+    // Walk backwards from the end of `trimmed` up to bash_max_lines / bash_max_bytes.
+    var output_lines: usize = 0;
+    var output_bytes: usize = 0;
+    var start_pos: usize = trimmed.len;
+    var cursor: usize = trimmed.len;
+    var truncated_by: []const u8 = "lines";
+    var last_line_partial = false;
+
+    while (output_lines < bash_max_lines) {
+        const line_start = if (cursor == 0) 0 else if (std.mem.lastIndexOfScalar(u8, trimmed[0..cursor], '\n')) |nl| nl + 1 else 0;
+        const line_len = cursor - line_start;
+        const add_bytes = line_len + @intFromBool(output_lines > 0);
+        if (output_bytes + add_bytes > bash_max_bytes) {
+            truncated_by = "bytes";
+            if (output_lines == 0) {
+                var partial_start = trimmed.len - @min(trimmed.len, bash_max_bytes);
+                while (partial_start < trimmed.len and (trimmed[partial_start] & 0xc0) == 0x80) : (partial_start += 1) {}
+                start_pos = partial_start;
+                output_bytes = trimmed.len - partial_start;
+                output_lines = 1;
+                last_line_partial = true;
+            }
+            break;
+        }
+        start_pos = line_start;
+        output_bytes += add_bytes;
+        output_lines += 1;
+        if (line_start == 0) break;
+        cursor = line_start - 1;
+    }
+
+    const tail_slice = if (raw.len > 0 and raw[raw.len - 1] == '\n' and !last_line_partial) blk: {
+        // Keep trailing newline only when the original output fit? No, pi joins lines without trailing \n.
+        break :blk trimmed[start_pos..];
+    } else trimmed[start_pos..];
+
+    return .{
+        .content = try a.dupe(u8, tail_slice),
+        .truncated = true,
+        .truncated_by = truncated_by,
+        .total_lines = total_lines,
+        .total_bytes = total_bytes,
+        .output_lines = output_lines,
+        .output_bytes = tail_slice.len,
+        .last_line_partial = last_line_partial,
+    };
+}
+
+fn shellRun(ctx: agent.ToolContext, temp_dir: []const u8, command: []const u8) anyerror!agent.ToolResult {
     var child = try std.process.spawn(ctx.io, .{
         .argv = &.{ "/bin/sh", "-c", "exec /bin/sh -c \"$1\" 2>&1", "zpi-bash", command },
         .cwd = .{ .path = ctx.cwd },
@@ -349,21 +572,78 @@ fn shellRun(ctx: agent.ToolContext, command: []const u8) anyerror!agent.ToolResu
     // Drain before waiting so a child blocked on a full pipe can make progress.
     // If the bounded drain fails or cancellation interrupts it, the defer above
     // kills and reaps the entire process group.
-    const owned_output = try shellDrain(ctx, stdout);
-    errdefer ctx.allocator.free(owned_output);
+    var acc = try shellDrain(ctx, temp_dir, stdout);
+    errdefer acc.deinitAndCleanupOnError();
     const waited = try child.wait(ctx.io);
     completed = true;
-    const text = if (owned_output.len == 0) "(no output)" else owned_output;
+    try acc.ensureSpilledIfTruncated();
+
     const status: ?u32 = switch (waited) {
         .exited => |code| code,
         .signal => |signal| 128 + @as(u32, @intCast(@backingInt(signal))),
         .stopped, .unknown => null,
     };
+
+    const trunc = try truncateTailText(ctx.allocator, &acc);
+    defer if (trunc.truncated) ctx.allocator.free(trunc.content);
+
+    var text_out: []const u8 = undefined;
+    var details: std.json.Value = .null;
+
+    if (!trunc.truncated) {
+        text_out = if (acc.tail.items.len == 0) "(no output)" else acc.tail.items;
+    } else {
+        const spill_path = acc.spill_path orelse return error.TempFileExhausted;
+        const start_line = trunc.total_lines - trunc.output_lines + 1;
+        const end_line = trunc.total_lines;
+        const notice = if (trunc.last_line_partial) blk: {
+            const out_sz = try readSize(ctx.allocator, trunc.output_bytes);
+            defer ctx.allocator.free(out_sz);
+            const last_sz = try readSize(ctx.allocator, acc.lastLineBytes());
+            defer ctx.allocator.free(last_sz);
+            break :blk try std.fmt.allocPrint(ctx.allocator, "[Showing last {s} of line {d} (line is {s}). Full output: {s}]", .{ out_sz, end_line, last_sz, spill_path });
+        } else if (std.mem.eql(u8, trunc.truncated_by.?, "lines"))
+            try std.fmt.allocPrint(ctx.allocator, "[Showing lines {d}-{d} of {d}. Full output: {s}]", .{ start_line, end_line, trunc.total_lines, spill_path })
+        else
+            try std.fmt.allocPrint(ctx.allocator, "[Showing lines {d}-{d} of {d} (50.0KB limit). Full output: {s}]", .{ start_line, end_line, trunc.total_lines, spill_path });
+        defer ctx.allocator.free(notice);
+
+        text_out = if (trunc.content.len == 0)
+            try ctx.allocator.dupe(u8, notice)
+        else
+            try std.fmt.allocPrint(ctx.allocator, "{s}\n\n{s}", .{ trunc.content, notice });
+
+        const encoded = try std.json.Stringify.valueAlloc(ctx.allocator, .{
+            .truncation = .{
+                .content = trunc.content,
+                .truncated = true,
+                .truncatedBy = trunc.truncated_by.?,
+                .totalLines = trunc.total_lines,
+                .totalBytes = trunc.total_bytes,
+                .outputLines = trunc.output_lines,
+                .outputBytes = trunc.output_bytes,
+                .lastLinePartial = trunc.last_line_partial,
+                .firstLineExceedsLimit = false,
+                .maxLines = bash_max_lines,
+                .maxBytes = bash_max_bytes,
+            },
+            .fullOutputPath = spill_path,
+        }, .{});
+        defer ctx.allocator.free(encoded);
+        details = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, encoded, .{ .allocate = .alloc_always });
+    }
+    defer if (trunc.truncated) ctx.allocator.free(text_out);
+    defer {
+        if (acc.spill_path) |p| ctx.allocator.free(p);
+        acc.tail.deinit(ctx.allocator);
+    }
+
     return .{
         .text = if (status) |code|
-            if (code == 0) try ctx.allocator.dupe(u8, text) else try std.fmt.allocPrint(ctx.allocator, "{s}\n\nCommand exited with code {d}", .{ text, code })
+            if (code == 0) try ctx.allocator.dupe(u8, text_out) else try std.fmt.allocPrint(ctx.allocator, "{s}\n\nCommand exited with code {d}", .{ text_out, code })
         else
-            try std.fmt.allocPrint(ctx.allocator, "{s}\n\nCommand terminated without an exit code", .{text}),
+            try std.fmt.allocPrint(ctx.allocator, "{s}\n\nCommand terminated without an exit code", .{text_out}),
+        .details = details,
         .is_error = !waited.success(),
     };
 }

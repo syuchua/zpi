@@ -210,7 +210,7 @@ fn run(init: std.process.Init) !void {
         .defaults = !options.no_prompt_templates,
         .trust_project = options.trust_project_prompts,
     });
-    var tool_set = try zpi.tools.ToolSet.init(init.gpa);
+    var tool_set = try zpi.tools.ToolSet.initWithTempDir(init.gpa, init.environ_map.get("TMPDIR") orelse "/tmp");
     defer tool_set.deinit();
     var extension_host: ?zpi.extensions.Host = null;
     defer if (extension_host) |*host| {
@@ -325,13 +325,29 @@ fn run(init: std.process.Init) !void {
         try runtime.append(.{ .role = .system, .content = &.{.{ .text = indexed }}, .system_prompt_replace = true });
     }
     if (prompt.len > 0) try app.submit(prompt);
-    if (options.mode == .interactive) try tui.run(init.io, .{
-        .context = &app,
-        .run = App.submitErased,
-        .session_info = App.sessionInfoErased,
-        .cancel = cancel_token,
-        .reset_cancel = App.resetCancelErased,
-    });
+    if (options.mode == .interactive) {
+        var slash_commands: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (slash_commands.items) |cmd| a.free(cmd);
+            slash_commands.deinit(a);
+        }
+        for (discovered_skills) |skill| {
+            try slash_commands.append(a, try std.fmt.allocPrint(a, "/skill:{s}", .{skill.name}));
+        }
+        for (discovered_templates) |tmpl| {
+            try slash_commands.append(a, try std.fmt.allocPrint(a, "/{s}", .{tmpl.name}));
+        }
+        try tui.run(init.io, .{
+            .context = &app,
+            .run = App.submitErased,
+            .session_info = App.sessionInfoErased,
+            .cancel = cancel_token,
+            .reset_cancel = App.resetCancelErased,
+            .allocator = init.gpa,
+            .cwd = cwd,
+            .commands = slash_commands.items,
+        });
+    }
 }
 
 const App = struct {
@@ -468,14 +484,66 @@ const App = struct {
             .tool_end => |ended| {
                 if (self.mode == .json) {
                     try self.json(.{ .type = "tool_execution_end", .id = ended.call.id, .result = ended.result });
-                } else if (self.mode == .interactive and ended.result.is_error) {
-                    try tui.writeText(self.io, .stderr(), ended.result.text);
-                    try std.Io.File.stderr().writeStreamingAll(self.io, "\n");
+                } else if (self.mode == .interactive) {
+                    if (ended.result.is_error) {
+                        try tui.writeText(self.io, .stderr(), ended.result.text);
+                        try std.Io.File.stderr().writeStreamingAll(self.io, "\n");
+                    } else if (ended.result.details) |details_val| {
+                        if (details_val == .object) {
+                            if (std.mem.eql(u8, ended.call.name, "edit")) {
+                                if (details_val.object.get("diff")) |diff_val| {
+                                    if (diff_val == .string and diff_val.string.len > 0) {
+                                        try writeDiffPreview(self.io, diff_val.string);
+                                    }
+                                }
+                            } else if (std.mem.eql(u8, ended.call.name, "bash")) {
+                                if (details_val.object.get("fullOutputPath")) |path_val| {
+                                    if (path_val == .string and path_val.string.len > 0) {
+                                        const stderr = std.Io.File.stderr();
+                                        try stderr.writeStreamingAll(self.io, "[full output: ");
+                                        try tui.writeText(self.io, stderr, path_val.string);
+                                        try stderr.writeStreamingAll(self.io, "]\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             },
             .settled => if (self.mode == .json) {
                 try self.json(.{ .type = "agent_settled" });
             },
+        }
+    }
+    fn writeDiffPreview(io: std.Io, diff: []const u8) !void {
+        const stderr = std.Io.File.stderr();
+        const color = stderr.supportsAnsiEscapeCodes(io) catch false;
+        var lines = std.mem.splitScalar(u8, diff, '\n');
+        var count: usize = 0;
+        while (lines.next()) |line| {
+            if (count >= 40) {
+                try stderr.writeStreamingAll(io, if (color) "\x1b[2m... (preview truncated)\x1b[0m\n" else "... (preview truncated)\n");
+                break;
+            }
+            if (color) {
+                if (std.mem.startsWith(u8, line, "+")) {
+                    try stderr.writeStreamingAll(io, "\x1b[32m");
+                    try tui.writeText(io, stderr, line);
+                    try stderr.writeStreamingAll(io, "\x1b[0m\n");
+                } else if (std.mem.startsWith(u8, line, "-")) {
+                    try stderr.writeStreamingAll(io, "\x1b[31m");
+                    try tui.writeText(io, stderr, line);
+                    try stderr.writeStreamingAll(io, "\x1b[0m\n");
+                } else {
+                    try stderr.writeStreamingAll(io, "\x1b[2m");
+                    try tui.writeText(io, stderr, line);
+                    try stderr.writeStreamingAll(io, "\x1b[0m\n");
+                }
+            } else {
+                try tui.writeText(io, stderr, line);
+                try stderr.writeStreamingAll(io, "\n");
+            }
+            count += 1;
         }
     }
     fn json(self: *App, value: anytype) !void {
@@ -495,4 +563,5 @@ test {
     _ = recent_session;
     _ = skills;
     _ = pi_session;
+    _ = tui;
 }
