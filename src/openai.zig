@@ -4,9 +4,10 @@ const std = @import("std");
 const model = @import("model");
 const sse = @import("sse");
 const http_headers = @import("http_headers");
+const http_transport = @import("http_transport");
 const context_budget = @import("context_budget");
 
-pub const ProxyPolicy = enum { system, none };
+pub const ProxyPolicy = http_transport.ProxyPolicy;
 
 pub const Config = struct {
     endpoint: []const u8,
@@ -118,18 +119,6 @@ pub const Client = struct {
         if (uri.user != null or uri.password != null) return error.InvalidEndpoint;
         if (std.mem.indexOfAny(u8, self.config.api_key, "\r\n") != null) return error.InvalidCredential;
         try http_headers.validateAll(self.config.headers);
-        var http: std.http.Client = .{ .allocator = allocator, .io = self.io };
-        defer http.deinit();
-        var proxy_arena = std.heap.ArenaAllocator.init(allocator);
-        defer proxy_arena.deinit();
-        if (self.proxy_policy == .system) {
-            if (self.environ) |env| try http.initDefaultProxies(proxy_arena.allocator(), env);
-        }
-        // Zig 0.17's CONNECT path returns the proxy-protocol connection without
-        // wrapping the tunnel in origin TLS. Refuse before opening a connection
-        // or sending credentials. Direct mode is an explicit caller decision.
-        if (std.mem.eql(u8, uri.scheme, "https") and http.https_proxy != null)
-            return error.HttpsProxyUnsupported;
         const authorization = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self.config.api_key});
         defer allocator.free(authorization);
         const auth_override = http_headers.get(self.config.headers, "authorization");
@@ -147,63 +136,18 @@ pub const Client = struct {
         }
         const payload = try encodeRequest(allocator, self.config, messages, tools);
         defer allocator.free(payload);
-        var req = try http.request(.POST, uri, .{
-            // Inspect redirect status without following it or draining its body.
-            .redirect_behavior = .unhandled,
-            .keep_alive = false,
-            .headers = .{
-                .authorization = if (auth_override) |value| .{ .override = value } else if (self.config.api_key.len == 0) .omit else .{ .override = authorization },
-                .content_type = .{ .override = "application/json" },
-                .accept_encoding = .{ .override = "identity" },
-            },
-            .extra_headers = extra_headers[0..extra_count],
-        });
-        defer req.deinit();
-        if (req.connection) |conn| cancel_socket.set(self.io, conn.stream_reader.stream);
-        defer cancel_socket.clear(self.io);
-        try req.sendBodyComplete(payload);
-        var response = try req.receiveHead(&.{});
-        self.status = response.head.status;
-        if (response.head.status != .ok) {
-            self.retry_after_ms = http_headers.parseRetryAfterMs(response.head);
-            return error.HttpRequestFailed;
-        }
-        if (response.head.content_encoding != .identity) return error.UnsupportedContentEncoding;
-        const content_type = response.head.content_type orelse return error.InvalidContentType;
-        const delimiter = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
-        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, content_type[0..delimiter], " \t"), "text/event-stream")) return error.InvalidContentType;
         var decoder = Decoder.init(allocator, sink);
         decoder.supports_finish_reason = self.config.compat.supports_finish_reason;
         defer decoder.deinit();
-        var framing = sse.Decoder.init(allocator, 1024 * 1024);
-        defer framing.deinit();
-        var transfer_buffer: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buffer);
-        var chunk: [8192]u8 = undefined;
-        while (!decoder.done) {
-            // Draining the Reader's internal buffer can avoid an extra socket
-            // read before exposing already-arrived SSE bytes.
-            const buffered = reader.buffered();
-            if (buffered.len > 0) {
-                try framing.feed(buffered, decoder.sseSink());
-                reader.toss(buffered.len);
-                continue;
-            }
-            // readVec returns available bytes; readSliceShort would wait for a
-            // whole buffer and delay small streaming deltas until EOF.
-            var vectors = [_][]u8{&chunk};
-            const count = reader.readVec(&vectors) catch |err| switch (err) {
-                error.EndOfStream => break,
-                error.ReadFailed => return error.ResponseReadFailed,
-            };
-            if (count > 0) try framing.feed(chunk[0..count], decoder.sseSink());
-        }
-        try framing.finish();
-        if (!decoder.done) return error.TruncatedStream;
-        // [DONE] terminates the application stream. Do not wait for an idle
-        // keep-alive server to close the connection; req.deinit closes this
-        // non-reusable request. Bytes after DONE in the same SSE batch still
-        // fail through the terminal decoder.
+        try http_transport.postSse(allocator, self.io, .{
+            .uri = uri,
+            .authorization = if (auth_override) |value| value else if (self.config.api_key.len == 0) null else authorization,
+            .extra_headers = extra_headers[0..extra_count],
+            .payload = payload,
+            .environ = self.environ,
+            .proxy_policy = self.proxy_policy,
+            .cancel_socket = cancel_socket,
+        }, decoder.sseSink(), &decoder.done, &self.status, &self.retry_after_ms);
     }
 };
 

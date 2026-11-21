@@ -7,6 +7,8 @@ import os
 import pty
 import select
 import shutil
+import socket
+import ssl
 import sys
 import termios
 import time
@@ -1088,6 +1090,167 @@ def terminal_compact_check(common, environment, root):
     reloaded = run_repo_cli(args + ['-p', 'after-compact-reload'], input='', text=True,
                             capture_output=True, env=environment, timeout=20)
     assert reloaded.returncode == 0 and reloaded.stdout == 'after compact reload ok\n', reloaded.stderr
+
+
+def check_https_proxy(root, environment, server):
+    import base64
+
+    expected_proxy_auth = 'Basic ' + base64.b64encode(b'proxyuser:proxypass').decode()
+    proxy_events = []
+
+    class ConnectProxy(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_CONNECT(self):
+            auth = self.headers.get('Proxy-Authorization')
+            if auth != expected_proxy_auth:
+                proxy_events.append(('rejected', self.path, auth))
+                self.send_response(407)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            host, _, port_str = self.path.rpartition(':')
+            port = int(port_str)
+            upstream = socket.create_connection((host, port), timeout=10)
+            proxy_events.append(('tunneled', self.path))
+            self.send_response(200, 'Connection Established')
+            self.end_headers()
+            self.connection.setblocking(False)
+            upstream.setblocking(False)
+            try:
+                sockets = [self.connection, upstream]
+                while sockets:
+                    readable, _, _ = select.select(sockets, [], [], 10)
+                    if not readable:
+                        break
+                    for sock in readable:
+                        other = upstream if sock is self.connection else self.connection
+                        try:
+                            data = sock.recv(16384)
+                        except (BlockingIOError, ssl.SSLWantReadError):
+                            continue
+                        except OSError:
+                            data = b''
+                        if not data:
+                            return
+                        other.sendall(data)
+            finally:
+                upstream.close()
+
+    proxy_server = ThreadingHTTPServer(('127.0.0.1', 0), ConnectProxy)
+    proxy_server.daemon_threads = True
+    proxy_thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+    proxy_thread.start()
+    try:
+        # 1. NO_PROXY bypasses unreachable http_proxy and connects directly.
+        bypass_cfg = root / 'noproxy.json'
+        bypass_cfg.write_text(json.dumps({'providers': {'noproxy': {
+            'api': 'openai-completions',
+            'baseUrl': f'http://127.0.0.1:{server.server_port}/route/v1',
+            'apiKey': 'route-key',
+            'models': [{'id': 'bypass-model', 'maxTokens': 1024}],
+        }}}))
+        server.expected_route_path = '/route/v1/chat/completions'
+        server.expected_route_model = 'bypass-model'
+        server.expected_route_tokens = 1024
+        bypass_env = {k: v for k, v in environment.items()
+                      if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')}
+        bypass_env['http_proxy'] = 'http://127.0.0.1:1'
+        bypass_env['NO_PROXY'] = '127.0.0.1'
+        res = run_repo_cli([str(BINARY), '--models-file', str(bypass_cfg), '--provider', 'noproxy',
+                            '--no-session', '--no-tools', '-p', 'bypass'],
+                           input='', text=True, capture_output=True, env=bypass_env, timeout=20)
+        assert res.returncode == 0 and res.stdout == 'route complete\n', (res.stderr, res.stdout)
+
+        # 2. Bad proxy auth on HTTPS CONNECT fails closed with ProxyConnectFailed.
+        bad_proxy_cfg = root / 'badproxy.json'
+        bad_proxy_cfg.write_text(json.dumps({'providers': {'badproxy': {
+            'api': 'openai-completions',
+            'baseUrl': 'https://127.0.0.1:4443/v1',
+            'apiKey': 'secret-must-not-leak',
+            'models': [{'id': 'm'}],
+        }}}))
+        bad_env = {k: v for k, v in environment.items()
+                   if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')}
+        bad_env['https_proxy'] = f'http://wrong:creds@127.0.0.1:{proxy_server.server_port}'
+        rejected = run_repo_cli([str(BINARY), '--models-file', str(bad_proxy_cfg), '--provider', 'badproxy',
+                                 '--no-session', '--no-tools', '-p', 'hi'],
+                                input='', text=True, capture_output=True, env=bad_env, timeout=20)
+        assert rejected.returncode != 0 and 'ProxyConnectFailed' in rejected.stderr, rejected.stderr
+        assert ('rejected', '127.0.0.1:4443', 'Basic d3Jvbmc6Y3JlZHM=') in proxy_events, proxy_events
+
+        # 3. End-to-end TLS origin over HTTP CONNECT proxy when openssl is available.
+        if shutil.which('openssl'):
+            cert_file = root / 'tls-cert.pem'
+            key_file = root / 'tls-key.pem'
+            subprocess.run([
+                'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                '-keyout', str(key_file), '-out', str(cert_file),
+                '-days', '1', '-subj', '/CN=127.0.0.1',
+                '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1',
+            ], check=True, capture_output=True, timeout=20)
+
+            class TlsOriginHandler(BaseHTTPRequestHandler):
+                def log_message(self, *_):
+                    pass
+
+                def do_POST(self):
+                    body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                    assert self.headers.get('Authorization') == 'Bearer tls-proxy-secret'
+                    assert self.path in ('/v1/chat/completions', '/v1/responses')
+                    if self.path == '/v1/responses':
+                        events = [
+                            ('response.created', {'response': {'id': 'resp_tls'}}),
+                            ('response.output_item.added', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_tls'}}),
+                            ('response.output_text.delta', {'output_index': 0, 'delta': 'tls proxy ok'}),
+                            ('response.output_item.done', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_tls', 'content': [{'type': 'output_text', 'text': 'tls proxy ok'}]}}),
+                            ('response.completed', {'response': {'id': 'resp_tls', 'status': 'completed', 'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}}),
+                        ]
+                        data = ''.join(f'event: {k}\ndata: {json.dumps(dict(p, type=k))}\n\n' for k, p in events).encode()
+                    else:
+                        chunk = {'choices': [{'index': 0, 'delta': {'content': 'tls proxy ok'}, 'finish_reason': 'stop'}]}
+                        data = ('data: ' + json.dumps(chunk) + '\n\ndata: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+
+            tls_origin = ThreadingHTTPServer(('127.0.0.1', 0), TlsOriginHandler)
+            tls_origin.daemon_threads = True
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=str(cert_file), keyfile=str(key_file))
+            tls_origin.socket = ctx.wrap_socket(tls_origin.socket, server_side=True)
+            tls_thread = threading.Thread(target=tls_origin.serve_forever, daemon=True)
+            tls_thread.start()
+            try:
+                tls_port = tls_origin.server_port
+                proxy_env = {k: v for k, v in environment.items()
+                             if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy', 'no_proxy')}
+                proxy_env['HTTPS_PROXY'] = f'http://proxyuser:proxypass@127.0.0.1:{proxy_server.server_port}'
+                proxy_env['SSL_CERT_FILE'] = str(cert_file)
+                for api_name in ('openai-completions', 'openai-responses'):
+                    tls_cfg = root / f'tls-{api_name}.json'
+                    tls_cfg.write_text(json.dumps({'providers': {'tls-proxied': {
+                        'api': api_name,
+                        'baseUrl': f'https://127.0.0.1:{tls_port}/v1',
+                        'apiKey': 'tls-proxy-secret',
+                        'models': [{'id': 'tls-model'}],
+                    }}}))
+                    tunneled = run_repo_cli([str(BINARY), '--models-file', str(tls_cfg), '--provider', 'tls-proxied',
+                                             '--no-session', '--no-tools', '-p', 'through proxy'],
+                                            input='', text=True, capture_output=True, env=proxy_env, timeout=20)
+                    assert tunneled.returncode == 0 and tunneled.stdout == 'tls proxy ok\n', (api_name, tunneled.stderr, tunneled.stdout)
+                assert proxy_events.count(('tunneled', f'127.0.0.1:{tls_port}')) == 2, proxy_events
+            finally:
+                tls_origin.shutdown()
+                tls_origin.server_close()
+                tls_thread.join(timeout=2)
+    finally:
+        proxy_server.shutdown()
+        proxy_server.server_close()
+        proxy_thread.join(timeout=2)
 
 
 def check_pi_import(root, resume_args, environment, server):
@@ -2420,6 +2583,7 @@ for line in sys.stdin:
                                             text=True, capture_output=True, env=environment, timeout=20)
             assert failed_responses.returncode != 0
             assert not (root / 'responses-uncommitted.txt').exists()
+            check_https_proxy(root, environment, server)
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'

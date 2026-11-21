@@ -21,7 +21,7 @@ else
     exit 1
 fi
 
-for suite in core cli sse http-header model openai openai-responses anthropic anthropic-edge agent tool session pi-session replacement search extension context-budget compaction mcp mcp-tool prompt-template native native-value native-json; do
+for suite in core cli sse http-header http-transport model openai openai-responses anthropic anthropic-edge agent tool session pi-session replacement search extension context-budget compaction mcp mcp-tool prompt-template native native-value native-json; do
     "$artifacts/bin/$suite-tests"
 done
 ZPI_REJECTION_DIR="$artifacts/lib" "$artifacts/bin/native-rejection-tests"

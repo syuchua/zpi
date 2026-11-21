@@ -18,6 +18,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const http_transport = b.addModule("http_transport", .{
+        .root_source_file = b.path("src/http_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "sse", .module = sse }, .{ .name = "http_headers", .module = http_headers } },
+    });
     const context_budget = b.addModule("context_budget", .{
         .root_source_file = b.path("src/context_budget.zig"),
         .target = target,
@@ -62,13 +68,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/openai.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "context_budget", .module = context_budget } },
+        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "http_transport", .module = http_transport }, .{ .name = "context_budget", .module = context_budget } },
     });
     const openai_responses = b.addModule("openai_responses", .{
         .root_source_file = b.path("src/openai_responses.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "context_budget", .module = context_budget } },
+        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "http_transport", .module = http_transport }, .{ .name = "context_budget", .module = context_budget } },
     });
     const native_plugin = b.addModule("native_plugin", .{
         .root_source_file = b.path("src/native_plugin.zig"),
@@ -110,7 +116,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/anthropic.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "context_budget", .module = context_budget } },
+        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "http_transport", .module = http_transport }, .{ .name = "context_budget", .module = context_budget } },
     });
     const tui = b.addModule("tui", .{
         .root_source_file = b.path("src/tui.zig"),
@@ -202,6 +208,15 @@ pub fn build(b: *std.Build) void {
     const pi_session_tests = b.addTest(.{ .name = "pi-session-tests", .root_module = pi_session });
     const sse_tests = b.addTest(.{ .name = "sse-tests", .root_module = sse });
     const http_header_tests = b.addTest(.{ .name = "http-header-tests", .root_module = http_headers });
+    const http_transport_tests = b.addTest(.{
+        .name = "http-transport-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/http_transport_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "http_transport", .module = http_transport }, .{ .name = "sse", .module = sse } },
+        }),
+    });
     const model_tests = b.addTest(.{ .name = "model-tests", .root_module = model });
     const context_budget_tests = b.addTest(.{ .name = "context-budget-tests", .root_module = context_budget });
     const compaction_tests = b.addTest(.{ .name = "compaction-tests", .root_module = compaction });
@@ -374,6 +389,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(sse_tests).step);
     test_step.dependOn(&b.addRunArtifact(http_header_tests).step);
+    test_step.dependOn(&b.addRunArtifact(http_transport_tests).step);
     test_step.dependOn(&b.addRunArtifact(model_tests).step);
     test_step.dependOn(&b.addRunArtifact(context_budget_tests).step);
     test_step.dependOn(&b.addRunArtifact(compaction_tests).step);
@@ -400,6 +416,7 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(exe_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(sse_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(http_header_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(http_transport_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(model_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(context_budget_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(compaction_tests, .{}).step);
