@@ -537,3 +537,19 @@ test "OpenAI client aborts stalled stream promptly on interrupt" {
     try trig_task.await(std.testing.io);
     try std.testing.expect(capture.reason == null);
 }
+
+test "OpenAI Chat Completions encodes reasoning_effort only when thinking_level != off" {
+    const a = std.testing.allocator;
+    const msgs = [_]model.Message{.{ .role = .user, .content = &.{.{ .text = "hi" }} }};
+    const off_body = try openai.encodeRequest(a, .{ .endpoint = "http://127.0.0.1/v1/chat/completions", .model_id = "m", .api_key = "" }, &msgs, &.{});
+    defer a.free(off_body);
+    var off_parsed = try std.json.parseFromSlice(std.json.Value, a, off_body, .{});
+    defer off_parsed.deinit();
+    try std.testing.expect(off_parsed.value.object.get("reasoning_effort") == null);
+
+    const max_body = try openai.encodeRequest(a, .{ .endpoint = "http://127.0.0.1/v1/chat/completions", .model_id = "m", .api_key = "", .thinking_level = .max }, &msgs, &.{});
+    defer a.free(max_body);
+    var max_parsed = try std.json.parseFromSlice(std.json.Value, a, max_body, .{});
+    defer max_parsed.deinit();
+    try std.testing.expectEqualStrings("high", max_parsed.value.object.get("reasoning_effort").?.string);
+}

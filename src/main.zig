@@ -2,6 +2,7 @@ const std = @import("std");
 const zpi = @import("zpi");
 const args_module = @import("cli/args.zig");
 const config = @import("cli/config.zig");
+const settings_mod = @import("cli/settings.zig");
 const initial_prompt = @import("cli/initial_prompt.zig");
 const tool_selection = @import("cli/tool_selection.zig");
 const system_prompt = @import("cli/system_prompt.zig");
@@ -23,7 +24,8 @@ const help =
     \\  --mode text            Text output; print when stdin/stdout is redirected
     \\  --mode json            Write Zpi JSONL events and exit
     \\  --provider ID          Provider from models.json, openai, or anthropic
-    \\  --model ID             Exact ID or known PROVIDER/ID (without --provider)
+    \\  --model ID             Exact ID or known PROVIDER/ID[:THINKING] (without --provider)
+    \\  --thinking LEVEL       Reasoning level: off, minimal, low, medium, high, xhigh, max
     \\  --models-file PATH     Explicit models.json (e.g. ~/.pi/agent/models.json)
     \\  --endpoint URL         Provider base URL or API endpoint
     \\  --api-key KEY          Credential override; prefer environment/config
@@ -120,13 +122,18 @@ fn run(init: std.process.Init) !void {
     const replacement = if (options.system_prompt) |input| try system_prompt.resolve(a, init.io, host_cwd, init.environ_map.get("HOME"), input) else null;
     const additions = try a.alloc([]const u8, options.append_system_prompt.items.len);
     for (options.append_system_prompt.items, additions[0..options.append_system_prompt.items.len]) |input, *text| text.* = try system_prompt.resolve(a, init.io, host_cwd, init.environ_map.get("HOME"), input);
+    const loaded_settings = try settings_mod.load(a, init.io, host_cwd, init.environ_map);
     const selection = try config.load(a, init.io, init.environ_map, .{
         .provider = options.provider,
         .model = options.model,
         .endpoint = options.endpoint,
         .api_key = options.api_key,
         .models_file = options.models_file,
+        .default_provider = loaded_settings.default_provider,
+        .default_model = loaded_settings.default_model,
     });
+    const initial_thinking = options.thinking orelse selection.thinking_suffix orelse (try loaded_settings.thinkingFor(a, selection.provider, selection.model)) orelse .off;
+    const initial_compaction = try loaded_settings.compactionFor(a, selection.provider, selection.model);
     var interrupt: ?zpi.model.Interrupt = if (options.mode == .interactive) try zpi.model.Interrupt.init() else null;
     var old_sigint: ?std.posix.Sigaction = null;
     defer {
@@ -155,6 +162,7 @@ fn run(init: std.process.Init) !void {
         .headers = selection.headers,
         .max_tokens = selection.max_tokens,
         .context_window = selection.context_window,
+        .thinking_level = initial_thinking,
         .compat = selection.openai_compat,
     }, .environ = init.environ_map, .proxy_policy = if (options.no_proxy) .none else .system, .cancel = cancel_token };
     var responses_client = zpi.openai_responses.Client{ .io = init.io, .config = .{
@@ -164,6 +172,7 @@ fn run(init: std.process.Init) !void {
         .headers = selection.headers,
         .max_tokens = selection.max_tokens,
         .context_window = selection.context_window,
+        .thinking_level = initial_thinking,
     }, .environ = init.environ_map, .proxy_policy = if (options.no_proxy) .none else .system, .cancel = cancel_token };
     var anthropic_client = zpi.anthropic.Client{ .io = init.io, .config = .{
         .endpoint = selection.endpoint,
@@ -182,7 +191,9 @@ fn run(init: std.process.Init) !void {
     var store = if (options.no_session) zpi.session.Store.memory(init.gpa, init.io) else blk: {
         var continuing = false;
         const path = if (options.session) |path| try std.fs.path.resolveAlloc(a, &.{ host_cwd, path }) else blk2: {
-            const directory = try recent_session.resolveDirectory(a, host_cwd, init.environ_map.get("HOME"), options.session_dir, init.environ_map.get("PI_CODING_AGENT_SESSION_DIR"));
+            const env_session_dir = init.environ_map.get("PI_CODING_AGENT_SESSION_DIR");
+            const fallback_session_dir = if (env_session_dir != null and env_session_dir.?.len > 0) env_session_dir else loaded_settings.session_dir;
+            const directory = try recent_session.resolveDirectory(a, host_cwd, init.environ_map.get("HOME"), options.session_dir, fallback_session_dir);
             if (options.continue_session) {
                 const discovered = try recent_session.newest(a, init.io, directory, cwd);
                 if (discovered) |path| {
@@ -292,6 +303,7 @@ fn run(init: std.process.Init) !void {
     const selected = try tool_selection.select(a, candidates, .{
         .tools = options.tools,
         .exclude = options.exclude_tools,
+        .default_tools = loaded_settings.default_tools,
         .no_tools = options.no_tools,
         .no_builtin_tools = options.no_builtin_tools,
     });
@@ -299,6 +311,7 @@ fn run(init: std.process.Init) !void {
     for (selected, enabled_tools) |index, *tool| tool.* = registered_tools[index];
     var runtime = agent.Agent.init(init.gpa, init.io, provider, enabled_tools, cwd);
     runtime.cancel = cancel_token;
+    runtime.retry = loaded_settings.retry;
     defer runtime.deinit();
     for (previous) |entry| try runtime.append(entry.message);
     if (options.branch) |id| try store.branch(id);
@@ -308,12 +321,26 @@ fn run(init: std.process.Init) !void {
     }
     var app = App{
         .allocator = init.gpa,
+        .arena = a,
         .io = init.io,
+        .environ = init.environ_map,
         .runtime = &runtime,
         .store = &store,
         .provider = provider,
         .tools = enabled_tools,
         .context_window = selection.context_window,
+        .selection = selection,
+        .settings = loaded_settings,
+        .compaction_settings = initial_compaction,
+        .thinking_level = initial_thinking,
+        .explicit_thinking = options.thinking != null,
+        .hide_thinking_block = loaded_settings.hide_thinking_block,
+        .models_file = options.models_file,
+        .endpoint_override = options.endpoint,
+        .api_key_override = options.api_key,
+        .openai_client = &openai_client,
+        .responses_client = &responses_client,
+        .anthropic_client = &anthropic_client,
         .mode = options.mode,
         .extension_host = if (extension_host) |*host| host else null,
         .interrupt = if (interrupt) |*int| int else null,
@@ -375,18 +402,35 @@ fn run(init: std.process.Init) !void {
             .cwd = cwd,
             .commands = slash_commands.items,
             .compact = App.compactErased,
+            .switch_model = App.switchModelErased,
+            .set_thinking = App.setThinkingErased,
+            .quiet_startup = loaded_settings.quiet_startup,
         });
     }
 }
 
 const App = struct {
     allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
     io: std.Io,
+    environ: *const std.process.Environ.Map,
     runtime: *agent.Agent,
     store: *zpi.session.Store,
     provider: zpi.model.Provider,
     tools: []const agent.Tool,
     context_window: u32 = 0,
+    selection: config.Selection,
+    settings: settings_mod.Settings,
+    compaction_settings: zpi.compaction.Settings,
+    thinking_level: zpi.model.ThinkingLevel = .off,
+    explicit_thinking: bool = false,
+    hide_thinking_block: bool = false,
+    models_file: ?[]const u8 = null,
+    endpoint_override: ?[]const u8 = null,
+    api_key_override: ?[]const u8 = null,
+    openai_client: *zpi.openai.Client,
+    responses_client: *zpi.openai_responses.Client,
+    anthropic_client: *zpi.anthropic.Client,
     skills_system_prompt: ?[]const u8 = null,
     mode: args_module.OutputMode,
     extension_host: ?*zpi.extensions.Host = null,
@@ -396,6 +440,99 @@ const App = struct {
     fn resetCancelErased(context: *anyopaque) void {
         const self: *App = @ptrCast(@alignCast(context));
         if (self.interrupt) |int| int.reset();
+    }
+    fn switchModelErased(context: *anyopaque, arg: []const u8) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        return self.switchModel(arg);
+    }
+    fn setThinkingErased(context: *anyopaque, arg: []const u8) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        return self.setThinking(arg);
+    }
+    fn switchModel(self: *App, arg: []const u8) !void {
+        if (arg.len == 0) {
+            const choices = try config.listModels(self.arena, self.io, self.environ, self.models_file);
+            var out: std.ArrayList(u8) = .empty;
+            try out.print(self.arena, "Active: {s}/{s} ({s}, thinking: {s})\n", .{
+                self.selection.provider,
+                self.selection.model,
+                @tagName(self.selection.api),
+                @tagName(self.thinking_level),
+            });
+            for (choices) |choice| {
+                const active = std.mem.eql(u8, choice.provider, self.selection.provider) and std.mem.eql(u8, choice.id, self.selection.model);
+                try out.print(self.arena, "{s} {s}/{s} ({s})\n", .{ if (active) "*" else " ", choice.provider, choice.id, @tagName(choice.api) });
+            }
+            try tui.writeText(self.io, .stdout(), out.items);
+            return;
+        }
+        const next_selection = try config.load(self.arena, self.io, self.environ, .{
+            .model = arg,
+            .endpoint = self.endpoint_override,
+            .api_key = self.api_key_override,
+            .models_file = self.models_file,
+            .default_provider = self.selection.provider,
+        });
+        const next_thinking = next_selection.thinking_suffix orelse (if (!self.explicit_thinking) (try self.settings.thinkingFor(self.arena, next_selection.provider, next_selection.model)) else null) orelse self.thinking_level;
+        const next_compaction = try self.settings.compactionFor(self.arena, next_selection.provider, next_selection.model);
+        self.selection = next_selection;
+        self.thinking_level = next_thinking;
+        self.compaction_settings = next_compaction;
+        self.context_window = next_selection.context_window;
+        self.syncClients();
+        const notice = try std.fmt.allocPrint(self.arena, "[model: {s}/{s} ({s}), thinking: {s}]\n", .{
+            self.selection.provider,
+            self.selection.model,
+            @tagName(self.selection.api),
+            @tagName(self.thinking_level),
+        });
+        try tui.writeText(self.io, .stdout(), notice);
+    }
+    fn setThinking(self: *App, arg: []const u8) !void {
+        if (arg.len == 0) {
+            const msg = try std.fmt.allocPrint(self.arena, "Thinking: {s} (off, minimal, low, medium, high, xhigh, max)\n", .{@tagName(self.thinking_level)});
+            try tui.writeText(self.io, .stdout(), msg);
+            return;
+        }
+        const level = zpi.model.ThinkingLevel.parse(arg) orelse return error.InvalidThinkingLevel;
+        self.thinking_level = level;
+        self.explicit_thinking = true;
+        self.syncClients();
+        const msg = try std.fmt.allocPrint(self.arena, "[thinking: {s}]\n", .{@tagName(self.thinking_level)});
+        try tui.writeText(self.io, .stdout(), msg);
+    }
+    fn syncClients(self: *App) void {
+        self.openai_client.config.endpoint = self.selection.endpoint;
+        self.openai_client.config.model_id = self.selection.model;
+        self.openai_client.config.api_key = self.selection.api_key;
+        self.openai_client.config.headers = self.selection.headers;
+        self.openai_client.config.max_tokens = self.selection.max_tokens;
+        self.openai_client.config.context_window = self.selection.context_window;
+        self.openai_client.config.thinking_level = self.thinking_level;
+        self.openai_client.config.compat = self.selection.openai_compat;
+
+        self.responses_client.config.endpoint = self.selection.endpoint;
+        self.responses_client.config.model_id = self.selection.model;
+        self.responses_client.config.api_key = self.selection.api_key;
+        self.responses_client.config.headers = self.selection.headers;
+        self.responses_client.config.max_tokens = self.selection.max_tokens;
+        self.responses_client.config.context_window = self.selection.context_window;
+        self.responses_client.config.thinking_level = self.thinking_level;
+
+        self.anthropic_client.config.endpoint = self.selection.endpoint;
+        self.anthropic_client.config.model_id = self.selection.model;
+        self.anthropic_client.config.api_key = self.selection.api_key;
+        self.anthropic_client.config.headers = self.selection.headers;
+        self.anthropic_client.config.max_tokens = self.selection.max_tokens;
+        self.anthropic_client.config.context_window = self.selection.context_window;
+
+        const next_provider = switch (self.selection.api) {
+            .openai_completions => self.openai_client.provider(),
+            .openai_responses => self.responses_client.provider(),
+            .anthropic_messages => self.anthropic_client.provider(),
+        };
+        self.provider = next_provider;
+        self.runtime.provider = next_provider;
     }
     fn compactErased(context: *anyopaque, focus: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
@@ -418,7 +555,7 @@ const App = struct {
         for (self.tools, defs) |tool, *def| def.* = tool.definition;
 
         if (automatic) {
-            if (!try zpi.compaction.shouldCompact(self.allocator, self.runtime.messages.items, defs, self.context_window, .{})) {
+            if (!try zpi.compaction.shouldCompact(self.allocator, self.runtime.messages.items, defs, self.context_window, self.compaction_settings)) {
                 return false;
             }
         }
@@ -431,11 +568,11 @@ const App = struct {
         defer self.allocator.free(msgs);
         for (projected, msgs) |entry, *m| m.* = entry.message;
 
-        const keep_recent: u64 = if (self.context_window > 0)
-            @min(@as(u64, 20000), @max(@as(u64, 512), @as(u64, self.context_window) / 3))
+        const default_keep: u64 = if (self.context_window > 0)
+            @min(self.compaction_settings.keep_recent_tokens, @max(@as(u64, 512), @as(u64, self.context_window) / 3))
         else
-            20000;
-        const plan = try zpi.compaction.findPlan(self.allocator, msgs, keep_recent, force) orelse return false;
+            self.compaction_settings.keep_recent_tokens;
+        const plan = try zpi.compaction.findPlan(self.allocator, msgs, default_keep, force) orelse return false;
         if (plan.cut_index <= plan.summarize_start) return false;
 
         const tokens_before = try zpi.context_budget.estimateInputTokens(self.allocator, self.runtime.messages.items, defs);
@@ -509,8 +646,8 @@ const App = struct {
         }
         const info = try std.fmt.allocPrint(
             self.allocator,
-            "Session Info\n\nFile: {s}\nMessages: {d} total ({d} user, {d} assistant)\nTools: {d} calls, {d} results\nActive entry: {s}\n",
-            .{ self.store.file_path orelse "In-memory", total, users, assistants, tool_calls, tool_results, self.store.active_leaf orelse "root" },
+            "Session Info\n\nFile: {s}\nModel: {s}/{s} ({s}, thinking: {s})\nMessages: {d} total ({d} user, {d} assistant)\nTools: {d} calls, {d} results\nActive entry: {s}\n",
+            .{ self.store.file_path orelse "In-memory", self.selection.provider, self.selection.model, @tagName(self.selection.api), @tagName(self.thinking_level), total, users, assistants, tool_calls, tool_results, self.store.active_leaf orelse "root" },
         );
         defer self.allocator.free(info);
         try tui.writeText(self.io, .stdout(), info);
@@ -567,6 +704,13 @@ const App = struct {
                     try self.json(.{ .type = "provider_event", .event = provider_event });
                 } else if (self.mode == .interactive) switch (provider_event) {
                     .text_delta => |text| try tui.writeText(self.io, .stdout(), text),
+                    .thinking_delta => |text| if (!self.hide_thinking_block) {
+                        const stderr = std.Io.File.stderr();
+                        const color = stderr.supportsAnsiEscapeCodes(self.io) catch false;
+                        if (color) try stderr.writeStreamingAll(self.io, "\x1b[2m");
+                        try tui.writeText(self.io, stderr, text);
+                        if (color) try stderr.writeStreamingAll(self.io, "\x1b[0m");
+                    },
                     else => {},
                 };
             },
@@ -685,6 +829,7 @@ const App = struct {
 test {
     _ = args_module;
     _ = config;
+    _ = settings_mod;
     _ = initial_prompt;
     _ = tool_selection;
     _ = system_prompt;

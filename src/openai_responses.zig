@@ -17,6 +17,7 @@ pub const Config = struct {
     max_tokens: u32 = 16384,
     /// Zero disables approximate context-window clipping.
     context_window: u32 = 0,
+    thinking_level: model.ThinkingLevel = .off,
     timeout_ms: i64 = 60000,
 };
 
@@ -155,6 +156,23 @@ pub fn encodeRequest(allocator: std.mem.Allocator, config: Config, messages: []c
     try json.objectField("max_output_tokens");
     const clamped = try context_budget.clampMaxTokens(allocator, projected, tools, config.context_window, config.max_tokens);
     try json.write(@max(min_output_tokens, clamped));
+    if (config.thinking_level != .off) {
+        const effort = switch (config.thinking_level) {
+            .off => unreachable,
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh, .max => "xhigh",
+        };
+        try json.objectField("reasoning");
+        try json.beginObject();
+        try json.objectField("effort");
+        try json.write(effort);
+        try json.objectField("summary");
+        try json.write("auto");
+        try json.endObject();
+    }
     try json.objectField("input");
     try json.beginArray();
 

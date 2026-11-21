@@ -292,6 +292,30 @@ pub const RetryHint = struct {
     context_overflow: bool = false,
 };
 
+pub const ThinkingLevel = enum {
+    off,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+    max,
+
+    pub fn parse(text: []const u8) ?ThinkingLevel {
+        inline for (.{ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) |name| {
+            if (std.mem.eql(u8, text, name)) return @field(ThinkingLevel, name);
+        }
+        return null;
+    }
+};
+
+pub const ThinkingBudgets = struct {
+    minimal: u32 = 1024,
+    low: u32 = 2048,
+    medium: u32 = 8192,
+    high: u32 = 16384,
+};
+
 /// Synchronous function delivering zero or more events into the sink. This is
 /// a push stream, not a returned one-shot chunk. Implementations propagate sink
 /// errors and provider errors without emitting a successful `done`.

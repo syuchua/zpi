@@ -1,4 +1,5 @@
 const std = @import("std");
+const zpi = @import("zpi");
 const tool_selection = @import("tool_selection.zig");
 
 pub const OutputMode = enum { auto, interactive, print, json };
@@ -10,6 +11,7 @@ pub const Options = struct {
     prompt: std.ArrayList([]const u8) = .empty,
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    thinking: ?zpi.model.ThinkingLevel = null,
     endpoint: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     models_file: ?[]const u8 = null,
@@ -204,6 +206,8 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
                 result.provider = value;
             } else if (std.mem.eql(u8, name, "model")) {
                 result.model = value;
+            } else if (std.mem.eql(u8, name, "thinking")) {
+                result.thinking = zpi.model.ThinkingLevel.parse(value) orelse return error.InvalidThinkingLevel;
             } else if (std.mem.eql(u8, name, "endpoint")) result.endpoint = value else if (std.mem.eql(u8, name, "api-key")) result.api_key = value else if (std.mem.eql(u8, name, "models-file")) result.models_file = value else if (std.mem.eql(u8, name, "cwd")) result.cwd = value else if (std.mem.eql(u8, name, "session")) result.session = value else if (std.mem.eql(u8, name, "pi-sdk")) result.pi_sdk = value else if (std.mem.eql(u8, name, "extension-host")) result.extension_host = value else return error.UnknownOption;
             continue;
         }
@@ -374,4 +378,8 @@ test "CLI parses modes, overrides, positionals and conflicts" {
     try std.testing.expectEqual(@as(usize, 2), native.native_plugins.items.len);
     try std.testing.expectEqualStrings("/tmp/one.so", native.native_plugins.items[0]);
     try std.testing.expectError(error.EmptyPluginPath, parse(std.testing.allocator, &.{ "--native-plugin=", "hi" }, false, false));
+    var thinking_opts = try parse(std.testing.allocator, &.{ "--thinking", "high", "hi" }, false, false);
+    defer thinking_opts.prompt.deinit(std.testing.allocator);
+    try std.testing.expectEqual(zpi.model.ThinkingLevel.high, thinking_opts.thinking.?);
+    try std.testing.expectError(error.InvalidThinkingLevel, parse(std.testing.allocator, &.{ "--thinking=bogus", "hi" }, false, false));
 }

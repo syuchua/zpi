@@ -331,3 +331,21 @@ test "responses client streams SSE over HTTP, parses retry hints, and cancels st
     try std.testing.expectError(error.Canceled, stall_task.cancel(std.testing.io));
     try trig_task.await(std.testing.io);
 }
+
+test "responses request encodes reasoning effort and summary when thinking_level != off" {
+    const a = std.testing.allocator;
+    const msgs = [_]model.Message{.{ .role = .user, .content = &.{.{ .text = "hi" }} }};
+    const off_body = try openai_responses.encodeRequest(a, .{ .endpoint = "http://127.0.0.1/v1/responses", .model_id = "gpt-5", .api_key = "" }, &msgs, &.{});
+    defer a.free(off_body);
+    var off_parsed = try std.json.parseFromSlice(std.json.Value, a, off_body, .{});
+    defer off_parsed.deinit();
+    try std.testing.expect(off_parsed.value.object.get("reasoning") == null);
+
+    const xhigh_body = try openai_responses.encodeRequest(a, .{ .endpoint = "http://127.0.0.1/v1/responses", .model_id = "gpt-5", .api_key = "", .thinking_level = .max }, &msgs, &.{});
+    defer a.free(xhigh_body);
+    var xhigh_parsed = try std.json.parseFromSlice(std.json.Value, a, xhigh_body, .{});
+    defer xhigh_parsed.deinit();
+    const reasoning = xhigh_parsed.value.object.get("reasoning").?.object;
+    try std.testing.expectEqualStrings("xhigh", reasoning.get("effort").?.string);
+    try std.testing.expectEqualStrings("auto", reasoning.get("summary").?.string);
+}

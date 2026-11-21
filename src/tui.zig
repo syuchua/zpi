@@ -18,6 +18,9 @@ pub const Submit = struct {
     cwd: ?[]const u8 = null,
     commands: []const []const u8 = &.{},
     compact: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    switch_model: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    set_thinking: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    quiet_startup: bool = false,
 };
 
 const InputQueue = struct {
@@ -105,10 +108,12 @@ pub fn run(io: std.Io, submit: Submit) !void {
     const output = std.Io.File.stdout();
     if (!try input.isTty(io) or !try output.isTty(io)) return error.InteractiveTtyRequired;
     const color = try output.supportsAnsiEscapeCodes(io);
-    try output.writeStreamingAll(io, if (color)
-        "\x1b[1;36mzpi\x1b[0m  /help · /hotkeys · /exit · Ctrl-D exits\n"
-    else
-        "zpi  /help · /hotkeys · /exit · Ctrl-D exits\n");
+    if (!submit.quiet_startup) {
+        try output.writeStreamingAll(io, if (color)
+            "\x1b[1;36mzpi\x1b[0m  /help · /hotkeys · /exit · Ctrl-D exits\n"
+        else
+            "zpi  /help · /hotkeys · /exit · Ctrl-D exits\n");
+    }
 
     var queue = InputQueue{};
     var history = History{ .allocator = submit.allocator };
@@ -140,7 +145,33 @@ pub fn run(io: std.Io, submit: Submit) !void {
             continue;
         }
         if (std.mem.eql(u8, text, "/hotkeys")) {
-            try output.writeStreamingAll(io, "Keyboard shortcuts\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+            try output.writeStreamingAll(io, "Keyboard shortcuts\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\n/model    List or switch model (/model [provider/id])\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+            continue;
+        }
+        if (std.mem.eql(u8, text, "/model") or std.mem.startsWith(u8, text, "/model ")) {
+            const arg = if (text.len > "/model".len) std.mem.trim(u8, text["/model".len..], " \t") else "";
+            if (submit.switch_model) |run_switch| {
+                run_switch(submit.context, arg) catch |err| {
+                    var msg: [256]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
+                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                };
+            } else {
+                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /model unavailable\n");
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, text, "/thinking") or std.mem.startsWith(u8, text, "/thinking ")) {
+            const arg = if (text.len > "/thinking".len) std.mem.trim(u8, text["/thinking".len..], " \t") else "";
+            if (submit.set_thinking) |run_thinking| {
+                run_thinking(submit.context, arg) catch |err| {
+                    var msg: [256]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
+                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                };
+            } else {
+                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /thinking unavailable\n");
+            }
             continue;
         }
         if (std.mem.eql(u8, text, "/compact") or std.mem.startsWith(u8, text, "/compact ")) {
@@ -492,7 +523,7 @@ fn computeLayout(text: []const u8, cursor: usize, cols_raw: usize, prompt_cols: 
     return .{ .cursor_row = cursor_row, .cursor_col = cursor_col, .end_row = row, .end_col = col };
 }
 
-const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/compact", "/exit", "/quit" };
+const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
 fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Submit, cols: usize, color: bool) !bool {
     // Identify token immediately before cursor (bounded by whitespace).

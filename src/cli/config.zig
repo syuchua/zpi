@@ -5,7 +5,8 @@ const http_headers = @import("http_headers");
 const models_json = @import("models_json.zig");
 
 pub const Api = enum { openai_completions, openai_responses, anthropic_messages };
-const OpenAiCompat = @import("zpi").openai.Compat;
+const zpi = @import("zpi");
+const OpenAiCompat = zpi.openai.Compat;
 pub const Selection = struct {
     api: Api = .openai_completions,
     provider: []const u8 = "openai",
@@ -16,6 +17,7 @@ pub const Selection = struct {
     max_tokens: u32 = 16384,
     context_window: u32 = 0,
     openai_compat: OpenAiCompat = .{},
+    thinking_suffix: ?zpi.model.ThinkingLevel = null,
 };
 pub const Overrides = struct {
     provider: ?[]const u8 = null,
@@ -23,22 +25,31 @@ pub const Overrides = struct {
     endpoint: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     models_file: ?[]const u8 = null,
+    default_provider: ?[]const u8 = null,
+    default_model: ?[]const u8 = null,
+};
+pub const ModelChoice = struct {
+    provider: []const u8,
+    id: []const u8,
+    api: Api,
 };
 
 /// allocator is an invocation arena. All returned slices share its lifetime.
 pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, overrides: Overrides) !Selection {
-    const path = try modelsFilePath(allocator, env, overrides.models_file);
-    const providers: ?std.json.Value = if (path) |p| blk: {
-        const text = std.Io.Dir.cwd().readFileAlloc(io, p, allocator, .limited(4 * 1024 * 1024)) catch |err| {
-            if (err == error.FileNotFound and overrides.models_file == null and env.get("ZPI_MODELS_FILE") == null) break :blk null;
-            return err;
-        };
-        const normalized = try models_json.normalize(allocator, text);
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, normalized, .{ .parse_numbers = false });
-        break :blk try objectField(parsed.value, "providers");
-    } else null;
-    var provider: []const u8 = overrides.provider orelse "openai";
-    var model_override = overrides.model;
+    const providers = try loadProvidersObject(allocator, io, env, overrides.models_file);
+    var provider: []const u8 = overrides.provider orelse overrides.default_provider orelse "openai";
+    var model_override = overrides.model orelse if (overrides.provider == null or (overrides.default_provider != null and std.mem.eql(u8, overrides.provider.?, overrides.default_provider.?))) overrides.default_model else null;
+    var thinking_suffix: ?zpi.model.ThinkingLevel = null;
+
+    if (model_override) |raw_ref| {
+        if (splitThinkingSuffix(raw_ref)) |split| {
+            if (!hasLiteralConfiguredModel(providers, overrides.provider, raw_ref)) {
+                model_override = split.base;
+                thinking_suffix = split.level;
+            }
+        }
+    }
+
     if (overrides.provider == null) {
         if (model_override) |reference| {
             if (try splitKnownProvider(providers, reference)) |route| {
@@ -55,6 +66,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
         .model = model_override orelse (if (is_openai) env.get("OPENAI_MODEL") else if (is_anthropic) env.get("ANTHROPIC_MODEL") else null) orelse (if (is_anthropic) "claude-sonnet-4-5" else "gpt-4o-mini"),
         .endpoint = if (is_anthropic) env.get("ANTHROPIC_BASE_URL") orelse "https://api.anthropic.com/v1" else (if (is_openai) env.get("OPENAI_BASE_URL") else null) orelse "https://api.openai.com/v1",
         .api_key = (if (is_openai) env.get("OPENAI_API_KEY") else if (is_anthropic) env.get("ANTHROPIC_API_KEY") else null) orelse "",
+        .thinking_suffix = thinking_suffix,
     };
     var found_provider = is_openai or is_anthropic;
     if (providers) |configured| {
@@ -128,6 +140,89 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
     return result;
 }
 const ModelRoute = struct { provider: []const u8, model: []const u8 };
+
+fn loadProvidersObject(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, models_file_override: ?[]const u8) !?std.json.Value {
+    const path = try modelsFilePath(allocator, env, models_file_override);
+    return if (path) |p| blk: {
+        const text = std.Io.Dir.cwd().readFileAlloc(io, p, allocator, .limited(4 * 1024 * 1024)) catch |err| {
+            if (err == error.FileNotFound and models_file_override == null and env.get("ZPI_MODELS_FILE") == null) break :blk null;
+            return err;
+        };
+        const normalized = try models_json.normalize(allocator, text);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, normalized, .{ .parse_numbers = false });
+        break :blk try objectField(parsed.value, "providers");
+    } else null;
+}
+
+pub fn listModels(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, models_file_override: ?[]const u8) ![]ModelChoice {
+    const providers = try loadProvidersObject(allocator, io, env, models_file_override);
+    var choices: std.ArrayList(ModelChoice) = .empty;
+    try choices.append(allocator, .{ .provider = "openai", .id = "gpt-4o-mini", .api = .openai_completions });
+    try choices.append(allocator, .{ .provider = "anthropic", .id = "claude-sonnet-4-5", .api = .anthropic_messages });
+    if (providers) |configured| {
+        var it = configured.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const prov_name = entry.key_ptr.*;
+            const prov_api = if (entry.value_ptr.object.get("api")) |api| (parseApi(str(api) catch continue) catch continue) else Api.openai_completions;
+            const models = entry.value_ptr.object.get("models") orelse continue;
+            if (models != .array) continue;
+            for (models.array.items) |m| {
+                const id_val = m.object.get("id") orelse continue;
+                if (id_val != .string or id_val.string.len == 0) continue;
+                const m_api = if (m.object.get("api")) |api| (parseApi(str(api) catch continue) catch continue) else prov_api;
+                try choices.append(allocator, .{ .provider = prov_name, .id = id_val.string, .api = m_api });
+            }
+        }
+    }
+    return choices.toOwnedSlice(allocator);
+}
+
+const ThinkingSuffixSplit = struct { base: []const u8, level: zpi.model.ThinkingLevel };
+
+fn splitThinkingSuffix(reference: []const u8) ?ThinkingSuffixSplit {
+    const colon = std.mem.lastIndexOfScalar(u8, reference, ':') orelse return null;
+    if (colon == 0 or colon + 1 >= reference.len) return null;
+    const level = zpi.model.ThinkingLevel.parse(reference[colon + 1 ..]) orelse return null;
+    return .{ .base = reference[0..colon], .level = level };
+}
+
+fn hasLiteralConfiguredModel(providers: ?std.json.Value, explicit_provider: ?[]const u8, reference: []const u8) bool {
+    const configured = providers orelse return false;
+    if (explicit_provider) |prov| {
+        const entry = configured.object.get(prov) orelse return false;
+        if (entry != .object) return false;
+        const models = entry.object.get("models") orelse return false;
+        if (models != .array) return false;
+        for (models.array.items) |m| {
+            if (m == .object) {
+                if (m.object.get("id")) |id_val| {
+                    if (id_val == .string and std.mem.eql(u8, id_val.string, reference)) return true;
+                }
+            }
+        }
+        return false;
+    }
+    var it = configured.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        const models = entry.value_ptr.object.get("models") orelse continue;
+        if (models != .array) continue;
+        for (models.array.items) |m| {
+            if (m == .object) {
+                if (m.object.get("id")) |id_val| {
+                    if (id_val == .string) {
+                        if (std.mem.eql(u8, id_val.string, reference)) return true;
+                        if (providerPrefix(reference, entry.key_ptr.*)) |stripped| {
+                            if (std.mem.eql(u8, id_val.string, stripped)) return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
 
 /// Resolve pi's agent-directory environment override for the default model file.
 /// Explicit --models-file and ZPI_MODELS_FILE remain higher precedence.
@@ -823,4 +918,40 @@ test "OpenAI Responses API selection resolves /responses endpoint" {
     try std.testing.expectEqual(@as(u32, 8192), selected.max_tokens);
     const exact = try load(arena.allocator(), std.testing.io, &env, .{ .model = "codex/gpt-5-codex", .endpoint = "http://127.0.0.1/v1/responses/", .models_file = path });
     try std.testing.expectEqualStrings("http://127.0.0.1/v1/responses", exact.endpoint);
+}
+
+test "model thinking suffix, literal colon preservation, default provider/model, and model listing" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data =
+        \\{"providers":{"ollama":{"api":"openai-completions","baseUrl":"http://127.0.0.1/v1","models":[{"id":"qwen:7b"},{"id":"literal:high"}]},"codex":{"api":"openai-responses","baseUrl":"http://127.0.0.1/v1","models":[{"id":"gpt-5"}]}}}
+    });
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "models.json" });
+    defer std.testing.allocator.free(path);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const suffixed = try load(a, std.testing.io, &env, .{ .model = "codex/gpt-5:high", .models_file = path });
+    try std.testing.expectEqualStrings("codex", suffixed.provider);
+    try std.testing.expectEqualStrings("gpt-5", suffixed.model);
+    try std.testing.expectEqual(zpi.model.ThinkingLevel.high, suffixed.thinking_suffix.?);
+
+    const tag_colon = try load(a, std.testing.io, &env, .{ .model = "ollama/qwen:7b", .models_file = path });
+    try std.testing.expectEqualStrings("qwen:7b", tag_colon.model);
+    try std.testing.expect(tag_colon.thinking_suffix == null);
+
+    const literal_colon = try load(a, std.testing.io, &env, .{ .model = "ollama/literal:high", .models_file = path });
+    try std.testing.expectEqualStrings("literal:high", literal_colon.model);
+    try std.testing.expect(literal_colon.thinking_suffix == null);
+
+    const defaulted = try load(a, std.testing.io, &env, .{ .default_provider = "codex", .default_model = "gpt-5", .models_file = path });
+    try std.testing.expectEqualStrings("codex", defaulted.provider);
+    try std.testing.expectEqualStrings("gpt-5", defaulted.model);
+    try std.testing.expectEqual(Api.openai_responses, defaulted.api);
+
+    const listed = try listModels(a, std.testing.io, &env, path);
+    try std.testing.expect(listed.len >= 5);
 }

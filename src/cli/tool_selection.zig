@@ -6,6 +6,7 @@ pub const Candidate = struct { name: []const u8, builtin: bool };
 pub const Selection = struct {
     tools: ?[]const u8 = null,
     exclude: ?[]const u8 = null,
+    default_tools: ?[]const []const u8 = null,
     no_tools: bool = false,
     no_builtin_tools: bool = false,
 };
@@ -33,6 +34,33 @@ pub fn select(a: std.mem.Allocator, candidates: []const Candidate, selection: Se
     defer a.free(enabled);
     for (candidates, enabled) |candidate, *value| value.* = !selection.no_tools and
         (!candidate.builtin or (!selection.no_builtin_tools and isDefaultBuiltin(candidate.name)));
+    if (!selection.no_tools and selection.default_tools != null) {
+        const entries = selection.default_tools.?;
+        var has_plain = false;
+        for (entries) |entry| {
+            if (entry.len > 0 and entry[0] != '+' and entry[0] != '-') {
+                has_plain = true;
+                break;
+            }
+        }
+        if (has_plain or entries.len == 0) {
+            for (candidates, enabled) |candidate, *value| {
+                if (candidate.builtin) value.* = false;
+            }
+        }
+        for (entries) |entry| {
+            if (entry.len == 0) continue;
+            if (entry[0] == '+' or entry[0] == '-') {
+                for (candidates, enabled) |candidate, *value| {
+                    if (std.mem.eql(u8, entry[1..], candidate.name)) value.* = entry[0] == '+';
+                }
+            } else {
+                for (candidates, enabled) |candidate, *value| {
+                    if (std.mem.eql(u8, entry, candidate.name)) value.* = true;
+                }
+            }
+        }
+    }
     if (selection.tools) |list| {
         var entries = std.mem.splitScalar(u8, list, ',');
         var first: ?[]const u8 = null;
@@ -136,6 +164,9 @@ test "tool selection applies pi defaults allowlists modifiers and exclusions" {
     try std.testing.expectError(error.InvalidToolModifier, select(std.testing.allocator, &fixture, .{ .tools = "+r*" }));
     try std.testing.expectError(error.InvalidToolModifier, select(std.testing.allocator, &fixture, .{ .tools = "-" }));
     try expect(.{ .exclude = "+read" }, &.{ 0, 1, 2, 3, 7, 8 });
+    try expect(.{ .default_tools = &.{ "-bash", "+grep" } }, &.{ 0, 2, 3, 4, 7, 8 });
+    try expect(.{ .default_tools = &.{ "read", "ls" }, .tools = "+grep" }, &.{ 0, 4, 6, 7, 8 });
+    try expect(.{ .default_tools = &.{} }, &.{ 7, 8 });
 }
 test "tool selection wildcard matches full names and escapes other punctuation" {
     try std.testing.expect(matches("*", "read"));

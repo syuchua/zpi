@@ -54,6 +54,50 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['stream'] is True
+            if self.path == '/settings-switch/v1/chat/completions':
+                tools = {t['function']['name'] for t in request.get('tools', [])}
+                assert tools == {'read', 'edit', 'write', 'grep'}, tools
+                user = [m['content'] for m in request['messages'] if m['role'] == 'user'][-1]
+                if user == 'settings-check':
+                    assert request.get('reasoning_effort') == 'medium', request
+                    reply = 'settings ok'
+                elif user == 'thinking-override':
+                    assert request.get('reasoning_effort') == 'low', request
+                    reply = 'thinking override ok'
+                else:
+                    raise AssertionError(f'Unexpected settings chat prompt: {user}')
+                data = ('data: ' + json.dumps(self.text(reply)) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if self.path == '/settings-switch/v1/responses':
+                items = request['input']
+                last_user = next(m['content'][0]['text'] for m in reversed(items) if m.get('role') == 'user')
+                if last_user == 'switched-turn':
+                    assert request.get('reasoning') == {'effort': 'high', 'summary': 'auto'}, request
+                    reply = 'switched model ok'
+                elif last_user == 'thinking-turn':
+                    assert request.get('reasoning') == {'effort': 'minimal', 'summary': 'auto'}, request
+                    reply = 'switched thinking ok'
+                else:
+                    raise AssertionError(f'Unexpected settings responses prompt: {last_user}')
+                events = [
+                    ('response.created', {'response': {'id': 'resp_sw'}}),
+                    ('response.output_item.added', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_sw'}}),
+                    ('response.output_text.delta', {'output_index': 0, 'delta': reply}),
+                    ('response.output_item.done', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_sw', 'content': [{'type': 'output_text', 'text': reply}]}}),
+                    ('response.completed', {'response': {'id': 'resp_sw', 'status': 'completed', 'usage': {'input_tokens': 2, 'output_tokens': 2, 'total_tokens': 4}}}),
+                ]
+                data = ''.join(f'event: {k}\ndata: {json.dumps(dict(p, type=k))}\n\n' for k, p in events).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/responses-fixture/v1/responses':
                 assert self.headers.get_all('Authorization') == ['Bearer fake-responses-key']
                 assert self.headers['x-responses-fixture'] == 'enabled'
@@ -1251,6 +1295,128 @@ def check_https_proxy(root, environment, server):
         proxy_server.shutdown()
         proxy_server.server_close()
         proxy_thread.join(timeout=2)
+
+
+def check_settings_and_model_switch(root, environment, server):
+    agent_dir = root / 'settings-agent'
+    agent_dir.mkdir()
+    sessions_dir = root / 'settings-sessions'
+    (agent_dir / 'models.json').write_text(json.dumps({'providers': {
+        'settings-chat': {
+            'api': 'openai-completions',
+            'baseUrl': f'http://127.0.0.1:{server.server_port}/settings-switch/v1',
+            'apiKey': 'settings-key',
+            'models': [{'id': 'chat-m'}],
+        },
+        'settings-resp': {
+            'api': 'openai-responses',
+            'baseUrl': f'http://127.0.0.1:{server.server_port}/settings-switch/v1',
+            'apiKey': 'settings-key',
+            'models': [{'id': 'gpt-5'}],
+        },
+    }}))
+    (agent_dir / 'settings.json').write_text(json.dumps({
+        'defaultProvider': 'settings-chat',
+        'defaultModel': 'chat-m',
+        'defaultThinkingLevel': 'medium',
+        'defaultTools': ['-bash', '+grep'],
+        'sessionDir': str(sessions_dir),
+        'quietStartup': True,
+        'compaction': {'enabled': True, 'reserveTokens': 12000, 'keepRecentTokens': 8000},
+        'retry': {'enabled': True, 'maxRetries': 2, 'baseDelayMs': 100, 'maxAgentDelayMs': 5000},
+    }))
+    env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir))
+    res = run_repo_cli([str(BINARY), '--no-proxy', '-p', 'settings-check'],
+                       input='', text=True, capture_output=True, env=env, timeout=20)
+    assert res.returncode == 0 and res.stdout == 'settings ok\n', (res.stderr, res.stdout)
+    assert len(list(sessions_dir.glob('*.jsonl'))) == 1
+
+    overridden = run_repo_cli([str(BINARY), '--no-proxy', '--no-session', '--thinking', 'low', '-p', 'thinking-override'],
+                              input='', text=True, capture_output=True, env=env, timeout=20)
+    assert overridden.returncode == 0 and overridden.stdout == 'thinking override ok\n', overridden.stderr
+
+    # Exercise quietStartup, /model listing, /model switching to openai-responses:high, and /thinking minimal in a PTY.
+    master, slave = pty.openpty()
+    before = termios.tcgetattr(slave)
+    transcript = bytearray()
+    process = subprocess.Popen(
+        [str(BINARY), '--no-proxy', '--no-session'],
+        cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+    )
+    os.close(slave)
+
+    def read_until(marker, start=0):
+        deadline = time.monotonic() + 10
+        while transcript.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('settings PTY timed out', marker, bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('terminal exited early', marker, bytes(transcript))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+        return transcript.find(marker, start)
+
+    def read_prompt(start=0):
+        deadline = time.monotonic() + 10
+        while True:
+            for marker in (b'>\x1b[0m ', b'> '):
+                pos = transcript.find(marker, start)
+                if pos != -1:
+                    return pos + len(marker)
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('settings PTY prompt timed out', bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('terminal exited early', bytes(transcript[start:]))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+
+    try:
+        p = read_prompt()
+        assert b'Ctrl-D exits' not in transcript, bytes(transcript)
+        os.write(master, b'/model\n')
+        p = read_prompt(read_until(b'settings-resp/gpt-5', p))
+        os.write(master, b'/model settings-resp/gpt-5:high\n')
+        p = read_prompt(read_until(b'[model: settings-resp/gpt-5 (openai_responses), thinking: high]', p))
+        os.write(master, b'switched-turn\n')
+        p = read_prompt(read_until(b'switched model ok', p))
+        os.write(master, b'/thinking minimal\n')
+        p = read_prompt(read_until(b'[thinking: minimal]', p))
+        os.write(master, b'thinking-turn\n')
+        p = read_prompt(read_until(b'switched thinking ok', p))
+        os.write(master, b'/exit\n')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+        after = termios.tcgetattr(master)
+        pendin = getattr(termios, 'PENDIN', 0)
+        assert (after[:3], after[3] & ~pendin, after[4:]) == (before[:3], before[3] & ~pendin, before[4:])
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def check_pi_import(root, resume_args, environment, server):
@@ -2584,6 +2750,7 @@ for line in sys.stdin:
             assert failed_responses.returncode != 0
             assert not (root / 'responses-uncommitted.txt').exists()
             check_https_proxy(root, environment, server)
+            check_settings_and_model_switch(root, environment, server)
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'
