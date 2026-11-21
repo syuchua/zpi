@@ -64,6 +64,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "context_budget", .module = context_budget } },
     });
+    const openai_responses = b.addModule("openai_responses", .{
+        .root_source_file = b.path("src/openai_responses.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "context_budget", .module = context_budget } },
+    });
     const native_plugin = b.addModule("native_plugin", .{
         .root_source_file = b.path("src/native_plugin.zig"),
         .target = target,
@@ -132,6 +138,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse", .module = sse },
             .{ .name = "model", .module = model },
             .{ .name = "openai", .module = openai },
+            .{ .name = "openai_responses", .module = openai_responses },
             .{ .name = "anthropic", .module = anthropic },
             .{ .name = "extensions", .module = extensions },
             .{ .name = "extension_tools", .module = extension_tools },
@@ -236,6 +243,15 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{ .{ .name = "openai", .module = openai }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers } },
+        }),
+    });
+    const openai_responses_tests = b.addTest(.{
+        .name = "openai-responses-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/openai_responses_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{ .{ .name = "openai_responses", .module = openai_responses }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers } },
         }),
     });
     const anthropic_edge_tests = b.addTest(.{
@@ -366,6 +382,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(prompt_template_tests).step);
     test_step.dependOn(&b.addRunArtifact(pi_session_tests).step);
     test_step.dependOn(&b.addRunArtifact(openai_tests).step);
+    test_step.dependOn(&b.addRunArtifact(openai_responses_tests).step);
     test_step.dependOn(&b.addRunArtifact(agent_tests).step);
     test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     test_step.dependOn(&b.addRunArtifact(session_tests).step);
@@ -391,6 +408,7 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(prompt_template_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(pi_session_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(openai_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(openai_responses_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(agent_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(tool_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(session_tests, .{}).step);

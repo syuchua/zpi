@@ -2,6 +2,7 @@ const std = @import("std");
 pub const sse = @import("sse");
 pub const model = @import("model");
 pub const openai = @import("openai");
+pub const openai_responses = @import("openai_responses");
 pub const anthropic = @import("anthropic");
 pub const extensions = @import("extensions");
 pub const extension_tools = @import("extension_tools");

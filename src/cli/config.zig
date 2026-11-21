@@ -4,7 +4,7 @@ const std = @import("std");
 const http_headers = @import("http_headers");
 const models_json = @import("models_json.zig");
 
-pub const Api = enum { openai_completions, anthropic_messages };
+pub const Api = enum { openai_completions, openai_responses, anthropic_messages };
 const OpenAiCompat = @import("zpi").openai.Compat;
 pub const Selection = struct {
     api: Api = .openai_completions,
@@ -119,7 +119,11 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
     if (model_override) |model| result.model = model;
     if (result.model.len == 0) return error.InvalidModel;
     const base = std.mem.trimEnd(u8, result.endpoint, "/");
-    const suffix = if (result.api == .anthropic_messages) "/messages" else "/chat/completions";
+    const suffix = switch (result.api) {
+        .anthropic_messages => "/messages",
+        .openai_responses => "/responses",
+        .openai_completions => "/chat/completions",
+    };
     result.endpoint = if (std.mem.endsWith(u8, base, suffix)) base else if (result.api == .anthropic_messages and !std.mem.endsWith(u8, base, "/v1")) try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{base}) else try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
     return result;
 }
@@ -503,6 +507,7 @@ fn validEnvironmentName(name: []const u8) bool {
 }
 fn parseApi(name: []const u8) !Api {
     if (std.mem.eql(u8, name, "openai-completions")) return .openai_completions;
+    if (std.mem.eql(u8, name, "openai-responses")) return .openai_responses;
     if (std.mem.eql(u8, name, "anthropic-messages")) return .anthropic_messages;
     return error.UnsupportedProviderApi;
 }
@@ -798,4 +803,24 @@ test "custom headers reject reserved names invalid values and unresolved variabl
         defer parsed.deinit();
         try std.testing.expectError(case.expected, resolveHeaders(std.testing.allocator, &env, parsed.value, null, null));
     }
+}
+
+test "OpenAI Responses API selection resolves /responses endpoint" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data =
+        \\{"providers":{"codex":{"api":"openai-responses","baseUrl":"http://127.0.0.1/v1","models":[{"id":"gpt-5-codex","maxTokens":8192}]}}}
+    });
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "models.json" });
+    defer std.testing.allocator.free(path);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = try load(arena.allocator(), std.testing.io, &env, .{ .model = "codex/gpt-5-codex", .models_file = path });
+    try std.testing.expectEqual(Api.openai_responses, selected.api);
+    try std.testing.expectEqualStrings("http://127.0.0.1/v1/responses", selected.endpoint);
+    try std.testing.expectEqual(@as(u32, 8192), selected.max_tokens);
+    const exact = try load(arena.allocator(), std.testing.io, &env, .{ .model = "codex/gpt-5-codex", .endpoint = "http://127.0.0.1/v1/responses/", .models_file = path });
+    try std.testing.expectEqualStrings("http://127.0.0.1/v1/responses", exact.endpoint);
 }

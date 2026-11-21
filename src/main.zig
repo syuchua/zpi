@@ -157,6 +157,14 @@ fn run(init: std.process.Init) !void {
         .context_window = selection.context_window,
         .compat = selection.openai_compat,
     }, .environ = init.environ_map, .proxy_policy = if (options.no_proxy) .none else .system, .cancel = cancel_token };
+    var responses_client = zpi.openai_responses.Client{ .io = init.io, .config = .{
+        .endpoint = selection.endpoint,
+        .model_id = selection.model,
+        .api_key = selection.api_key,
+        .headers = selection.headers,
+        .max_tokens = selection.max_tokens,
+        .context_window = selection.context_window,
+    }, .environ = init.environ_map, .proxy_policy = if (options.no_proxy) .none else .system, .cancel = cancel_token };
     var anthropic_client = zpi.anthropic.Client{ .io = init.io, .config = .{
         .endpoint = selection.endpoint,
         .model_id = selection.model,
@@ -167,6 +175,7 @@ fn run(init: std.process.Init) !void {
     }, .environ = init.environ_map, .proxy_policy = if (options.no_proxy) .none else .system, .cancel = cancel_token };
     const provider = switch (selection.api) {
         .openai_completions => openai_client.provider(),
+        .openai_responses => responses_client.provider(),
         .anthropic_messages => anthropic_client.provider(),
     };
     var cwd: []const u8 = if (options.cwd) |path| try std.fs.path.resolveAlloc(a, &.{ host_cwd, path }) else host_cwd;

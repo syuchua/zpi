@@ -33,6 +33,19 @@ class Handler(BaseHTTPRequestHandler):
                 ]
                 data = ''.join(f'event: {kind}\ndata: {json.dumps(dict(payload, type=kind))}\n\n'
                                for kind, payload in events).encode()
+            elif self.server.api == 'openai-responses':
+                wire_messages = body['input']
+                assert wire_messages[0] == {'role': 'system', 'content': '1234567'}
+                user = next(block['text'] for block in wire_messages[-1]['content'] if block['type'] == 'input_text')
+                events = [
+                    ('response.created', {'response': {'id': 'resp_budget'}}),
+                    ('response.output_item.added', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_1'}}),
+                    ('response.output_text.delta', {'output_index': 0, 'delta': 'budget complete'}),
+                    ('response.output_item.done', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_1', 'content': [{'type': 'output_text', 'text': 'budget complete'}]}}),
+                    ('response.completed', {'response': {'id': 'resp_budget', 'status': 'completed', 'usage': {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2}}}),
+                ]
+                data = ''.join(f'event: {kind}\ndata: {json.dumps(dict(payload, type=kind))}\n\n'
+                               for kind, payload in events).encode()
             else:
                 wire_messages = body['messages']
                 user = wire_messages[-1]['content']
@@ -44,7 +57,7 @@ class Handler(BaseHTTPRequestHandler):
             for message in wire_messages:
                 content = message['content']
                 text = content if isinstance(content, str) else ''.join(
-                    block.get('text', '') for block in content if block.get('type') == 'text')
+                    block.get('text', '') for block in content if block.get('type') in ('text', 'input_text', 'output_text'))
                 units = len(text.encode('utf-16-le')) // 2
                 estimate += (units * 2 + 6) // 7
             if self.server.api == 'anthropic-messages':
@@ -54,16 +67,22 @@ class Handler(BaseHTTPRequestHandler):
             if room < 32768:
                 room = min(32768, self.server.window - estimate - 4096)
             expected = min(self.server.max_tokens, max(1, room))
-            assert body['max_tokens'] == expected, {
-                'actual': body['max_tokens'], 'expected': expected,
+            if self.server.api == 'openai-responses':
+                expected = max(16, expected)
+                sent_tokens = body['max_output_tokens']
+            else:
+                sent_tokens = body['max_tokens']
+            assert sent_tokens == expected, {
+                'actual': sent_tokens, 'expected': expected,
                 'estimate': estimate, 'window': self.server.window,
                 'model_max_tokens': self.server.max_tokens, 'user': user,
             }
             if user == 'second turn':
                 assert any('budget complete' in str(message.get('content', '')) for message in wire_messages[:-1])
             else:
-                assert body['max_tokens'] == self.server.expected, (body['max_tokens'], self.server.expected)
-            self.server.observed.append((self.server.api, user, body['max_tokens']))
+                expected_first = max(16, self.server.expected) if self.server.api == 'openai-responses' else self.server.expected
+                assert sent_tokens == expected_first, (sent_tokens, expected_first)
+            self.server.observed.append((self.server.api, user, sent_tokens))
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.send_header('Content-Length', str(len(data)))
@@ -102,7 +121,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix='zpi-budget-') as directory:
             root = Path(directory)
             config = root / 'models.json'
-            for api in ('openai-completions', 'anthropic-messages'):
+            for api in ('openai-completions', 'openai-responses', 'anthropic-messages'):
                 for index, (window, ceiling, prompt, expected) in enumerate(cases):
                     server.api, server.prompt, server.expected = api, prompt, expected
                     server.window, server.max_tokens = window, ceiling
@@ -130,8 +149,8 @@ def main():
                                             env=dict(os.environ, HOME=str(root)), timeout=20)
                     assert result.returncode == 0 and result.stdout == 'budget complete\n', (result.stderr, server.failures)
             assert not server.failures, server.failures
-            assert len(server.observed) == len(cases) * 4, len(server.observed)
-            print(f'Context budget integration passed: {len(server.observed)} recalculated request budgets across both APIs and initial/resumed turns; fixed/ratio margins, fallback cap, model ceilings, floor and UTF-8')
+            assert len(server.observed) == len(cases) * 6, len(server.observed)
+            print(f'Context budget integration passed: {len(server.observed)} recalculated request budgets across all three APIs and initial/resumed turns; fixed/ratio margins, fallback cap, model ceilings, floor and UTF-8')
     finally:
         server.shutdown()
         server.server_close()

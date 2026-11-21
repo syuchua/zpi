@@ -52,6 +52,75 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['stream'] is True
+            if self.path == '/responses-fixture/v1/responses':
+                assert self.headers.get_all('Authorization') == ['Bearer fake-responses-key']
+                assert self.headers['x-responses-fixture'] == 'enabled'
+                assert request['store'] is False
+                assert request['max_output_tokens'] == 2048
+                items = request['input']
+                last_user = next(m['content'][0]['text'] for m in reversed(items) if m.get('role') == 'user')
+                outputs = [m for m in items if m.get('type') == 'function_call_output']
+                def sse_pack(ev_list):
+                    return ''.join(f'event: {kind}\ndata: {json.dumps(dict(payload, type=kind))}\n\n'
+                                   for kind, payload in ev_list).encode()
+                if last_user == 'responses-retry':
+                    self.server.responses_retry_count += 1
+                    if self.server.responses_retry_count == 1:
+                        self.send_response(429)
+                        self.send_header('Retry-After', '1')
+                        self.send_header('Content-Length', '0')
+                        self.end_headers()
+                        return
+                    data = sse_pack([
+                        ('response.created', {'response': {'id': 'resp_r1'}}),
+                        ('response.output_item.added', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_r1'}}),
+                        ('response.output_text.delta', {'output_index': 0, 'delta': 'responses retried'}),
+                        ('response.output_item.done', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_r1', 'content': [{'type': 'output_text', 'text': 'responses retried'}]}}),
+                        ('response.completed', {'response': {'id': 'resp_r1', 'status': 'completed', 'usage': {'input_tokens': 2, 'output_tokens': 2, 'total_tokens': 4}}}),
+                    ])
+                elif last_user == 'responses-fail-tool':
+                    data = sse_pack([
+                        ('response.created', {'response': {'id': 'resp_bad'}}),
+                        ('response.output_item.added', {'output_index': 0, 'item': {'type': 'function_call', 'id': 'fc_bad', 'call_id': 'call_bad', 'name': 'write', 'arguments': '{"path":"responses-uncommitted.txt","content":"bad"}'}}),
+                        ('response.output_item.done', {'output_index': 0, 'item': {'type': 'function_call', 'id': 'fc_bad', 'call_id': 'call_bad', 'name': 'write', 'arguments': '{"path":"responses-uncommitted.txt","content":"bad"}'}}),
+                        ('response.failed', {'response': {'id': 'resp_bad', 'status': 'failed', 'error': {'code': 'server_error', 'message': 'boom'}}}),
+                    ])
+                elif last_user == 'responses-workflow' and not outputs:
+                    data = sse_pack([
+                        ('response.created', {'response': {'id': 'resp_w1'}}),
+                        ('response.output_item.added', {'output_index': 0, 'item': {'type': 'function_call', 'id': 'fc_1', 'call_id': 'call_resp_1', 'name': 'write', 'arguments': '{"path":"responses.txt",'}}),
+                        ('response.function_call_arguments.delta', {'output_index': 0, 'delta': '"content":"响应成功\\n"}'}),
+                        ('response.output_item.done', {'output_index': 0, 'item': {'type': 'function_call', 'id': 'fc_1', 'call_id': 'call_resp_1', 'name': 'write', 'arguments': '{"path":"responses.txt","content":"响应成功\\n"}'}}),
+                        ('response.completed', {'response': {'id': 'resp_w1', 'status': 'completed', 'usage': {'input_tokens': 5, 'output_tokens': 3, 'total_tokens': 8}}}),
+                    ])
+                elif last_user == 'responses-workflow':
+                    assert outputs[-1]['call_id'] == 'call_resp_1', outputs
+                    calls = [m for m in items if m.get('type') == 'function_call']
+                    assert calls[-1]['id'] == 'fc_1' and calls[-1]['call_id'] == 'call_resp_1', calls
+                    data = sse_pack([
+                        ('response.created', {'response': {'id': 'resp_w2'}}),
+                        ('response.output_item.added', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_w2'}}),
+                        ('response.output_text.delta', {'output_index': 0, 'delta': 'responses complete'}),
+                        ('response.output_item.done', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_w2', 'content': [{'type': 'output_text', 'text': 'responses complete'}]}}),
+                        ('response.completed', {'response': {'id': 'resp_w2', 'status': 'completed', 'usage': {'input_tokens': 8, 'output_tokens': 3, 'total_tokens': 11}}}),
+                    ])
+                elif last_user == 'responses-resume':
+                    assert any(m.get('type') == 'function_call_output' and m.get('call_id') == 'call_resp_1' for m in items), items
+                    data = sse_pack([
+                        ('response.created', {'response': {'id': 'resp_w3'}}),
+                        ('response.output_item.added', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_w3'}}),
+                        ('response.output_text.delta', {'output_index': 0, 'delta': 'responses resumed'}),
+                        ('response.output_item.done', {'output_index': 0, 'item': {'type': 'message', 'id': 'msg_w3', 'content': [{'type': 'output_text', 'text': 'responses resumed'}]}}),
+                        ('response.completed', {'response': {'id': 'resp_w3', 'status': 'completed', 'usage': {'input_tokens': 10, 'output_tokens': 3, 'total_tokens': 13}}}),
+                    ])
+                else:
+                    raise AssertionError(f'Unexpected responses prompt: {last_user}')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/auto-compact/chat/completions':
                 messages = request['messages']
                 user = [m['content'] for m in messages if m['role'] == 'user'][-1]
@@ -1259,6 +1328,7 @@ def main():
     server.expected_budget_path = ''
     server.failure_request_count = 0
     server.retry_request_count = 0
+    server.responses_retry_count = 0
     server.cancel_stream_release = threading.Event()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -2326,6 +2396,30 @@ for line in sys.stdin:
                 assert response.returncode == 0, (response.stderr, server.failures)
                 assert response.stdout == expected, repr(response.stdout)
             assert (root / 'anthropic.txt').read_text() == '你好\n'
+            # Exercise openai-responses API selection, streaming function_call -> function_call_output,
+            # retry backoff, resume, and fail-closed partial tool call rejection.
+            config.write_text(json.dumps({'providers': {'responses-fixture': {
+                'api': 'openai-responses',
+                'baseUrl': f'http://127.0.0.1:{server.server_port}/responses-fixture/v1',
+                'apiKey': 'fake-responses-key',
+                'headers': {'X-Responses-Fixture': 'enabled'},
+                'models': [{'id': 'gpt-5-fixture', 'maxTokens': 2048}],
+            }}}))
+            responses_args = [str(BINARY), '--no-proxy', '--models-file', str(config),
+                              '--provider', 'responses-fixture', '--cwd', directory,
+                              '--session', str(root / 'responses.jsonl')]
+            for prompt, expected in [('responses-retry', 'responses retried\n'),
+                                     ('responses-workflow', 'responses complete\n'),
+                                     ('responses-resume', 'responses resumed\n')]:
+                response = run_repo_cli(responses_args + ['-p', prompt], text=True,
+                                          capture_output=True, env=environment, timeout=20)
+                assert response.returncode == 0, (response.stderr, server.failures)
+                assert response.stdout == expected, repr(response.stdout)
+            assert (root / 'responses.txt').read_text() == '响应成功\n'
+            failed_responses = run_repo_cli(responses_args + ['--no-session', '-p', 'responses-fail-tool'],
+                                            text=True, capture_output=True, env=environment, timeout=20)
+            assert failed_responses.returncode != 0
+            assert not (root / 'responses-uncommitted.txt').exists()
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'
