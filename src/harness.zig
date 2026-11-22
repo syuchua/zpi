@@ -381,7 +381,7 @@ pub const Harness = struct {
             const opened = zpi.session.Store.open(gpa, io, path) catch |err| {
                 if (err != error.FileNotFound) return err;
                 if (options.branch != null or continuing) return error.FileNotFound;
-                break :blk try zpi.session.Store.create(gpa, io, path, cwd);
+                break :blk try zpi.session.Store.deferred(gpa, io, path, cwd);
             };
             if (options.cwd == null and opened.cwd.len > 0) cwd = opened.cwd;
             break :blk opened;
@@ -681,8 +681,10 @@ pub const Harness = struct {
         };
         defer self.gpa.free(resolved);
 
-        if (self.store.file_path) |active_path| {
-            if (std.mem.eql(u8, active_path, resolved)) return self.statusSummary();
+        if (!self.store.pending_create) {
+            if (self.store.file_path) |active_path| {
+                if (std.mem.eql(u8, active_path, resolved)) return self.statusSummary();
+            }
         }
 
         var next_store = try zpi.session.Store.open(self.gpa, self.io, resolved);
@@ -1333,6 +1335,23 @@ test "harness lists and resumes sessions in session_dir without mutating state o
     const stats2 = try h.sessionStats();
     try std.testing.expectEqualStrings(s2_path, stats2.file_path.?);
     try std.testing.expectEqual(@as(usize, 1), stats2.total_messages);
+
+    // Exiting a fresh Harness without any non-system conversation record must
+    // not leave an empty .jsonl file on disk.
+    const empty_path = try std.fs.path.join(a, &.{ dir, "unused-empty.jsonl" });
+    defer a.free(empty_path);
+    {
+        const unused = try Harness.create(a, io, &env, .{
+            .host_cwd = dir,
+            .session = empty_path,
+            .session_dir = dir,
+            .no_tools = true,
+            .no_skills = true,
+            .no_prompt_templates = true,
+        }, null);
+        defer unused.deinit();
+    }
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, empty_path, .{}));
 
     // Steering queue push/drain/pop preserve FIFO order and trimming.
     try h.pushSteering("   ");

@@ -95,6 +95,7 @@ pub const Store = struct {
     cwd: []const u8 = "",
     next_id: u64 = 1,
     file: ?std.Io.File = null,
+    pending_create: bool = false,
     write_offset: u64 = 0,
     corrupt_line: ?usize = null,
     failed: bool = false,
@@ -102,22 +103,45 @@ pub const Store = struct {
     pub fn memory(allocator: std.mem.Allocator, io: std.Io) Store {
         return .{ .allocator = allocator, .io = io, .arena = .init(allocator) };
     }
-    /// Never truncate an existing session: creation must use a fresh path.
-    pub fn create(allocator: std.mem.Allocator, io: std.Io, path: []const u8, cwd: []const u8) !Store {
+    /// Stage a fresh session path in memory without creating the file until a
+    /// non-system conversation record is appended.
+    pub fn deferred(allocator: std.mem.Allocator, io: std.Io, path: []const u8, cwd: []const u8) !Store {
         var store = memory(allocator, io);
         errdefer store.deinit();
-        if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(io, parent);
-        store.file = try std.Io.Dir.cwd().createFile(io, path, .{
+        store.cwd = try store.arena.allocator().dupe(u8, cwd);
+        store.file_path = try store.arena.allocator().dupe(u8, path);
+        store.pending_create = true;
+        return store;
+    }
+    /// Never truncate an existing session: creation must use a fresh path.
+    pub fn create(allocator: std.mem.Allocator, io: std.Io, path: []const u8, cwd: []const u8) !Store {
+        var store = try deferred(allocator, io, path, cwd);
+        errdefer store.deinit();
+        try store.ensureMaterialized();
+        return store;
+    }
+    fn ensureMaterialized(self: *Store) !void {
+        if (!self.pending_create) return;
+        const path = self.file_path orelse return;
+        if (std.fs.path.dirname(path)) |parent| if (parent.len > 0) try std.Io.Dir.cwd().createDirPath(self.io, parent);
+        self.file = try std.Io.Dir.cwd().createFile(self.io, path, .{
             .read = true,
             .exclusive = true,
             .lock = .exclusive,
             .lock_nonblocking = true,
             .permissions = .fromMode(0o600),
         });
-        store.cwd = try store.arena.allocator().dupe(u8, cwd);
-        store.file_path = try store.arena.allocator().dupe(u8, path);
-        try store.writeRecord(.{ .type = .session, .cwd = cwd });
-        return store;
+        try self.writeRecord(.{ .type = .session, .cwd = self.cwd });
+        for (self.entries.items) |entry| {
+            if (entry.branch_summary) |bs| {
+                try self.writeRecord(.{ .type = .branch_summary, .id = entry.id, .parent_id = entry.parent_id, .from_id = bs.from_id, .summary = bs.summary });
+            } else if (entry.compaction) |comp| {
+                try self.writeRecord(.{ .type = .compaction, .version = 1, .id = entry.id, .parent_id = entry.parent_id, .summary = comp.summary, .first_kept_id = comp.first_kept_id, .tokens_before = comp.tokens_before });
+            } else {
+                try self.writeRecord(.{ .type = .message, .version = if (entry.message.system_prompt_replace) 2 else 1, .id = entry.id, .parent_id = entry.parent_id, .message = entry.message });
+            }
+        }
+        self.pending_create = false;
     }
     pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Store {
         var store = memory(allocator, io);
@@ -163,6 +187,7 @@ pub const Store = struct {
         const owned = try agent.cloneMessage(a, message);
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+        if (owned.role != .system) try self.ensureMaterialized();
         try self.writeRecord(.{ .type = .message, .version = if (owned.system_prompt_replace) 2 else 1, .id = id, .parent_id = self.active_leaf, .message = owned });
         self.entries.appendAssumeCapacity(.{ .id = id, .parent_id = self.active_leaf, .message = owned });
         self.id_index.putAssumeCapacityNoClobber(id, self.entries.items.len - 1);
@@ -186,6 +211,7 @@ pub const Store = struct {
         const synthetic = model.Message{ .role = .user, .content = content };
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+        try self.ensureMaterialized();
         try self.writeRecord(.{
             .type = .compaction,
             .version = 1,
@@ -233,6 +259,7 @@ pub const Store = struct {
         };
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+        try self.ensureMaterialized();
         try self.writeRecord(.{ .type = .branch_summary, .id = id, .parent_id = parent_id, .from_id = from_id, .summary = owned_summary });
         self.entries.appendAssumeCapacity(entry);
         self.id_index.putAssumeCapacityNoClobber(id, self.entries.items.len - 1);
@@ -261,6 +288,7 @@ pub const Store = struct {
     pub fn setLeaf(self: *Store, target: ?[]const u8) !void {
         const path = try self.pathFrom(self.allocator, target);
         defer self.allocator.free(path);
+        try self.ensureMaterialized();
         try self.writeRecord(.{ .type = .leaf, .id = target });
         self.active_leaf = if (target) |id| self.entries.items[self.find(id).?].id else null;
     }

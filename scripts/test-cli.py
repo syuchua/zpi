@@ -2191,6 +2191,7 @@ def check_resume_picker(root, environment):
     sessions_dir.mkdir()
     alpha = sessions_dir / 'alpha-session.jsonl'
     beta = sessions_dir / 'beta-session.jsonl'
+    empty_sys = sessions_dir / 'empty-session.jsonl'
 
     def write_session(path, user_text, assistant_text):
         records = [
@@ -2206,8 +2207,14 @@ def check_resume_picker(root, environment):
 
     write_session(alpha, 'first task alpha', 'alpha answer')
     write_session(beta, 'second task beta', 'beta answer')
+    empty_sys.write_text(''.join(json.dumps(r) + '\n' for r in [
+        {'type': 'session', 'version': 1, 'format': 'zpi', 'cwd': str(resume_work)},
+        {'type': 'message', 'id': '1', 'parent_id': None, 'version': 1,
+         'message': {'role': 'system', 'content': [{'text': 'sys only'}]}},
+    ]))
     os.utime(alpha, (1000, 1000))
     os.utime(beta, (2000, 2000))
+    os.utime(empty_sys, (3000, 3000))
 
     env = dict(environment, TERM='xterm-256color', PI_CODING_AGENT_SESSION_DIR=str(sessions_dir))
     env.pop('NO_COLOR', None)
@@ -2239,6 +2246,7 @@ def check_resume_picker(root, environment):
         expect(b'beta-session.jsonl', s)
         expect(b'second task beta', s)
         expect(b'alpha-session.jsonl', s)
+        assert b'empty-session.jsonl' not in transcript[s:], bytes(transcript[s:])
 
         # Interactive fuzzy SelectList /resume picker: filter to beta and select.
         s2 = len(transcript)
@@ -2316,6 +2324,42 @@ def check_resume_picker(root, environment):
         if p2.poll() is None:
             p2.kill()
             p2.wait(timeout=5)
+
+    # Exiting interactive mode without sending a prompt creates no .jsonl file.
+    lazy_dir = root / 'lazy-sessions'
+    lazy_dir.mkdir()
+    lazy_env = dict(env, PI_CODING_AGENT_SESSION_DIR=str(lazy_dir))
+    lazy_args = [str(BINARY), '--no-proxy', '--cwd', str(resume_work)]
+    m3, s3_fd = pty.openpty()
+    p3 = subprocess.Popen(lazy_args, cwd=resume_work, env=lazy_env, stdin=s3_fd, stdout=s3_fd, stderr=s3_fd, close_fds=True)
+    os.close(s3_fd)
+    t3 = bytearray()
+    try:
+        dl = time.monotonic() + 10
+        while b'\x1b[?2004h' not in t3:
+            if select.select([m3], [], [], 0.2)[0]:
+                t3.extend(os.read(m3, 16384))
+            assert time.monotonic() < dl, bytes(t3)
+        os.write(m3, b'/exit\n')
+        while True:
+            if not select.select([m3], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(m3, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            t3.extend(chunk)
+        assert p3.wait(timeout=5) == 0, bytes(t3)
+    finally:
+        os.close(m3)
+        if p3.poll() is None:
+            p3.kill()
+            p3.wait(timeout=5)
+    assert list(lazy_dir.glob('*.jsonl')) == [], list(lazy_dir.glob('*.jsonl'))
 
 
 def check_pi_import(root, resume_args, environment, server):

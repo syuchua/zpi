@@ -346,3 +346,36 @@ test "compaction entries persist project kept span preserve system prompt and ke
     try std.testing.expectEqual(@as(usize, 3), pre_branch.len);
     try std.testing.expectEqualStrings("old answer", pre_branch[2].message.content[0].text);
 }
+
+test "deferred session avoids file creation for system-only history and flushes on first user message" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/lazy.jsonl", .{&tmp.sub_path});
+    defer a.free(path);
+
+    {
+        var store = try session.Store.deferred(a, std.testing.io, path, "/workspace");
+        defer store.deinit();
+        _ = try store.appendMessage(.{ .role = .system, .content = &.{.{ .text = "initial sys" }} });
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    }
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+
+    {
+        var store = try session.Store.deferred(a, std.testing.io, path, "/workspace");
+        defer store.deinit();
+        _ = try store.appendMessage(.{ .role = .system, .content = &.{.{ .text = "initial sys" }} });
+        _ = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "hello" }} });
+    }
+
+    var reopened = try session.Store.open(a, std.testing.io, path);
+    defer reopened.deinit();
+    const active = try reopened.activePath(a);
+    defer a.free(active);
+    try std.testing.expectEqual(@as(usize, 2), active.len);
+    try std.testing.expectEqual(model.Role.system, active[0].message.role);
+    try std.testing.expectEqualStrings("initial sys", active[0].message.content[0].text);
+    try std.testing.expectEqual(model.Role.user, active[1].message.role);
+    try std.testing.expectEqualStrings("hello", active[1].message.content[0].text);
+}

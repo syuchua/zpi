@@ -234,9 +234,11 @@ pub fn list(a: std.mem.Allocator, io: std.Io, directory: []const u8, cwd: []cons
             }
         }
 
+        if (msg_count == 0) continue;
+
         const path = try std.fs.path.resolveAlloc(a, &.{ directory, entry.name });
         errdefer a.free(path);
-        const preview = try sanitizePreviewAlloc(a, if (preview_text.len > 0) preview_text else "(empty session)", 72);
+        const preview = try sanitizePreviewAlloc(a, if (preview_text.len > 0) preview_text else "(conversation)", 72);
         try candidates.append(a, .{
             .path = path,
             .basename = std.fs.path.basename(path),
@@ -327,7 +329,11 @@ test "recent session discovery is cwd-aware, bounded and read-only" {
     defer a.free(missing);
     try std.testing.expect((try newest(a, std.testing.io, missing, "/project")) == null);
 
-    // list() returns matching sessions newest-first with extracted first-user preview.
+    // list() returns matching non-empty sessions newest-first with extracted first-user preview.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "sys-only.jsonl",
+        .data = header ++ "{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"system\",\"content\":[{\"text\":\"sys\"}]}}\n",
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "first.jsonl",
         .data = header ++ "{\"type\":\"message\",\"id\":\"1\",\"message\":{\"role\":\"system\",\"content\":[{\"text\":\"sys\"}]}}\n{\"type\":\"message\",\"id\":\"2\",\"message\":{\"role\":\"user\",\"content\":[{\"text\":\"older prompt\"}]}}\n",
@@ -345,8 +351,9 @@ test "recent session discovery is cwd-aware, bounded and read-only" {
 
     const listed = try list(a, std.testing.io, directory, "/project", 10);
     defer freeList(a, listed);
-    try std.testing.expectEqual(@as(usize, 4), listed.len);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
     try std.testing.expectEqualStrings("second.jsonl", listed[0].basename);
+    try std.testing.expectEqualStrings("first.jsonl", listed[1].basename);
     try std.testing.expectEqualStrings("newest prompt", listed[0].preview);
     try std.testing.expectEqual(@as(usize, 1), listed[0].message_count);
     try std.testing.expectEqualStrings("first.jsonl", listed[1].basename);
