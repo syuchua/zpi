@@ -273,6 +273,37 @@ Follow-up `b7b8e3f14` (`.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-21136/b7b
 | `src/tui/components/dialog.zig` | `d96dea97de2c0cdf19d4d1a3ae2e723869a7efa64bf77a6c0369a989747ad6f6` |
 | `scripts/test-cli.py` | `4a1b43a0b005bc3bf973e06dae4408582b205e859fe2729e94350043a9458f8c` |
 
+#### Tool streaming, Markdown wrapping, `/resume` picker, and mid-turn steering (`baf964300`)
+
+Verification run `baf964300` (`.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-47513/baf964300.output`, exit 0) verified tool card argument headers (`[tool: edit] comp.txt`, `[tool: bash] ...`), incremental live `bash` `on_update` / `tool_update` line streaming (`src/tools.zig`), `Ctrl+O` compact/expanded thinking & tool-output toggle, width-aware ANSI-preserving Markdown wrapping (`terminal.wrapAnsiAlloc`, `MarkdownStyler.styleWrappedLineAlloc`), live provider `usage` + `Footer` 70%/90% warning colors (`Theme.warn` / `Theme.tool_err`), `Shift+Tab` thinking-level cycling (`ThinkingLevel.next`, `Harness.cycleThinking`), collapsible `/resume` session discovery & switching (`recent_session.list`, `Harness.listSessions`/`resumeSession`, `TERM=dumb` plain-text fallback), and mid-turn steering (`Agent.SteeringHook`, `Harness.pushSteering`/`drainSteering`, `Ctrl+S` live-editor steering skipping remaining tool calls with matched error results and preserving `Enter` follow-up queuing):
+- **macOS arm64**: passed `zig fmt --check build.zig build.zig.zon src`, `py_compile`, `sh -n`, `node --check`, **133/133** build steps (`zig build test install test-binaries --summary all` with `pi 1.6.0` SDK; `harness-tests` **30/30**, `tui-tests` **19/19**, `agent-tests` **11/11**, `tool-tests` **11/11**, `extension-tests` **4/4** executed alongside cached unchanged suites), `zig build -Dtui=none test` + `install` + headless `-p`/`--mode json` loopback HTTP smoke, `scripts/test-cli.py` (with `pi 1.6.0` SDK, `ZPI_PI_SESSION_SDK`, C/Zig `.dylib` fixtures, and full PTY coverage), `scripts/test-ts-host.py`, `scripts/test-context-budget.py` (**84** checks), and `scripts/test-package-release.py`.
+- **Linux 7-target matrix**: Alpine arm64 native (**100/100** build steps) and all four cross-built musl container runs (`aarch64-linux-musl` and translated `x86_64-linux-musl` under Apple Container and Colima) each recorded **192 passed, 3 SDK skips, 0 failures**; Ubuntu 24.04 arm64/glibc 2.39 native (**100/100** steps) and cross-built each recorded **190 passed, 5 skips (3 SDK, 2 search), 0 failures**. Every Linux target passed `scripts/test-cli.py` (including all new PTY tests and C/Zig `.so` plugins) and **84** context-budget checks.
+
+`baf964300` recorded these exact SHA-256 hashes (with `docs/spec/compatibility-matrix.md` and `docs/spec/platform-verification.md` finalized immediately afterward):
+
+| File | SHA-256 |
+| --- | --- |
+| `src/model.zig` | `575c437a76c1d55a2a6355b52ba3b5a53f6d1d8fd6f4b58c9070668f717b4a06` |
+| `src/tools.zig` | `c3fc963ef3b2acfb99d970853d6d03d9a4235c2a553350cf30d86ff189bee6de` |
+| `src/tools_tests.zig` | `eb9d6f84da655e101e84f3546919f8e8501cfd247806dda3e3eaec8ac4317da2` |
+| `src/agent.zig` | `1ec8fc32389b4a8681c8a6bee5cda09fefdceca2b5677dee76ad09f8e2b13190` |
+| `src/agent_tests.zig` | `1fcc78c43b9d6f32f6b885b83fb0432096ff1730991210db37d05913f7401aaf` |
+| `src/harness.zig` | `0a6c6ad2107dad951bcf64ca88bec47b73cbe2a78caacda99788cc448b4a7f70` |
+| `src/cli/recent_session.zig` | `81f831fcf2342f28e1ca44fd4396887b91cb519914a42fc6ed817005cf12f22a` |
+| `src/main.zig` | `d4c62e73591f49e57c3d2bc215c041cd1f4ece6b576e92e96946d9039a5c63af` |
+| `src/tui.zig` | `2d8c1441a1bf244b4f818b74f634d9a982da0dc20a6e24b250840bdaa3f47c26` |
+| `src/tui/terminal.zig` | `80c03cb32c5394ae7995e3a7d8bfe1334827c355f0aecf1b3e1499cea5bc0b50` |
+| `src/tui/theme.zig` | `997944baca80a0b9be7ee8d522c8efe4a8ab78cab5db2ee019971844112477e` |
+| `src/tui/renderer.zig` | `8231f3dd6870166b88e6fed8b779a4e55c7bdd561497f751c08e8a013e3c7424` |
+| `src/tui/components/chrome.zig` | `1ce39ef3b74eb6e854849d9b636b7a9a706302565ecd039a167087a0b861220e` |
+| `src/tui/components/dialog.zig` | `b2d62ea0c66202249ca6cd9987ed962d897e616baeb0dbc467fafb49914660ed` |
+| `src/tui/components/markdown.zig` | `012d7e5c5f8d24a0134df1a2f4007628087572b77579638664e8eaeae12ccf7a` |
+| `src/tui/components/message.zig` | `18e2e089a5a528866a683938ab78a63875a0a80334bf1574619dbc88501285dc` |
+| `src/tui/components/select_list.zig` | `adbcb1d4476c3cf2c2a0256e3d0ce289fb5c4baef745960bcd22e9101a6023df` |
+| `src/tui/components/tool_card.zig` | `725940b3ca3491eff848f0df5b36f281b1ce1ccd8146744d293a9ade1cd19792` |
+| `scripts/test-cli.py` | `f356e4f19ebf574c2db971b4489032ba55792af9f6f86bcef199b7caaecde4fc` |
+| `README.md` | `f642fa273a9e8c831859ba0412a5144a04d875ec629f4765fa3acea6a5dc313a` |
+
 ## Further acceptance
 
 - Extend the same build-installed test executables as real core behavior lands; preserve failures and distinguish compilation from execution.
