@@ -7,8 +7,10 @@ import os
 import pty
 import select
 import shutil
+import signal
 import socket
 import ssl
+import struct
 import sys
 import termios
 import time
@@ -63,7 +65,7 @@ class Handler(BaseHTTPRequestHandler):
                     assert '[User]: departed request' in user and '[Assistant]: departed answer' in user, user
                     assert '[Assistant]: [call read]' in user, user
                     assert 'destination request' not in user and 'shared request' not in user, user
-                    assert 'old instructions' not in user and 'tool output to omit' not in user, user
+                    assert 'old instructions' not in user and '中文日本語한글' not in user, user
                     self.server.tree_summary_requests += 1
                     if self.server.tree_summary_requests == 1:
                         response = self.text('partial summary')
@@ -1372,7 +1374,7 @@ def check_tree_navigation(root, environment, server):
                 'id': 'historical', 'name': 'read', 'arguments': {'path': 'example.txt'},
             }}],
         }},
-        message('8', '7', 'tool_result', 'tool output to omit', tool_call_id='historical', tool_name='read'),
+        message('8', '7', 'tool_result', '中文日本語한글', tool_call_id='historical', tool_name='read'),
         message('9', '8', 'assistant', 'departed answer'),
     ]
     before = ''.join(json.dumps(record) + '\n' for record in records).encode()
@@ -1381,8 +1383,14 @@ def check_tree_navigation(root, environment, server):
             '--session', str(session), '--no-tools', '--skill', str(skills)]
     server.tree_summary_requests = 0
     master, slave = pty.openpty()
+
+    def resize(rows, cols):
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+
+    resize(12, 70)
     term_before = termios.tcgetattr(slave)
-    process = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave, env=environment)
+    process = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave,
+                               env=dict(environment, TERM='xterm'))
     transcript = bytearray()
 
     def expect(marker, start=0):
@@ -1402,13 +1410,58 @@ def check_tree_navigation(root, environment, server):
         return expect(marker, start)
 
     try:
-        expect(b'Ctrl-D exits')
-        command(b'/tr\t', b'Use /tree ENTRY-ID')
+        prompt_ready = b'\x1b[?2004h'
+        picker_ready = b'Up/Down move  Enter switch  Esc cancel'
+        assert expect(prompt_ready)
+        start = len(transcript)
+        command(b'/tr\t', picker_ready)
+        assert b'Session tree' in transcript[start:]
+        assert b'>*         9 assistant' in transcript[start:]
+        assert '中文日本語한글'.encode() in transcript[start:]
+
+        # Redraw at a different width and height while no key is pressed.
+        start = len(transcript)
+        resize(5, 31)
+        frame_end = expect(b'Up/Down Enter Esc', start)
+        frame = transcript[start:frame_end].decode()
+        assert '8 tool_result  中文\r' in frame, frame
+        assert '\x1b[7m>*         9 assistant' in frame, frame
+        assert '6 user' not in frame, frame
+        start = len(transcript)
+        os.write(master, b'\x1b[5~')
+        frame_end = expect(b'Up/Down Enter Esc', start)
+        selected = transcript[start:frame_end].split(b'\x1b[7m>')[-1].lstrip()
+        assert selected.startswith(b'6 user '), selected
+        start = len(transcript)
+        os.write(master, b'\x1b[6~')
+        expect(b'>*         9 assistant', start)
+        start = len(transcript)
+        os.write(master, b'\x1b[A')
+        expect(b'>          8 tool_result', start)
+        start = len(transcript)
+        os.write(master, b'\x1b[200~\n\x1b[B\x1b[201~\x1b/session\r')
+        expect(b'Active entry: 9', start)
+        assert session.read_bytes() == before and server.tree_summary_requests == 0
+
+        resize(24, 80)
+        command(b'/tree', picker_ready)
+        start = len(transcript)
+        process.send_signal(signal.SIGINT)
+        expect(prompt_ready, start)
+        assert session.read_bytes() == before
+
+        command(b'/tree --list', b'Use /tree ENTRY-ID or /tree --summary ENTRY-ID.')
         assert b'Session tree (active: 9)' in transcript and b'* 9 <- 8' in transcript
         command(b'/tree --older 4', b'Use /tree ENTRY-ID or /tree --summary ENTRY-ID.')
-        command(b'/tree 7', b'zpi: IncompleteBranchToolBatch')
+        command(b'/tree', picker_ready)
+        start = len(transcript)
+        os.write(master, b'\x1b[A' * 2 + b'\r')
+        expect(b'zpi: IncompleteBranchToolBatch', start)
         assert session.read_bytes() == before
-        command(b'/tree 4', b'[branched to 4]')
+        command(b'/tree', picker_ready)
+        start = len(transcript)
+        os.write(master, b'\x1b[A' * 5 + b'\r')
+        expect(b'[branched to 4]', start)
         assert server.tree_summary_requests == 0
         command(b'/tree 9', b'[branched to 9]')
         switched = session.read_bytes()

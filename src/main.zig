@@ -54,7 +54,7 @@ const help =
     \\                          Defaults to PI_CODING_AGENT_SESSION_DIR when set
     \\  -c, --continue         Continue the newest Zpi session for the working directory
     \\  --branch ENTRY-ID      Continue after an entry in an existing Zpi session
-    \\  /tree [--summary] ID   Navigate the active session tree
+    \\  /tree                  Pick an entry in the active session tree
     \\  --system-prompt TEXT|PATH Replace the system prompt
     \\  --append-system-prompt TEXT|PATH Append instructions (repeatable)
     \\  -s, --skill PATH       Load a skill directory or SKILL.md (repeatable)
@@ -409,6 +409,7 @@ fn run(init: std.process.Init) !void {
             .commands = slash_commands.items,
             .compact = App.compactErased,
             .tree = App.treeErased,
+            .tree_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else App.treeSourceErased,
             .switch_model = App.switchModelErased,
             .set_thinking = App.setThinkingErased,
             .quiet_startup = loaded_settings.quiet_startup,
@@ -646,9 +647,39 @@ const App = struct {
         const self: *App = @ptrCast(@alignCast(context));
         return self.navigateTree(target);
     }
+    fn treeSourceErased(context: *anyopaque) tui.TreeSource {
+        const self: *const App = @ptrCast(@alignCast(context));
+        return .{
+            .context = self,
+            .len = self.store.entries.items.len,
+            .active = if (self.store.active_leaf) |id| self.store.entryIndex(id) else null,
+            .item = treeItemErased,
+        };
+    }
+    fn treeItemErased(context: *const anyopaque, index: usize) tui.TreeItem {
+        const self: *const App = @ptrCast(@alignCast(context));
+        const entry = self.store.entries.items[index];
+        var depth: usize = 0;
+        var parent = entry.parent_id;
+        // The visible indentation is capped. Avoid walking the entire ancestry on redraw.
+        while (depth < 4) : (depth += 1) {
+            const parent_index = self.store.entryIndex(parent orelse break) orelse break;
+            parent = self.store.entries.items[parent_index].parent_id;
+        }
+        return .{
+            .id = entry.id,
+            .role = if (entry.branch_summary != null) "branch_summary" else if (entry.compaction != null) "compaction" else @tagName(entry.message.role),
+            .preview = if (entry.branch_summary) |summary| summary.summary else if (entry.compaction) |compact| compact.summary else firstMessageText(entry.message),
+            .depth = @min(depth, 4),
+        };
+    }
     fn navigateTree(self: *App, args: []const u8) !void {
         var words = std.mem.tokenizeAny(u8, args, " \t\r\n");
-        const first = words.next() orelse return self.showTree(self.store.entries.items.len);
+        const first = words.next() orelse "--list";
+        if (std.mem.eql(u8, first, "--list")) {
+            if (words.next() != null) return error.InvalidTreeArguments;
+            return self.showTree(self.store.entries.items.len);
+        }
         const older = std.mem.eql(u8, first, "--older");
         const summarize = std.mem.eql(u8, first, "--summary");
         const target = if (older or summarize) words.next() orelse return error.InvalidTreeArguments else first;

@@ -60,11 +60,12 @@ Sessions are created under `~/.zpi/agent/sessions/`; pass `--session PATH` to cr
 
 ### Navigate within a session
 
-- `/tree` lists up to 50 recent entries with their IDs, parent IDs, and text previews. `*` marks the active entry. `/tree --older ENTRY-ID` lists the preceding page.
-- `/tree ENTRY-ID` continues after the selected entry without a model request. Targets with incomplete tool batches are rejected. Switching preserves both branches and does not undo filesystem changes.
-- `/tree --summary ENTRY-ID` sends the departed conversation after the common ancestor to the active provider. The request omits system messages and tool results, retains assistant tool-call descriptions, and exposes no tools. Zpi appends the summary after the selected entry and restores it on reopen. If generation fails or is canceled before the switch commits, the active branch stays where it was.
+- `/tree` opens a keyboard picker with message previews and indented entries in session order. `*` marks the active entry and `>` marks the cursor. Move with Up/Down, Page Up/Page Down, or Home/End. Enter switches locally. Esc or Ctrl-C returns to the prompt without switching. The picker lists messages in session order and shows up to 20 rows at once. The picker follows terminal resize and preserves regular scrollback.
+- `/tree --list` prints the 50 most recent entries with their IDs and parent IDs. `/tree --older ENTRY-ID` prints the preceding page. With `TERM=dumb`, bare `/tree` prints the list.
+- `/tree ENTRY-ID` switches directly without a model request. Both picker and direct navigation reject entries with incomplete tool batches. Switching preserves both branches and leaves filesystem changes in place.
+- `/tree --summary ENTRY-ID` explicitly sends the departed conversation after the common ancestor to the active provider. The request omits system messages and tool results, retains assistant tool-call descriptions, and exposes no tools. Zpi appends the summary after the selected entry and restores it on reopen. If generation fails or is canceled before the switch commits, the active branch stays where it was.
 
-Navigation uses exact entry IDs. Pi's keyboard-driven tree picker, prompt prefill, and labels remain pending.
+Pi's prompt prefill, tree filtering, and labels remain pending.
 
 ## Import a pi v3 session
 

@@ -8,6 +8,20 @@ const agent = @import("agent");
 pub const max_prompt_bytes: usize = 64 * 1024;
 const max_history_entries: usize = 200;
 
+pub const TreeItem = struct {
+    id: []const u8,
+    role: []const u8,
+    preview: []const u8,
+    depth: usize,
+};
+
+pub const TreeSource = struct {
+    context: *const anyopaque,
+    len: usize,
+    active: ?usize,
+    item: *const fn (*const anyopaque, usize) TreeItem,
+};
+
 pub const Submit = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -19,6 +33,7 @@ pub const Submit = struct {
     commands: []const []const u8 = &.{},
     compact: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     tree: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    tree_source: ?*const fn (*anyopaque) TreeSource = null,
     switch_model: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     set_thinking: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     quiet_startup: bool = false,
@@ -28,20 +43,22 @@ const InputQueue = struct {
     buf: [4096]u8 = undefined,
     start: usize = 0,
     end: usize = 0,
+    eof: bool = false,
 
     fn hasBuffered(self: *const InputQueue) bool {
         return self.start < self.end;
     }
 
     fn readByteTimeout(self: *InputQueue, fd: std.posix.fd_t, cancel: ?agent.model.Cancel, timeout_ms: i32) !?u8 {
+        if (cancel) |token| {
+            if (token.isCanceled()) return error.Canceled;
+        }
         if (self.start < self.end) {
             const b = self.buf[self.start];
             self.start += 1;
             return b;
         }
-        if (cancel) |token| {
-            if (token.isCanceled()) return error.Canceled;
-        }
+        if (self.eof) return null;
         var pollfds: [2]std.posix.pollfd = undefined;
         var nfds: usize = 1;
         pollfds[0] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
@@ -70,7 +87,10 @@ const InputQueue = struct {
                     },
                     else => return err,
                 };
-                if (n == 0) return null;
+                if (n == 0) {
+                    self.eof = true;
+                    return null;
+                }
                 self.start = 1;
                 self.end = n;
                 return self.buf[0];
@@ -146,7 +166,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
             continue;
         }
         if (std.mem.eql(u8, text, "/hotkeys")) {
-            try output.writeStreamingAll(io, "Keyboard shortcuts\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\n/model    List or switch model (/model [provider/id])\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     List or navigate entries (/tree [--summary] ENTRY-ID)\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+            try output.writeStreamingAll(io, "Keyboard shortcuts\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\n/model    List or switch model (/model [provider/id])\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Pick a branch (Up/Down, Enter, Esc); /tree --list prints IDs\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
             continue;
         }
         if (std.mem.eql(u8, text, "/model") or std.mem.startsWith(u8, text, "/model ")) {
@@ -178,7 +198,19 @@ pub fn run(io: std.Io, submit: Submit) !void {
         if (std.mem.eql(u8, text, "/tree") or std.mem.startsWith(u8, text, "/tree ")) {
             const target = if (text.len > "/tree".len) std.mem.trim(u8, text["/tree".len..], " \t") else "";
             if (submit.tree) |run_tree| {
-                run_tree(submit.context, target) catch |err| {
+                const argument = if (target.len == 0 and color and submit.tree_source != null) blk: {
+                    const tree = submit.tree_source.?(submit.context);
+                    const choice = selectTree(io, input.handle, output, &queue, submit, tree) catch |err| switch (err) {
+                        error.Canceled => {
+                            queue.start = queue.end;
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    if (queue.eof) return;
+                    break :blk choice orelse continue;
+                } else target;
+                run_tree(submit.context, argument) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
                     try std.Io.File.stderr().writeStreamingAll(io, line);
@@ -227,15 +259,194 @@ pub fn writeText(io: std.Io, file: std.Io.File, text: []const u8) !void {
     try file.writeStreamingAll(io, text[start..]);
 }
 
-fn terminalColumns(io: std.Io, output: std.Io.File) usize {
+fn selectTree(
+    io: std.Io,
+    input_fd: std.posix.fd_t,
+    output: std.Io.File,
+    queue: *InputQueue,
+    submit: Submit,
+    source: TreeSource,
+) !?[]const u8 {
+    if (source.len == 0) {
+        try output.writeStreamingAll(io, "No entries in session.\n");
+        return null;
+    }
+
+    const original = try enterRawMode(input_fd);
+    defer std.posix.tcsetattr(input_fd, .NOW, original) catch {};
+    try output.writeStreamingAll(io, "\x1b[?2004h");
+    defer output.writeStreamingAll(io, "\x1b[?2004l\r\n") catch {};
+
+    var selected = source.active orelse source.len - 1;
+    var first: usize = 0;
+    var previous_rows: usize = 0;
+    var previous_size: ?std.posix.winsize = null;
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(submit.allocator);
+    var dirty = true;
+    var in_paste = false;
+    while (true) {
+        const size = terminalSize(io, output);
+        const chrome: usize = @as(usize, @intFromBool(size.row >= 3)) + @intFromBool(size.row >= 2);
+        const visible = @max(1, @min(20, @as(usize, size.row) -| chrome));
+        if (selected < first) first = selected;
+        if (selected >= first + visible) first = selected - visible + 1;
+        first = @min(first, source.len -| visible);
+        const resized = if (previous_size) |old| old.col != size.col or old.row != size.row else false;
+        if (dirty or resized) {
+            // A resize can reflow an old frame. Start a fresh one so redraws
+            // never rely on the old cursor position after a resize.
+            if (resized) try output.writeStreamingAll(io, "\r\n");
+            const end = @min(source.len, first + visible);
+            frame.clearRetainingCapacity();
+            try renderTree(&frame, submit.allocator, source, selected, .{ first, end }, size, if (resized) 0 else previous_rows);
+            try output.writeStreamingAll(io, frame.items);
+            previous_rows = end - first + chrome - 1;
+            previous_size = size;
+            dirty = false;
+        }
+
+        const key = (try queue.readByteTimeout(input_fd, submit.cancel, 100)) orelse {
+            if (queue.eof) return null;
+            continue;
+        };
+        if (key == 0x1b) {
+            const next = (try queue.readByteTimeout(input_fd, submit.cancel, 35)) orelse {
+                if (!in_paste) return null;
+                continue;
+            };
+            if (next != '[' and next != 'O') {
+                if (in_paste) continue;
+                // A key typed immediately after Escape belongs to the prompt.
+                queue.start -= 1;
+                return null;
+            }
+            var params: [32]u8 = undefined;
+            var count: usize = 0;
+            const final_byte: ?u8 = while (true) {
+                const byte = (try queue.readByteTimeout(input_fd, submit.cancel, 35)) orelse break null;
+                if (byte >= 0x40 and byte <= 0x7e) break byte;
+                if (count < params.len) params[count] = byte;
+                count +|= 1;
+            };
+            const final = final_byte orelse continue;
+            if (count > params.len) continue;
+            const prefix = params[0..count];
+            if (next == '[' and final == '~' and std.mem.eql(u8, prefix, "200")) {
+                in_paste = true;
+                continue;
+            }
+            if (next == '[' and final == '~' and std.mem.eql(u8, prefix, "201")) {
+                in_paste = false;
+                continue;
+            }
+            if (in_paste) continue;
+            const previous = selected;
+            switch (final) {
+                'A' => selected -|= 1,
+                'B' => selected = @min(selected + 1, source.len - 1),
+                'H' => selected = 0,
+                'F' => selected = source.len - 1,
+                '~' => {
+                    if (std.mem.eql(u8, prefix, "5")) selected -|= visible;
+                    if (std.mem.eql(u8, prefix, "6")) selected = @min(selected + visible, source.len - 1);
+                    if (std.mem.eql(u8, prefix, "1") or std.mem.eql(u8, prefix, "7")) selected = 0;
+                    if (std.mem.eql(u8, prefix, "4") or std.mem.eql(u8, prefix, "8")) selected = source.len - 1;
+                },
+                else => {},
+            }
+            dirty = selected != previous;
+        } else if (key == 0x03) {
+            return error.Canceled;
+        } else if (!in_paste) {
+            switch (key) {
+                0x04 => return null,
+                '\r', '\n' => return source.item(source.context, selected).id,
+                else => {},
+            }
+        }
+    }
+}
+
+fn renderTree(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    source: TreeSource,
+    selected: usize,
+    range: struct { usize, usize },
+    size: std.posix.winsize,
+    previous_rows: usize,
+) !void {
+    // Leave room at the right edge to avoid wrapping clipped previews.
+    const width = @max(1, @as(usize, size.col) -| 1);
+    if (previous_rows > 0) try out.print(allocator, "\x1b[{d}A", .{previous_rows});
+    try out.appendSlice(allocator, "\r\x1b[J");
+    if (size.row >= 3) {
+        _ = try appendTreeText(out, allocator, "Session tree", width);
+        try out.appendSlice(allocator, "\r\n");
+    }
+
+    for (range[0]..range[1]) |index| {
+        if (index > range[0]) try out.appendSlice(allocator, "\r\n");
+        const item = source.item(source.context, index);
+        if (index == selected) try out.appendSlice(allocator, "\x1b[7m");
+        const marker: u8 = if (index == selected) '>' else ' ';
+        const active: u8 = if (source.active == index) '*' else ' ';
+        var remaining = width;
+        remaining -= try appendTreeText(out, allocator, &.{ marker, active, ' ' }, remaining);
+        const indent_len: usize = if (item.depth > 4) 8 else item.depth * 2;
+        const indent = "        "[0..indent_len];
+        const visible_indent = indent[0..@min(indent.len, remaining)];
+        try out.appendSlice(allocator, visible_indent);
+        remaining -= visible_indent.len;
+        remaining -= try appendTreeText(out, allocator, item.id, remaining);
+        remaining -= try appendTreeText(out, allocator, " ", remaining);
+        remaining -= try appendTreeText(out, allocator, item.role, remaining);
+        remaining -= try appendTreeText(out, allocator, "  ", remaining);
+        _ = try appendTreeText(out, allocator, item.preview, remaining);
+        if (index == selected) try out.appendSlice(allocator, "\x1b[0m");
+    }
+    if (size.row >= 2) {
+        try out.appendSlice(allocator, "\r\n");
+        const shortcuts = if (width >= 38) "Up/Down move  Enter switch  Esc cancel" else "Up/Down Enter Esc";
+        _ = try appendTreeText(out, allocator, shortcuts, width);
+    }
+}
+
+fn appendTreeText(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, max_cols: usize) !usize {
+    var index: usize = 0;
+    var columns: usize = 0;
+    while (index < text.len and columns < max_cols) {
+        if (text[index] == '\r' or text[index] == '\n' or text[index] == '\t') break;
+        const length = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+        const step = @min(length, text.len - index);
+        const decoded = std.unicode.utf8Decode(text[index .. index + step]) catch 0xfffd;
+        const cp = if (decoded < 0x20 or (decoded >= 0x7f and decoded <= 0x9f)) '?' else decoded;
+        const width = codepointWidth(cp);
+        if (columns + width > max_cols) break;
+        var encoded: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(cp, &encoded) catch unreachable;
+        try out.appendSlice(allocator, encoded[0..len]);
+        columns += width;
+        index += step;
+    }
+    return columns;
+}
+
+fn terminalSize(io: std.Io, output: std.Io.File) std.posix.winsize {
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const rc = io.operate(.{ .device_io_control = .{
         .file = output,
         .code = std.posix.T.IOCGWINSZ,
         .arg = &ws,
-    } }) catch return 80;
-    if (rc.device_io_control >= 0 and ws.col > 0) return ws.col;
-    return 80;
+    } }) catch return .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+    if (rc.device_io_control < 0 or ws.col == 0) ws.col = 80;
+    if (rc.device_io_control < 0 or ws.row == 0) ws.row = 24;
+    return ws;
+}
+
+fn terminalColumns(io: std.Io, output: std.Io.File) usize {
+    return terminalSize(io, output).col;
 }
 
 const EditorState = struct {
@@ -655,6 +866,20 @@ fn commonPrefixLen(items: []const []u8) usize {
     return len;
 }
 
+fn enterRawMode(fd: std.posix.fd_t) !std.posix.termios {
+    const original = try std.posix.tcgetattr(fd);
+    var raw = original;
+    raw.lflag.ICANON = false;
+    raw.lflag.ECHO = false;
+    raw.lflag.IEXTEN = false;
+    raw.iflag.ICRNL = false;
+    raw.iflag.IXON = false;
+    raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+    raw.cc[@backingInt(std.posix.V.TIME)] = 0;
+    try std.posix.tcsetattr(fd, .NOW, raw);
+    return original;
+}
+
 fn readPromptLine(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -668,16 +893,7 @@ fn readPromptLine(
     if (submit.cancel) |token| {
         if (token.isCanceled()) return error.Canceled;
     }
-    const orig_term = try std.posix.tcgetattr(input_fd);
-    var raw_term = orig_term;
-    raw_term.lflag.ICANON = false;
-    raw_term.lflag.ECHO = false;
-    raw_term.lflag.IEXTEN = false;
-    raw_term.iflag.ICRNL = false;
-    raw_term.iflag.IXON = false;
-    raw_term.cc[@backingInt(std.posix.V.MIN)] = 1;
-    raw_term.cc[@backingInt(std.posix.V.TIME)] = 0;
-    try std.posix.tcsetattr(input_fd, .NOW, raw_term);
+    const orig_term = try enterRawMode(input_fd);
     defer std.posix.tcsetattr(input_fd, .NOW, orig_term) catch {};
 
     try output.writeStreamingAll(io, "\x1b[?2004h");
