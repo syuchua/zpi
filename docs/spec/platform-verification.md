@@ -261,6 +261,18 @@ Extracted CLI-agnostic session/agent orchestration into `src/harness.zig` (`Harn
 | `README.md` | `2caa1f427c9239b1717d0d4e911b3e77cabc8c848cae6b0c4fd014a11086035d` |
 | `docs/spec/compatibility-matrix.md` | `3c800f678a0ee1637dc7e3e8d80992f745ddac6c6ba16ed5634d216b6a00781f` |
 
+#### Auto-retracting dialogs, selectors, and Tab hints follow-up (`b7b8e3f14`)
+
+Follow-up `b7b8e3f14` (`.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-21136/b7b8e3f14.output`, exit 0) verified auto-retracting `/model` and `/tree` `SelectList` menus via `MainScreenRenderer.clearViewport`, dismissible `PopupDialog` overlays for `/help` and `/hotkeys`, transient inline `Tab` completion hints, and synchronized `EditorState` / `LiveScreen` rendering across macOS arm64 (**133/133** build steps, `tui-tests` **18/18**, `-Dtui=none`, `pi 1.6.0` SDK + C/Zig plugins + PTY retraction assertions, `test-ts-host.py`, `test-context-budget.py` **84**, `test-package-release.py`) and all 7 Linux targets (Alpine arm64 native **100/100** steps + 4 musl containers each **188** passed / **3** SDK skips / **0** failures; Ubuntu 24.04 arm64 native **100/100** steps + cross glibc each **186** passed / **5** skips / **0** failures):
+
+| File | SHA-256 |
+| --- | --- |
+| `src/tui.zig` | `b8b091eba464052a8cb38d7947d64df1e0e7d0f2e29a64de302dd922765f66eb` |
+| `src/tui/renderer.zig` | `8231f3dd6870166b88e6fed8b779a4e55c7bdd561497f751c08e8a013e3c7424` |
+| `src/tui/components/select_list.zig` | `adbcb1d4476c3cf2c2a0256e3d0ce289fb5c4baef745960bcd22e9101a6023df` |
+| `src/tui/components/dialog.zig` | `d96dea97de2c0cdf19d4d1a3ae2e723869a7efa64bf77a6c0369a989747ad6f6` |
+| `scripts/test-cli.py` | `4a1b43a0b005bc3bf973e06dae4408582b205e859fe2729e94350043a9458f8c` |
+
 ## Further acceptance
 
 - Extend the same build-installed test executables as real core behavior lands; preserve failures and distinguish compilation from execution.

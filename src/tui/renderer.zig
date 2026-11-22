@@ -47,6 +47,9 @@ pub const MainScreenRenderer = struct {
         errdefer out.deinit(self.allocator);
 
         const has_prev = self.previous_lines.items.len > 0;
+        if (!has_prev and new_lines.len == 0) {
+            return try out.toOwnedSlice(self.allocator);
+        }
         const resized = has_prev and cols != self.previous_cols;
 
         var first_diff: usize = 0;
@@ -260,4 +263,13 @@ test "MainScreenRenderer commits scrollback lines and resets viewport on resize"
     const resized = try r.renderViewportAlloc(&.{"> next"}, .{ .row = 0, .col = 6 }, 40);
     defer a.free(resized);
     try std.testing.expectEqualStrings("\r\n> next", resized);
+
+    // Clearing retracts the viewport and becomes a zero-byte no-op afterward.
+    const cleared = try r.clearViewportAlloc();
+    defer a.free(cleared);
+    try std.testing.expectEqualStrings("\r\x1b[J", cleared);
+
+    const cleared_again = try r.clearViewportAlloc();
+    defer a.free(cleared_again);
+    try std.testing.expectEqual(@as(usize, 0), cleared_again.len);
 }

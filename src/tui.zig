@@ -13,7 +13,14 @@ pub const components = struct {
     pub const tool_card = @import("tui/components/tool_card.zig");
     pub const chrome = @import("tui/components/chrome.zig");
     pub const select_list = @import("tui/components/select_list.zig");
+    pub const dialog = @import("tui/components/dialog.zig");
 };
+
+const DialogKind = enum { help, hotkeys };
+
+fn eraseSubmittedPromptLine(io: std.Io, output: std.Io.File) !void {
+    try output.writeStreamingAll(io, "\x1b[1A\r\x1b[J");
+}
 
 const InputQueue = terminal.InputQueue;
 const enterRawMode = terminal.enterRawMode;
@@ -143,10 +150,12 @@ pub fn run(io: std.Io, submit: Submit) !void {
     }
     var carried_draft: ?[]u8 = null;
     defer if (carried_draft) |draft| submit.allocator.free(draft);
+    var pending_dialog: ?DialogKind = null;
 
     while (true) {
         if (submit.reset_cancel) |reset| reset(submit.context);
         const raw = if (followups.items.len > 0) blk: {
+            pending_dialog = null;
             const next = followups.orderedRemove(0);
             const echo = try components.message.formatUserEchoAlloc(submit.allocator, th, next);
             defer submit.allocator.free(echo);
@@ -157,9 +166,13 @@ pub fn run(io: std.Io, submit: Submit) !void {
             const initial = carried_draft;
             carried_draft = null;
             defer if (initial) |draft| submit.allocator.free(draft);
-            const prompt_prefix = if (use_sgr) "\x1b[36m>\x1b[0m " else "> ";
-            try output.writeStreamingAll(io, prompt_prefix);
-            break :blk readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, use_sgr, th, initial) catch |err| switch (err) {
+            const dlg = pending_dialog;
+            pending_dialog = null;
+            if (dlg == null) {
+                const prompt_prefix = if (use_sgr) "\x1b[36m>\x1b[0m " else "> ";
+                try output.writeStreamingAll(io, prompt_prefix);
+            }
+            break :blk readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, use_sgr, color, th, initial, dlg) catch |err| switch (err) {
                 error.Canceled => {
                     try output.writeStreamingAll(io, "\n");
                     continue;
@@ -178,11 +191,21 @@ pub fn run(io: std.Io, submit: Submit) !void {
         try history.push(text);
         if (std.mem.eql(u8, text, "/exit") or std.mem.eql(u8, text, "/quit")) return;
         if (std.mem.eql(u8, text, "/help")) {
-            try output.writeStreamingAll(io, "Enter a task to stream a response and run tools. /exit leaves the session.\nUse --session PATH to reopen; add --branch ENTRY-ID to continue from an earlier point.\nTab completes /commands and @paths; Up/Down navigates history; Alt+Enter or trailing \\ adds a newline.\n");
+            if (color) {
+                try eraseSubmittedPromptLine(io, output);
+                pending_dialog = .help;
+            } else {
+                try output.writeStreamingAll(io, "Enter a task to stream a response and run tools. /exit leaves the session.\nUse --session PATH to reopen; add --branch ENTRY-ID to continue from an earlier point.\nTab completes /commands and @paths; Up/Down navigates history; Alt+Enter or trailing \\ adds a newline.\n");
+            }
             continue;
         }
         if (std.mem.eql(u8, text, "/hotkeys")) {
-            try output.writeStreamingAll(io, "Keyboard shortcuts\nEnter     Submit prompt (or queue follow-up while busy)\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\nAlt+Up    Edit queued follow-up messages\nEsc       Clear draft while busy / cancel selector\n/model    Fuzzy model picker (or /model [provider/id] | --list)\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Branch picker (/ filter, p prefill user msg, s summarize, Enter switch)\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+            if (color) {
+                try eraseSubmittedPromptLine(io, output);
+                pending_dialog = .hotkeys;
+            } else {
+                try output.writeStreamingAll(io, "Keyboard shortcuts\nEnter     Submit prompt (or queue follow-up while busy)\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\nAlt+Up    Edit queued follow-up messages\nEsc       Clear draft while busy / cancel selector\n/model    Fuzzy model picker (or /model [provider/id] | --list)\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Branch picker (/ filter, p prefill user msg, s summarize, Enter switch)\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+            }
             continue;
         }
         if (std.mem.eql(u8, text, "/model") or std.mem.startsWith(u8, text, "/model ")) {
@@ -193,6 +216,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
                 const arg = if (std.mem.eql(u8, raw_arg, "--list"))
                     ""
                 else if (raw_arg.len == 0 and color and submit.model_source != null) blk: {
+                    try eraseSubmittedPromptLine(io, output);
                     var src = (submit.model_source.?(submit.context) catch |err| {
                         var msg: [256]u8 = undefined;
                         const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
@@ -243,6 +267,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
                 var prefill_text: ?[]const u8 = null;
                 var skip_tree_cmd = false;
                 const argument = if (target.len == 0 and color and submit.tree_source != null) blk: {
+                    try eraseSubmittedPromptLine(io, output);
                     const tree = submit.tree_source.?(submit.context);
                     const choice = selectTree(io, input.handle, output, &queue, submit, tree, th) catch |err| switch (err) {
                         error.Canceled => {
@@ -437,17 +462,23 @@ const EditorState = struct {
     draft: ?[]u8 = null,
     rendered_cursor_row: usize = 0,
     last_tab_prefix: ?[]u8 = null,
+    completion_hint: ?[]u8 = null,
 
     fn deinit(self: *EditorState) void {
         self.buf.deinit(self.allocator);
         if (self.draft) |d| self.allocator.free(d);
         if (self.last_tab_prefix) |p| self.allocator.free(p);
+        if (self.completion_hint) |h| self.allocator.free(h);
     }
 
     fn resetCompletionTrack(self: *EditorState) void {
         if (self.last_tab_prefix) |p| {
             self.allocator.free(p);
             self.last_tab_prefix = null;
+        }
+        if (self.completion_hint) |h| {
+            self.allocator.free(h);
+            self.completion_hint = null;
         }
     }
 
@@ -599,13 +630,34 @@ const EditorState = struct {
     }
 
     fn renderWithFooter(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize, color: bool, footer_line: ?[]const u8) !void {
+        return self.renderWithOverlay(io, output, cols, color, theme.Theme.init(if (color) .ansi16 else .none), &.{}, footer_line);
+    }
+
+    fn renderWithOverlay(
+        self: *EditorState,
+        io: std.Io,
+        output: std.Io.File,
+        cols: usize,
+        use_sgr: bool,
+        th: theme.Theme,
+        dialog_lines: []const []const u8,
+        footer_line: ?[]const u8,
+    ) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
+        if (use_sgr or th.mode != .none) try out.appendSlice(self.allocator, renderer.sync_begin);
         if (self.rendered_cursor_row > 0) {
             try out.print(self.allocator, "\x1b[{d}A", .{self.rendered_cursor_row});
         }
         try out.appendSlice(self.allocator, "\r\x1b[J");
-        try out.appendSlice(self.allocator, if (color) "\x1b[36m>\x1b[0m " else "> ");
+
+        for (dialog_lines) |dline| {
+            try out.appendSlice(self.allocator, dline);
+            try out.appendSlice(self.allocator, "\r\n");
+        }
+        const rows_above = dialog_lines.len;
+
+        try out.appendSlice(self.allocator, if (use_sgr) "\x1b[36m>\x1b[0m " else "> ");
 
         // Compute visual coordinates (prompt width = 2 on line 0) across newlines and soft wraps.
         const layout = computeLayout(self.buf.items, self.cursor, cols, 2);
@@ -613,6 +665,17 @@ const EditorState = struct {
 
         var total_end_row = layout.end_row;
         var total_end_col = layout.end_col;
+        if (self.completion_hint) |hint| {
+            if (hint.len > 0) {
+                try out.appendSlice(self.allocator, "\r\n");
+                var styled_hint: std.ArrayList(u8) = .empty;
+                defer styled_hint.deinit(self.allocator);
+                try th.paint(&styled_hint, self.allocator, theme.Theme.muted, hint);
+                try out.appendSlice(self.allocator, styled_hint.items);
+                total_end_row += 1;
+                total_end_col = terminal.visibleWidth(hint);
+            }
+        }
         if (footer_line) |fl| {
             if (fl.len > 0) {
                 try out.appendSlice(self.allocator, "\r\n");
@@ -632,7 +695,8 @@ const EditorState = struct {
                 try out.print(self.allocator, "\x1b[{d}C", .{layout.cursor_col});
             }
         }
-        self.rendered_cursor_row = layout.cursor_row;
+        if (use_sgr or th.mode != .none) try out.appendSlice(self.allocator, renderer.sync_end);
+        self.rendered_cursor_row = rows_above + layout.cursor_row;
         try output.writeStreamingAll(io, out.items);
     }
 
@@ -652,7 +716,7 @@ const EditorState = struct {
 
 const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
-fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
+fn handleTab(editor: *EditorState, io: std.Io, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
     // Identify token immediately before cursor (bounded by whitespace).
     var token_start = editor.cursor;
     while (token_start > 0 and !std.ascii.isWhitespace(editor.buf.items[token_start - 1])) : (token_start -= 1) {}
@@ -724,17 +788,12 @@ fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Subm
         return true;
     }
 
-    // Second Tab on the same ambiguous prefix prints candidate list below prompt.
-    if (!allow_list) return false;
-    const same_prefix = if (editor.last_tab_prefix) |prev| std.mem.eql(u8, prev, token) else false;
-    if (!same_prefix) {
-        editor.resetCompletionTrack();
-        editor.last_tab_prefix = try editor.allocator.dupe(u8, token);
-        return false;
-    }
+    // Multiple matches: insert any shared prefix and display a transient hint below the prompt.
+    if (!allow_list or !color) return false;
     var list_out: std.ArrayList(u8) = .empty;
     defer list_out.deinit(editor.allocator);
-    const shown = @min(matches.items.len, 24);
+    const max_cols = @max(12, cols -| 1);
+    const shown = @min(matches.items.len, 12);
     for (matches.items[0..shown], 0..) |m, idx| {
         if (idx > 0) try list_out.appendSlice(editor.allocator, "  ");
         try list_out.appendSlice(editor.allocator, m);
@@ -742,21 +801,12 @@ fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Subm
     if (matches.items.len > shown) {
         try list_out.print(editor.allocator, "  (+{d} more)", .{matches.items.len - shown});
     }
-    try list_out.append(editor.allocator, '\n');
-    if (color and submit.status_info != null) {
-        try editor.clearFooterOnly(io, output, cols);
-    }
-    try output.writeStreamingAll(io, "\n");
-    try output.writeStreamingAll(io, list_out.items);
-    editor.rendered_cursor_row = 0;
-    const footer_line = if (color and submit.status_info != null) blk: {
-        var info = submit.status_info.?(submit.context);
-        info.queued_count = 0;
-        break :blk try components.chrome.Footer.renderLineAlloc(editor.allocator, theme.Theme.init(submit.color_mode orelse .ansi16), info, @max(1, cols -| 1));
-    } else null;
-    defer if (footer_line) |fl| editor.allocator.free(fl);
-    try editor.renderWithFooter(io, output, cols, color, footer_line);
-    return false;
+    var clipped: std.ArrayList(u8) = .empty;
+    defer clipped.deinit(editor.allocator);
+    _ = try terminal.appendTruncatedAnsi(&clipped, editor.allocator, list_out.items, max_cols, "...");
+    if (editor.completion_hint) |old| editor.allocator.free(old);
+    editor.completion_hint = try clipped.toOwnedSlice(editor.allocator);
+    return true;
 }
 
 fn appendUnique(list: *std.ArrayList([]u8), a: std.mem.Allocator, text: []const u8) !void {
@@ -786,9 +836,11 @@ fn readPromptLine(
     queue: *InputQueue,
     history: *const History,
     submit: Submit,
-    color: bool,
+    use_sgr: bool,
+    term_ansi: bool,
     th: theme.Theme,
     initial: ?[]const u8,
+    initial_dialog: ?DialogKind,
 ) anyerror!?[]u8 {
     if (submit.cancel) |token| {
         if (token.isCanceled()) return error.Canceled;
@@ -803,9 +855,11 @@ fn readPromptLine(
     defer editor.deinit();
 
     const has_footer = th.mode != .none and submit.status_info != null;
+    var dialog = initial_dialog;
+    var dialog_on_screen = false;
     var in_paste = false;
     var cols = terminalColumns(io, output);
-    var dirty = has_footer;
+    var dirty = has_footer or dialog != null;
     if (initial) |text| {
         if (text.len > 0) {
             try editor.insertSlice(text);
@@ -814,7 +868,7 @@ fn readPromptLine(
     }
 
     while (true) {
-        if (dirty and !queue.hasBuffered()) {
+        if ((dirty and !queue.hasBuffered()) or (dialog != null and !dialog_on_screen)) {
             cols = terminalColumns(io, output);
             const footer_line = if (has_footer) blk: {
                 var info = submit.status_info.?(submit.context);
@@ -822,12 +876,35 @@ fn readPromptLine(
                 break :blk try components.chrome.Footer.renderLineAlloc(allocator, th, info, @max(1, cols -| 1));
             } else null;
             defer if (footer_line) |fl| allocator.free(fl);
-            try editor.renderWithFooter(io, output, cols, color, footer_line);
+
+            const dialog_lines: [][]u8 = if (dialog) |dk| blk: {
+                const spec: components.dialog.DialogSpec = switch (dk) {
+                    .help => .{ .title = "Help", .lines = &components.dialog.help_lines },
+                    .hotkeys => .{ .title = "Keyboard shortcuts", .lines = &components.dialog.hotkeys_lines },
+                };
+                break :blk try components.dialog.renderLinesAlloc(allocator, th, spec, cols);
+            } else &.{};
+            defer {
+                for (dialog_lines) |dl| allocator.free(dl);
+                if (dialog_lines.len > 0) allocator.free(dialog_lines);
+            }
+            const dialog_slices = try allocator.alloc([]const u8, dialog_lines.len);
+            defer allocator.free(dialog_slices);
+            for (dialog_lines, dialog_slices) |dl, *s| s.* = dl;
+
+            try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, footer_line);
+            dialog_on_screen = dialog_slices.len > 0;
             dirty = false;
         }
         const b_opt = try queue.readByte(input_fd, submit.cancel);
         const b = b_opt orelse {
-            if (has_footer) editor.clearFooterOnly(io, output, cols) catch {};
+            if (dialog_on_screen or editor.completion_hint != null) {
+                editor.resetCompletionTrack();
+                editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null) catch {};
+                dialog_on_screen = false;
+            } else if (has_footer) {
+                editor.clearFooterOnly(io, output, cols) catch {};
+            }
             if (editor.buf.items.len == 0) {
                 try output.writeStreamingAll(io, "\n");
                 return null;
@@ -835,14 +912,38 @@ fn readPromptLine(
             return try editor.buf.toOwnedSlice(allocator);
         };
 
+        if (dialog != null) {
+            dialog = null;
+            dirty = true;
+            if (b == 0x03) continue;
+            if ((b == '\r' or b == '\n' or b == 'q' or b == 'Q' or b == '?') and editor.buf.items.len == 0) continue;
+            if (b == 0x1b) {
+                const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse continue;
+                if (next == 0x1b) continue;
+                if (queue.start > 0) queue.start -= 1;
+            }
+        }
+
         switch (b) {
             0x03 => {
-                if (has_footer) editor.clearFooterOnly(io, output, cols) catch {};
+                if (dialog_on_screen or editor.completion_hint != null) {
+                    editor.resetCompletionTrack();
+                    editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null) catch {};
+                    dialog_on_screen = false;
+                } else if (has_footer) {
+                    editor.clearFooterOnly(io, output, cols) catch {};
+                }
                 return error.Canceled;
             },
             0x04 => {
                 if (editor.buf.items.len == 0) {
-                    if (has_footer) editor.clearFooterOnly(io, output, cols) catch {};
+                    if (dialog_on_screen or editor.completion_hint != null) {
+                        editor.resetCompletionTrack();
+                        editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null) catch {};
+                        dialog_on_screen = false;
+                    } else if (has_footer) {
+                        editor.clearFooterOnly(io, output, cols) catch {};
+                    }
                     try output.writeStreamingAll(io, "\n");
                     return null;
                 }
@@ -862,9 +963,11 @@ fn readPromptLine(
                     dirty = true;
                     continue;
                 }
-                if (dirty) {
+                const had_hint = editor.completion_hint != null;
+                editor.resetCompletionTrack();
+                if (dirty or had_hint) {
                     cols = terminalColumns(io, output);
-                    try editor.renderWithFooter(io, output, cols, color, null);
+                    try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null);
                 } else if (has_footer) {
                     try editor.clearFooterOnly(io, output, cols);
                 }
@@ -914,14 +1017,20 @@ fn readPromptLine(
             '\t' => {
                 if (!in_paste) {
                     cols = terminalColumns(io, output);
-                    if (try handleTab(&editor, io, output, submit, cols, color, true)) dirty = true;
+                    if (try handleTab(&editor, io, submit, cols, term_ansi, true)) dirty = true;
                 } else {
                     try editor.insertSlice("\t");
                     dirty = true;
                 }
             },
             0x1b => {
-                const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse continue;
+                const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse {
+                    if (editor.completion_hint != null) {
+                        editor.resetCompletionTrack();
+                        dirty = true;
+                    }
+                    continue;
+                };
                 switch (next) {
                     '\r', '\n' => {
                         try editor.insertSlice("\n");
@@ -1072,6 +1181,7 @@ test {
     _ = components.tool_card;
     _ = components.chrome;
     _ = components.select_list;
+    _ = components.dialog;
 }
 
 test "editor UTF-8 insertion cursor movement deletion and history navigation" {
@@ -1163,6 +1273,8 @@ const LiveScreen = struct {
 
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(self.allocator);
+        if (self.color) try frame.appendSlice(self.allocator, renderer.sync_begin);
+        const body_start = frame.items.len;
 
         if (self.overlay_active) {
             const p_rows = if (self.pending_line.items.len > 0) pendingLineRows(self.pending_line.items, self.overlay_cols) else 0;
@@ -1185,7 +1297,10 @@ const LiveScreen = struct {
             self.overlay_active = true;
         }
 
-        if (frame.items.len > 0) try self.output.writeStreamingAll(self.io, frame.items);
+        if (frame.items.len > body_start) {
+            if (self.color) try frame.appendSlice(self.allocator, renderer.sync_end);
+            try self.output.writeStreamingAll(self.io, frame.items);
+        }
     }
 
     fn writeMarkdown(self: *LiveScreen, delta: []const u8) !void {
@@ -1194,6 +1309,8 @@ const LiveScreen = struct {
 
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(self.allocator);
+        if (self.color) try frame.appendSlice(self.allocator, renderer.sync_begin);
+        const body_start = frame.items.len;
 
         if (self.overlay_active) {
             const p_rows = if (self.pending_line.items.len > 0) pendingLineRows(self.pending_line.items, self.overlay_cols) else 0;
@@ -1243,7 +1360,10 @@ const LiveScreen = struct {
             self.overlay_active = true;
         }
 
-        if (frame.items.len > 0) try self.output.writeStreamingAll(self.io, frame.items);
+        if (frame.items.len > body_start) {
+            if (self.color) try frame.appendSlice(self.allocator, renderer.sync_end);
+            try self.output.writeStreamingAll(self.io, frame.items);
+        }
     }
 
     fn loaderTickAndRender(
@@ -1291,8 +1411,13 @@ const LiveScreen = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
+        if (self.overlay_active and cols == self.overlay_cols and new_cursor_row == self.overlay_cursor_row and std.mem.eql(u8, self.overlay_bytes.items, new_bytes)) {
+            return;
+        }
+
         var frame: std.ArrayList(u8) = .empty;
         defer frame.deinit(self.allocator);
+        if (self.color) try frame.appendSlice(self.allocator, renderer.sync_begin);
 
         if (self.overlay_active) {
             if (new_bytes.len == 0) {
@@ -1324,7 +1449,10 @@ const LiveScreen = struct {
         self.overlay_cursor_row = new_cursor_row;
         self.overlay_cols = cols;
 
-        if (frame.items.len > 0) try self.output.writeStreamingAll(self.io, frame.items);
+        if (frame.items.len > 0) {
+            if (self.color) try frame.appendSlice(self.allocator, renderer.sync_end);
+            try self.output.writeStreamingAll(self.io, frame.items);
+        }
     }
 
     fn clearOverlay(self: *LiveScreen) !void {
@@ -1657,7 +1785,7 @@ fn runTurnWithLiveEditor(
             '\t' => {
                 if (!in_paste) {
                     cols = terminalColumns(io, output);
-                    if (try handleTab(&editor, io, output, submit, cols, color, false)) dirty = true;
+                    if (try handleTab(&editor, io, submit, cols, color, false)) dirty = true;
                 } else {
                     try editor.insertSlice("\t");
                     dirty = true;

@@ -898,8 +898,10 @@ def terminal_check(common, environment, session, tool_count):
         read_until(b'Use --session PATH')
         os.write(master, b'/hotkeys\n')
         read_until(b'Keyboard shortcuts')
+        session_mark = len(transcript)
         os.write(master, b'/session\n')
         read_until(f'Active entry: {active_entry}'.encode())
+        assert b'\r\x1b[J' in transcript[session_mark:], bytes(transcript[session_mark:])
         assert f'File: {session}'.encode() in transcript, bytes(transcript)
         messages = [record['message'] for record in map(json.loads, before_commands.splitlines())
                     if record['type'] == 'message' and record['message']['role'] != 'system']
@@ -1110,8 +1112,11 @@ def terminal_editor_check(common, environment, root):
     try:
         read_until(b'Ctrl-D exits')
         p = read_prompt()
-        # 1. Tab completes /he -> /help
-        os.write(master, b'/he\t\n')
+        # 1. Tab completes /he -> /help and opens auto-retracting dialog; ambiguous /h shows inline hint and retracts cleanly
+        os.write(master, b'/h\t')
+        hint_end = read_until(b'/hotkeys', p)
+        assert b'/help' in transcript[p:hint_end + 32], bytes(transcript[p:])
+        os.write(master, b'e\t\n')
         p = read_prompt(read_until(b'Tab completes /commands and @paths', p))
 
         # 2. Left-arrow cursor editing
@@ -1564,7 +1569,7 @@ def check_tree_navigation(root, environment, server):
         start = len(transcript)
         os.write(master, b'\r\x1b[A\x1b[200~y\x1b[201~n')
         frame_end = expect(picker_ready, start)
-        selected = transcript[start:frame_end].split(b'\x1b[7m>')[-1].lstrip()
+        selected = transcript[:frame_end].split(b'\x1b[7m>')[-1].lstrip()
         assert selected.startswith(b'4 user '), selected
         assert session.read_bytes() == switched and server.tree_summary_requests == 2
 
@@ -2006,16 +2011,20 @@ def check_settings_and_model_switch(root, environment, server):
         os.write(master, b'/model\n')
         read_until(b'Type to filter', mark)
         os.write(master, b'gpt5')
-        read_until(b'settings-resp/gpt-5', mark)
+        filter_pos = read_until(b'settings-resp/gpt-5', mark)
         os.write(master, b'\x1b')
         time.sleep(0.08)
         os.write(master, b'\x1b')
-        p = read_until(b'\x1b[?2004h', read_prompt(mark)) + len(b'\x1b[?2004h')
+        cancel_pos = read_until(b'\x1b[?2004h', filter_pos) + len(b'\x1b[?2004h')
+        assert b'\r\x1b[J' in transcript[filter_pos:cancel_pos], bytes(transcript[filter_pos:cancel_pos])
+        p = read_prompt(cancel_pos)
         mark = p
         os.write(master, b'/model\n')
         read_until(b'Type to filter', mark)
         os.write(master, b'gpt5\r')
-        p = read_prompt(read_until(b'[model: settings-resp/gpt-5 (openai_responses), thinking: medium]', mark))
+        switched_pos = read_until(b'[model: settings-resp/gpt-5 (openai_responses), thinking: medium]', mark)
+        assert b'\r\x1b[J' in transcript[mark:switched_pos], bytes(transcript[mark:switched_pos])
+        p = read_prompt(switched_pos)
         os.write(master, b'/model settings-resp/gpt-5:high\n')
         p = read_prompt(read_until(b'[model: settings-resp/gpt-5 (openai_responses), thinking: high]', p))
         os.write(master, b'switched-turn\n')

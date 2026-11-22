@@ -2,6 +2,7 @@
 //! Preserves native scrollback, narrow-width CJK clipping, paste isolation, and termios state.
 const std = @import("std");
 const agent = @import("agent");
+const renderer_mod = @import("../renderer.zig");
 const terminal = @import("../terminal.zig");
 const theme = @import("../theme.zig");
 
@@ -208,17 +209,17 @@ pub fn run(
 
     const original = try terminal.enterRawMode(input_fd);
     defer std.posix.tcsetattr(input_fd, .NOW, original) catch {};
+    var renderer = renderer_mod.MainScreenRenderer.init(allocator, th.mode != .none);
+    defer renderer.deinit();
     try output.writeStreamingAll(io, "\x1b[?2004h");
-    defer output.writeStreamingAll(io, "\x1b[?2004l\r\n") catch {};
+    defer output.writeStreamingAll(io, "\x1b[?2004l") catch {};
+    defer renderer.clearViewport(io, output) catch {};
 
     var list = FilteredList.init(allocator);
     defer list.deinit();
     try list.rebuild(source, true);
 
-    var previous_rows: usize = 0;
     var previous_size: ?std.posix.winsize = null;
-    var frame: std.ArrayList(u8) = .empty;
-    defer frame.deinit(allocator);
     var dirty = true;
     var in_paste = false;
     var confirm_summary = false;
@@ -251,25 +252,28 @@ pub fn run(
 
         const resized = if (previous_size) |old| old.col != size.col or old.row != size.row else false;
         if (dirty or resized) {
-            if (resized) try output.writeStreamingAll(io, "\r\n");
             const end = @min(list.indices.items.len, list.first_pos + visible);
-            frame.clearRetainingCapacity();
-            try renderFrame(
-                &frame,
+            const lines = try renderLinesAlloc(
                 allocator,
                 source,
                 &list,
                 .{ list.first_pos, end },
                 size,
-                if (resized) 0 else previous_rows,
                 confirm_summary,
                 show_filter_bar,
                 options,
                 th,
             );
-            try output.writeStreamingAll(io, frame.items);
-            const body_rows = if (end > list.first_pos) end - list.first_pos else 1;
-            previous_rows = header_rows + body_rows + footer_rows -| 1;
+            defer {
+                for (lines) |l| allocator.free(l);
+                allocator.free(lines);
+            }
+            const slices = try allocator.alloc([]const u8, lines.len);
+            defer allocator.free(slices);
+            for (lines, slices) |l, *s| s.* = l;
+            const end_row = if (lines.len > 0) lines.len - 1 else 0;
+            const end_col = if (lines.len > 0) terminal.visibleWidth(lines[end_row]) else 0;
+            try renderer.renderViewport(io, output, slices, .{ .row = end_row, .col = end_col }, size.col);
             previous_size = size;
             dirty = false;
         }
@@ -475,6 +479,108 @@ pub fn run(
     }
 }
 
+pub fn renderLinesAlloc(
+    allocator: std.mem.Allocator,
+    source: Source,
+    list: *const FilteredList,
+    range: struct { usize, usize },
+    size: std.posix.winsize,
+    confirm_summary: bool,
+    show_filter_bar: bool,
+    options: Options,
+    th: theme.Theme,
+) ![][]u8 {
+    const width = @max(1, @as(usize, size.col) -| 1);
+    var lines: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (lines.items) |l| allocator.free(l);
+        lines.deinit(allocator);
+    }
+
+    if (size.row >= 3) {
+        var row: std.ArrayList(u8) = .empty;
+        errdefer row.deinit(allocator);
+        if (options.title_hint.len > 0 and width >= options.title.len + options.title_hint.len + 3) {
+            try th.appendOpen(&row, allocator, theme.Theme.accent);
+            const used = try terminal.appendClippedText(&row, allocator, options.title, width);
+            try th.appendClose(&row, allocator);
+            try th.appendOpen(&row, allocator, theme.Theme.muted);
+            _ = try terminal.appendClippedText(&row, allocator, options.title_hint, width -| used);
+            try th.appendClose(&row, allocator);
+        } else {
+            _ = try terminal.appendClippedText(&row, allocator, options.title, width);
+        }
+        try lines.append(allocator, try row.toOwnedSlice(allocator));
+    }
+
+    if (show_filter_bar and size.row >= 4) {
+        var row: std.ArrayList(u8) = .empty;
+        errdefer row.deinit(allocator);
+        try th.appendOpen(&row, allocator, theme.Theme.muted);
+        const used = try terminal.appendClippedText(&row, allocator, "Filter: ", width);
+        try th.appendClose(&row, allocator);
+        _ = try terminal.appendClippedText(&row, allocator, list.filter.items, width -| used);
+        try lines.append(allocator, try row.toOwnedSlice(allocator));
+    }
+
+    if (range[1] <= range[0]) {
+        var row: std.ArrayList(u8) = .empty;
+        errdefer row.deinit(allocator);
+        try th.appendOpen(&row, allocator, theme.Theme.muted);
+        _ = try terminal.appendClippedText(&row, allocator, "(no matches)", width);
+        try th.appendClose(&row, allocator);
+        try lines.append(allocator, try row.toOwnedSlice(allocator));
+    } else {
+        for (range[0]..range[1]) |pos| {
+            var row: std.ArrayList(u8) = .empty;
+            errdefer row.deinit(allocator);
+            const index = list.indices.items[pos];
+            const item = source.item(source.context, index);
+            const is_selected = pos == list.selected_pos;
+            if (is_selected) try row.appendSlice(allocator, "\x1b[7m");
+            const marker: u8 = if (is_selected) '>' else ' ';
+            const active: u8 = if (source.active == index or item.is_active) '*' else ' ';
+            var remaining = width;
+            remaining -= try terminal.appendClippedText(&row, allocator, &.{ marker, active, ' ' }, remaining);
+            const indent_len: usize = if (item.depth > 4) 8 else item.depth * 2;
+            const indent = "        "[0..indent_len];
+            const visible_indent = indent[0..@min(indent.len, remaining)];
+            try row.appendSlice(allocator, visible_indent);
+            remaining -= visible_indent.len;
+            remaining -= try terminal.appendClippedText(&row, allocator, item.id, remaining);
+            if (item.role.len > 0) {
+                remaining -= try terminal.appendClippedText(&row, allocator, " ", remaining);
+                remaining -= try terminal.appendClippedText(&row, allocator, item.role, remaining);
+            }
+            if (item.preview.len > 0) {
+                remaining -= try terminal.appendClippedText(&row, allocator, "  ", remaining);
+                _ = try terminal.appendClippedText(&row, allocator, item.preview, remaining);
+            }
+            if (is_selected) try row.appendSlice(allocator, "\x1b[0m");
+            try lines.append(allocator, try row.toOwnedSlice(allocator));
+        }
+    }
+
+    if (size.row >= 2) {
+        var row: std.ArrayList(u8) = .empty;
+        errdefer row.deinit(allocator);
+        if (confirm_summary and options.confirm_prompt != null) {
+            _ = try terminal.appendClippedText(&row, allocator, options.confirm_prompt.?, width);
+        } else {
+            const shortcuts = if (width >= options.footer_full.len)
+                options.footer_full
+            else if (options.confirm_prompt != null and width >= options.confirm_prompt.?.len)
+                options.footer_medium
+            else
+                options.footer_narrow;
+            _ = try terminal.appendClippedText(&row, allocator, shortcuts, width);
+        }
+        try lines.append(allocator, try row.toOwnedSlice(allocator));
+    }
+
+    return try lines.toOwnedSlice(allocator);
+}
+
 pub fn renderFrame(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
@@ -488,76 +594,16 @@ pub fn renderFrame(
     options: Options,
     th: theme.Theme,
 ) !void {
-    const width = @max(1, @as(usize, size.col) -| 1);
+    const lines = try renderLinesAlloc(allocator, source, list, range, size, confirm_summary, show_filter_bar, options, th);
+    defer {
+        for (lines) |l| allocator.free(l);
+        allocator.free(lines);
+    }
     if (previous_rows > 0) try out.print(allocator, "\x1b[{d}A", .{previous_rows});
     try out.appendSlice(allocator, "\r\x1b[J");
-    if (size.row >= 3) {
-        if (options.title_hint.len > 0 and width >= options.title.len + options.title_hint.len + 3) {
-            try th.appendOpen(out, allocator, theme.Theme.accent);
-            const used = try terminal.appendClippedText(out, allocator, options.title, width);
-            try th.appendClose(out, allocator);
-            try th.appendOpen(out, allocator, theme.Theme.muted);
-            _ = try terminal.appendClippedText(out, allocator, options.title_hint, width -| used);
-            try th.appendClose(out, allocator);
-        } else {
-            _ = try terminal.appendClippedText(out, allocator, options.title, width);
-        }
-        try out.appendSlice(allocator, "\r\n");
-    }
-    if (show_filter_bar and size.row >= 4) {
-        try th.appendOpen(out, allocator, theme.Theme.muted);
-        const used = try terminal.appendClippedText(out, allocator, "Filter: ", width);
-        try th.appendClose(out, allocator);
-        _ = try terminal.appendClippedText(out, allocator, list.filter.items, width -| used);
-        try out.appendSlice(allocator, "\r\n");
-    }
-
-    if (range[1] <= range[0]) {
-        try th.appendOpen(out, allocator, theme.Theme.muted);
-        _ = try terminal.appendClippedText(out, allocator, "(no matches)", width);
-        try th.appendClose(out, allocator);
-    } else {
-        for (range[0]..range[1]) |pos| {
-            if (pos > range[0]) try out.appendSlice(allocator, "\r\n");
-            const index = list.indices.items[pos];
-            const item = source.item(source.context, index);
-            const is_selected = pos == list.selected_pos;
-            if (is_selected) try out.appendSlice(allocator, "\x1b[7m");
-            const marker: u8 = if (is_selected) '>' else ' ';
-            const active: u8 = if (source.active == index or item.is_active) '*' else ' ';
-            var remaining = width;
-            remaining -= try terminal.appendClippedText(out, allocator, &.{ marker, active, ' ' }, remaining);
-            const indent_len: usize = if (item.depth > 4) 8 else item.depth * 2;
-            const indent = "        "[0..indent_len];
-            const visible_indent = indent[0..@min(indent.len, remaining)];
-            try out.appendSlice(allocator, visible_indent);
-            remaining -= visible_indent.len;
-            remaining -= try terminal.appendClippedText(out, allocator, item.id, remaining);
-            if (item.role.len > 0) {
-                remaining -= try terminal.appendClippedText(out, allocator, " ", remaining);
-                remaining -= try terminal.appendClippedText(out, allocator, item.role, remaining);
-            }
-            if (item.preview.len > 0) {
-                remaining -= try terminal.appendClippedText(out, allocator, "  ", remaining);
-                _ = try terminal.appendClippedText(out, allocator, item.preview, remaining);
-            }
-            if (is_selected) try out.appendSlice(allocator, "\x1b[0m");
-        }
-    }
-
-    if (size.row >= 2) {
-        try out.appendSlice(allocator, "\r\n");
-        if (confirm_summary and options.confirm_prompt != null) {
-            _ = try terminal.appendClippedText(out, allocator, options.confirm_prompt.?, width);
-        } else {
-            const shortcuts = if (width >= options.footer_full.len)
-                options.footer_full
-            else if (options.confirm_prompt != null and width >= options.confirm_prompt.?.len)
-                options.footer_medium
-            else
-                options.footer_narrow;
-            _ = try terminal.appendClippedText(out, allocator, shortcuts, width);
-        }
+    for (lines, 0..) |l, i| {
+        if (i > 0) try out.appendSlice(allocator, "\r\n");
+        try out.appendSlice(allocator, l);
     }
 }
 
