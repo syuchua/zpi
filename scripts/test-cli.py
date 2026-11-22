@@ -1035,11 +1035,11 @@ def terminal_check(common, environment, session, tool_count):
                                env=environment, close_fds=True)
     transcript = bytearray()
 
-    def read_until(marker):
+    def read_until(marker, start=0):
         deadline = time.monotonic() + 10
-        while marker not in transcript:
+        while transcript.find(marker, start) == -1:
             remaining = deadline - time.monotonic()
-            assert remaining > 0, ('terminal timed out', bytes(transcript))
+            assert remaining > 0, ('terminal timed out', marker, bytes(transcript[start:]))
             if not select.select([master], [], [], remaining)[0]:
                 continue
             try:
@@ -1050,6 +1050,7 @@ def terminal_check(common, environment, session, tool_count):
                 raise
             assert chunk, bytes(transcript)
             transcript.extend(chunk)
+        return transcript.find(marker, start)
 
     try:
         read_until(b'Ctrl-D exits')
@@ -1059,7 +1060,7 @@ def terminal_check(common, environment, session, tool_count):
         read_until(b'Keyboard shortcuts')
         session_mark = len(transcript)
         os.write(master, b'/session\n')
-        read_until(f'Active entry: {active_entry}'.encode())
+        read_until(f'Active entry: {active_entry}'.encode(), session_mark)
         assert b'\r\x1b[J' in transcript[session_mark:], bytes(transcript[session_mark:])
         assert f'File: {session}'.encode() in transcript, bytes(transcript)
         messages = [record['message'] for record in map(json.loads, before_commands.splitlines())
@@ -1069,9 +1070,22 @@ def terminal_check(common, environment, session, tool_count):
         assert f'Messages: {len(messages)} total ({user_count} user, {assistant_count} assistant)'.encode() in transcript, bytes(transcript)
         assert f'Tools: {tool_count} calls, {tool_count} results'.encode() in transcript, bytes(transcript)
         assert session.read_bytes() == before_commands
+        resume_mark = len(transcript)
         os.write(master, b'resume-check\n')
-        read_until(b'resumed correctly')
+        read_until(b'resumed correctly', resume_mark)
         os.write(master, b'/exit\n')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
         assert process.wait(timeout=5) == 0, bytes(transcript)
         after = termios.tcgetattr(slave)
         pendin = getattr(termios, 'PENDIN', 0)
@@ -2364,6 +2378,10 @@ def check_resume_picker(root, environment):
         return transcript.find(marker, start)
 
     try:
+        expect(b'v0.1.0-dev')
+        expect(b'[Tools]')
+        expect(b'first task alpha')
+        expect(b'alpha answer')
         expect(b'\x1b[?2004h')
         s = len(transcript)
         os.write(master, b'/resume --list\n')
@@ -2380,6 +2398,8 @@ def check_resume_picker(root, environment):
         filt_pos = expect(b'beta-session.jsonl', s2)
         os.write(master, b'\r')
         resumed_pos = expect(b'[resumed: beta-session.jsonl]', filt_pos)
+        expect(b'second task beta', resumed_pos)
+        expect(b'beta answer', resumed_pos)
         assert b'\r\x1b[J' in transcript[filt_pos:resumed_pos], bytes(transcript[filt_pos:resumed_pos])
 
         # /session reflects switched session file and counts.

@@ -214,11 +214,14 @@ fn run(init: std.process.Init) !void {
                 for (slash_commands) |cmd| init.gpa.free(cmd);
                 init.gpa.free(slash_commands);
             }
+            var startup_res = try h.startupResources(init.gpa);
+            defer startup_res.deinit();
             const status = h.statusSummary();
             try tui.run(init.io, .{
                 .context = &adapter,
                 .run = CliAdapter.submitErased,
                 .session_info = CliAdapter.sessionInfoErased,
+                .render_initial_history = CliAdapter.renderInitialHistoryErased,
                 .jobs_info = CliAdapter.jobsErased,
                 .cancel = cancel_token,
                 .reset_cancel = CliAdapter.resetCancelErased,
@@ -245,6 +248,15 @@ fn run(init: std.process.Init) !void {
                 .pop_bg_notifications = CliAdapter.popBgNotificationsErased,
                 .color_mode = adapter.tui_theme.mode,
                 .quiet_startup = status.quiet_startup,
+                .startup_info = .{
+                    .version = startup_res.version,
+                    .skills = startup_res.skills,
+                    .templates = startup_res.templates,
+                    .plugins = startup_res.plugins,
+                    .extensions = startup_res.extensions,
+                    .mcp_servers = startup_res.mcp_servers,
+                    .tools = startup_res.tools,
+                },
             });
         } else {
             return error.TuiDisabled;
@@ -746,6 +758,141 @@ const CliAdapter = struct {
         };
     }
 
+    fn renderInitialHistoryErased(context: *anyopaque) anyerror!bool {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        return try self.renderSessionHistory();
+    }
+
+    fn renderSessionHistory(self: *CliAdapter) anyerror!bool {
+        const h = self.harness orelse return false;
+        const projected = try h.store.projectedActivePath(self.allocator);
+        defer self.allocator.free(projected);
+
+        var has_visible = false;
+        for (projected) |entry| {
+            if (entry.message.role != .system) {
+                has_visible = true;
+                break;
+            }
+        }
+        if (!has_visible) return false;
+
+        const stdout = std.Io.File.stdout();
+        const cols = if (comptime build_options.enable_tui) tui.terminal.terminalColumns(self.io, stdout) else 80;
+        const wrap_cols = @max(@as(usize, 16), cols -| 1);
+        const hide_thinking = h.settings.hide_thinking_block;
+        const expanded = if (comptime build_options.enable_tui) self.isExpanded() else false;
+
+        for (projected) |entry| {
+            if (entry.message.role == .system) continue;
+            if (entry.compaction) |comp| {
+                const line = try std.fmt.allocPrint(self.allocator, "[compacted history]\n{s}\n\n", .{comp.summary});
+                defer self.allocator.free(line);
+                try writeSafe(self.io, stdout, line);
+                continue;
+            }
+            if (entry.branch_summary) |bs| {
+                const line = try std.fmt.allocPrint(self.allocator, "[branch summary]\n{s}\n\n", .{bs.summary});
+                defer self.allocator.free(line);
+                try writeSafe(self.io, stdout, line);
+                continue;
+            }
+            switch (entry.message.role) {
+                .user => {
+                    for (entry.message.content) |part| switch (part) {
+                        .text => |txt| {
+                            if (comptime build_options.enable_tui) {
+                                const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt);
+                                defer self.allocator.free(echo);
+                                try stdout.writeStreamingAll(self.io, echo);
+                                try stdout.writeStreamingAll(self.io, "\n\n");
+                            } else {
+                                try stdout.writeStreamingAll(self.io, "> ");
+                                try writeSafe(self.io, stdout, txt);
+                                try stdout.writeStreamingAll(self.io, "\n\n");
+                            }
+                        },
+                        else => {},
+                    };
+                },
+                .assistant => {
+                    var md = if (comptime build_options.enable_tui) tui.components.markdown.MarkdownStyler{} else {};
+                    for (entry.message.content) |part| switch (part) {
+                        .thinking => |thk| if (!hide_thinking and thk.text.len > 0) {
+                            const txt = thk.text;
+                            const max_len: usize = if (expanded) 16 * 1024 else 240;
+                            var take = @min(txt.len, max_len);
+                            if (take < txt.len) {
+                                while (take > 0 and (txt[take] & 0xc0) == 0x80) : (take -= 1) {}
+                            }
+                            if (comptime build_options.enable_tui) {
+                                const hdr = try tui.components.message.formatThinkingHeaderAlloc(self.allocator, self.tui_theme);
+                                defer self.allocator.free(hdr);
+                                try stdout.writeStreamingAll(self.io, hdr);
+                                const body = try tui.components.message.formatThinkingDeltaAlloc(self.allocator, self.tui_theme, txt[0..take]);
+                                defer self.allocator.free(body);
+                                try stdout.writeStreamingAll(self.io, body);
+                                if (take < txt.len) try stdout.writeStreamingAll(self.io, " ...");
+                                try stdout.writeStreamingAll(self.io, "\n");
+                            }
+                        },
+                        .text => |txt| if (txt.len > 0) {
+                            if (comptime build_options.enable_tui) {
+                                var lines = std.mem.splitScalar(u8, txt, '\n');
+                                while (lines.next()) |line| {
+                                    const styled = try md.styleWrappedLineAlloc(self.allocator, self.tui_theme, line, wrap_cols);
+                                    defer self.allocator.free(styled);
+                                    try stdout.writeStreamingAll(self.io, styled);
+                                    try stdout.writeStreamingAll(self.io, "\n");
+                                }
+                            } else {
+                                try writeSafe(self.io, stdout, txt);
+                                try stdout.writeStreamingAll(self.io, "\n");
+                            }
+                        },
+                        .tool_call => |call| {
+                            if (comptime build_options.enable_tui) {
+                                const arg_summary = extractToolArgSummary(call);
+                                const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
+                                defer self.allocator.free(header);
+                                try stdout.writeStreamingAll(self.io, header);
+                            } else {
+                                try stdout.writeStreamingAll(self.io, "[tool: ");
+                                try writeSafe(self.io, stdout, call.name);
+                                try stdout.writeStreamingAll(self.io, "]\n");
+                            }
+                        },
+                        else => {},
+                    };
+                    try stdout.writeStreamingAll(self.io, "\n");
+                },
+                .tool_result => {
+                    if (comptime build_options.enable_tui) {
+                        if (entry.message.is_error) {
+                            var first_text: []const u8 = "";
+                            for (entry.message.content) |part| switch (part) {
+                                .text => |txt| {
+                                    first_text = txt;
+                                    break;
+                                },
+                                else => {},
+                            };
+                            const err_line = try tui.components.tool_card.formatEndErrorAlloc(self.allocator, self.tui_theme, first_text);
+                            defer self.allocator.free(err_line);
+                            try stdout.writeStreamingAll(self.io, err_line);
+                        } else {
+                            const ok_line = try tui.components.tool_card.formatEndOkAlloc(self.allocator, self.tui_theme);
+                            defer self.allocator.free(ok_line);
+                            try stdout.writeStreamingAll(self.io, ok_line);
+                        }
+                    }
+                },
+                .system => unreachable,
+            }
+        }
+        return true;
+    }
+
     fn resumeErased(context: *anyopaque, arg: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         const h = self.harness.?;
@@ -776,6 +923,10 @@ const CliAdapter = struct {
         const notice = try std.fmt.allocPrint(self.allocator, "[resumed: {s}]\n", .{std.fs.path.basename(arg)});
         defer self.allocator.free(notice);
         try writeSafe(self.io, .stdout(), notice);
+        if (self.mode == .interactive) {
+            try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+            _ = try self.renderSessionHistory();
+        }
     }
 
     fn emit(context: *anyopaque, event: harness.Event) anyerror!void {

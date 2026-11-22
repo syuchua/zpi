@@ -98,6 +98,27 @@ pub const SwitchModelResult = union(enum) {
     switched: StatusSummary,
 };
 
+pub const StartupResources = struct {
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    skills: []const []const u8,
+    templates: []const []const u8,
+    plugins: []const []const u8,
+    extensions: []const []const u8,
+    mcp_servers: []const []const u8,
+    tools: []const []const u8,
+
+    pub fn deinit(self: *StartupResources) void {
+        self.allocator.free(self.skills);
+        self.allocator.free(self.templates);
+        self.allocator.free(self.plugins);
+        self.allocator.free(self.extensions);
+        self.allocator.free(self.mcp_servers);
+        self.allocator.free(self.tools);
+        self.* = undefined;
+    }
+};
+
 pub const StatusSummary = struct {
     provider: []const u8,
     model: []const u8,
@@ -213,6 +234,9 @@ pub const Harness = struct {
     tool_set: zpi.tools.ToolSet,
     native_modules: []zpi.native_runtime.Module,
     native_loaded: usize,
+    native_plugin_names: []const []const u8 = &.{},
+    extension_names: []const []const u8 = &.{},
+    mcp_server_names: []const []const u8 = &.{},
     extension_host: ?zpi.extensions.Host,
     enabled_tools: []agent.Tool,
     runtime: agent.Agent,
@@ -438,12 +462,15 @@ pub const Harness = struct {
         errdefer for (self.native_modules[0..self.native_loaded]) |*module| {
             module.close() catch {};
         };
-        for (options.native_plugins, self.native_modules) |path, *module| {
+        const plugin_names = try a.alloc([]const u8, options.native_plugins.len);
+        for (options.native_plugins, plugin_names, self.native_modules) |path, *pname, *module| {
             const absolute = try std.fs.path.resolveAlloc(a, &.{ host_cwd, path });
             module.* = try zpi.native_runtime.Module.open(absolute);
             self.native_loaded += 1;
+            pname.* = std.fs.path.basename(path);
             registered_tools = try zpi.native_tools.combine(a, module, registered_tools);
         }
+        self.native_plugin_names = plugin_names;
 
         const previous = try self.store.projectedPathFrom(a, options.branch orelse self.store.active_leaf);
         defer a.free(previous);
@@ -465,7 +492,9 @@ pub const Harness = struct {
             break :blk try system_prompt.compose(a, base, additions);
         } else null;
 
-        for (options.mcp_servers, self.mcp_clients) |server, *client| {
+        const mcp_names = try a.alloc([]const u8, options.mcp_servers.len);
+        for (options.mcp_servers, mcp_names, self.mcp_clients) |server, *mname, *client| {
+            mname.* = try a.dupe(u8, server.name);
             const command = try a.alloc([]const u8, server.argv.len);
             for (server.argv, command) |arg, *value| value.* = arg;
             client.* = try zpi.mcp.Client.start(gpa, io, .{ .argv = command, .cwd = cwd });
@@ -478,8 +507,12 @@ pub const Harness = struct {
                 registered_tools = try zpi.mcp_tools.combine(a, client, server.name, registered_tools, listing.result());
             }
         }
+        self.mcp_server_names = mcp_names;
 
         if (options.extensions.len > 0) {
+            const ext_names = try a.alloc([]const u8, options.extensions.len);
+            for (options.extensions, ext_names) |epath, *ename| ename.* = std.fs.path.basename(epath);
+            self.extension_names = ext_names;
             const sdk_directory = try std.fs.path.resolveAlloc(a, &.{ host_cwd, options.pi_sdk.? });
             const script = if (options.extension_host) |path|
                 try std.fs.path.resolveAlloc(a, &.{ host_cwd, path })
@@ -621,6 +654,38 @@ pub const Harness = struct {
             .context_window = self.selection.context_window,
             .hide_thinking_block = self.settings.hide_thinking_block,
             .quiet_startup = self.settings.quiet_startup,
+        };
+    }
+
+    pub fn startupResources(self: *const Harness, allocator: std.mem.Allocator) !StartupResources {
+        const skill_names = try allocator.alloc([]const u8, self.discovered_skills.len);
+        errdefer allocator.free(skill_names);
+        for (self.discovered_skills, skill_names) |s, *dst| dst.* = s.name;
+
+        const tmpl_names = try allocator.alloc([]const u8, self.discovered_templates.len);
+        errdefer allocator.free(tmpl_names);
+        for (self.discovered_templates, tmpl_names) |t, *dst| dst.* = t.name;
+
+        const plugins = try allocator.dupe([]const u8, self.native_plugin_names);
+        errdefer allocator.free(plugins);
+        const exts = try allocator.dupe([]const u8, self.extension_names);
+        errdefer allocator.free(exts);
+        const mcps = try allocator.dupe([]const u8, self.mcp_server_names);
+        errdefer allocator.free(mcps);
+
+        const tool_names = try allocator.alloc([]const u8, self.enabled_tools.len);
+        errdefer allocator.free(tool_names);
+        for (self.enabled_tools, tool_names) |t, *dst| dst.* = t.definition.name;
+
+        return .{
+            .allocator = allocator,
+            .version = zpi.VERSION,
+            .skills = skill_names,
+            .templates = tmpl_names,
+            .plugins = plugins,
+            .extensions = exts,
+            .mcp_servers = mcps,
+            .tools = tool_names,
         };
     }
 

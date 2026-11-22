@@ -108,10 +108,21 @@ pub const BgNotification = struct {
     trigger: bool,
 };
 
+pub const StartupInfo = struct {
+    version: []const u8 = "",
+    skills: []const []const u8 = &.{},
+    templates: []const []const u8 = &.{},
+    plugins: []const []const u8 = &.{},
+    extensions: []const []const u8 = &.{},
+    mcp_servers: []const []const u8 = &.{},
+    tools: []const []const u8 = &.{},
+};
+
 pub const Submit = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque, []const u8) anyerror!void,
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
+    render_initial_history: ?*const fn (*anyopaque) anyerror!bool = null,
     jobs_info: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     cancel: ?agent.model.Cancel = null,
     reset_cancel: ?*const fn (*anyopaque) void = null,
@@ -138,6 +149,7 @@ pub const Submit = struct {
     pop_bg_notifications: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]BgNotification = null,
     color_mode: ?theme.ColorMode = null,
     quiet_startup: bool = false,
+    startup_info: StartupInfo = .{},
 };
 
 const History = struct {
@@ -159,6 +171,85 @@ const History = struct {
     }
 };
 
+fn writeStartupSection(
+    out: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    th: theme.Theme,
+    title: []const u8,
+    items: []const []const u8,
+    max_cols: usize,
+) !usize {
+    if (items.len == 0) return 0;
+    var hdr_buf: [64]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "[{s}]", .{title}) catch title;
+    try th.paint(out, a, theme.Theme.accent, hdr);
+    try out.append(a, '\n');
+
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(a);
+    try joined.appendSlice(a, "  ");
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try joined.appendSlice(a, ", ");
+        try joined.appendSlice(a, item);
+    }
+    const wrapped = try terminal.wrapAnsiAlloc(a, joined.items, max_cols);
+    defer a.free(wrapped);
+    var row_count: usize = 1;
+    var lines_it = std.mem.splitScalar(u8, wrapped, '\n');
+    while (lines_it.next()) |line| {
+        try th.paint(out, a, theme.Theme.muted, line);
+        try out.append(a, '\n');
+        row_count += 1;
+    }
+    try out.append(a, '\n');
+    return row_count + 1;
+}
+
+fn renderStartupBanner(io: std.Io, output: std.Io.File, submit: Submit, th: theme.Theme) !usize {
+    const a = submit.allocator;
+    const sz = terminalSize(io, output);
+    const max_cols = @max(@as(usize, 24), @as(usize, sz.col) -| 1);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    var lines: usize = 0;
+
+    try out.append(a, '\n');
+    lines += 1;
+
+    try th.appendOpen(&out, a, theme.Theme.accent);
+    try out.appendSlice(a, "zpi");
+    try th.appendClose(&out, a);
+    if (submit.startup_info.version.len > 0) {
+        var ver_buf: [64]u8 = undefined;
+        const ver_str = std.fmt.bufPrint(&ver_buf, " v{s}", .{submit.startup_info.version}) catch submit.startup_info.version;
+        try th.paint(&out, a, theme.Theme.muted, ver_str);
+    }
+    try out.append(a, '\n');
+    lines += 1;
+
+    const hints = "Ctrl-C interrupt · Ctrl-D exits · / commands · @ files · Shift+Tab thinking · Ctrl-O expand · /help · /hotkeys";
+    const wrapped_hints = try terminal.wrapAnsiAlloc(a, hints, max_cols);
+    defer a.free(wrapped_hints);
+    var hints_it = std.mem.splitScalar(u8, wrapped_hints, '\n');
+    while (hints_it.next()) |hline| {
+        try th.paint(&out, a, theme.Theme.muted, hline);
+        try out.append(a, '\n');
+        lines += 1;
+    }
+    try out.append(a, '\n');
+    lines += 1;
+
+    lines += try writeStartupSection(&out, a, th, "Skills", submit.startup_info.skills, max_cols);
+    lines += try writeStartupSection(&out, a, th, "Prompts", submit.startup_info.templates, max_cols);
+    lines += try writeStartupSection(&out, a, th, "Plugins", submit.startup_info.plugins, max_cols);
+    lines += try writeStartupSection(&out, a, th, "Extensions", submit.startup_info.extensions, max_cols);
+    lines += try writeStartupSection(&out, a, th, "MCP", submit.startup_info.mcp_servers, max_cols);
+    lines += try writeStartupSection(&out, a, th, "Tools", submit.startup_info.tools, max_cols);
+
+    try output.writeStreamingAll(io, out.items);
+    return lines;
+}
+
 pub fn run(io: std.Io, submit: Submit) !void {
     const input = std.Io.File.stdin();
     const output = std.Io.File.stdout();
@@ -166,11 +257,20 @@ pub fn run(io: std.Io, submit: Submit) !void {
     const color = try output.supportsAnsiEscapeCodes(io);
     const th = theme.Theme.init(submit.color_mode orelse if (color) .ansi16 else .none);
     const use_sgr = color and th.mode != .none;
+    var header_lines: usize = 0;
     if (!submit.quiet_startup) {
-        try output.writeStreamingAll(io, if (use_sgr)
-            "\x1b[1;36mzpi\x1b[0m  /help · /hotkeys · /exit · Ctrl-D exits\n"
-        else
-            "zpi  /help · /hotkeys · /exit · Ctrl-D exits\n");
+        header_lines = try renderStartupBanner(io, output, submit, th);
+    }
+    const had_initial_history = if (submit.render_initial_history) |render_init| try render_init(submit.context) else false;
+    if (!had_initial_history and !submit.quiet_startup and th.mode != .none) {
+        const sz = terminalSize(io, output);
+        const editor_chrome_rows: usize = 5;
+        if (sz.row > header_lines + editor_chrome_rows) {
+            const pad = @min(@as(usize, sz.row) - header_lines - editor_chrome_rows, 80);
+            var pad_buf: [80]u8 = undefined;
+            @memset(pad_buf[0..pad], '\n');
+            try output.writeStreamingAll(io, pad_buf[0..pad]);
+        }
     }
 
     var queue = InputQueue{};
