@@ -7,7 +7,7 @@ The local host is macOS arm64 with Zig 0.17.0. Apple Container 1.6.1 and Colima 
 ```sh
 zig build test
 zig build
-zig fmt --check build.zig src/*.zig src/cli/*.zig
+zig fmt --check build.zig build.zig.zon src
 python3 scripts/test-cli.py
 sh scripts/test-linux-containers.sh
 sh scripts/test-linux-glibc.sh
@@ -229,6 +229,37 @@ Added `LiveScreen` (mutex-synchronized stream + overlay rendering preserving unf
 | `scripts/test-cli.py` | `cda955bba3a19407a48cd11c251272c64555f05ea254318b3a8d725cf5d1f67e` |
 | `scripts/test-linux-artifacts.sh` | `bd917cc1c6ef7df6609759ac180ecda1e806dbdf656b5d52b18daf1933dc31dc` |
 | `README.md` | `cf34b256a8d92e4bffec874ea5311f397a54b0e5421855cf2373c46af0e57f9c` |
+
+### Layered core/harness + optional pure-Zig main-screen TUI (`feat/tui-layered-architecture`)
+
+Extracted CLI-agnostic session/agent orchestration into `src/harness.zig` (`Harness`, `Event`, `Sink`, shared by `-p`, `--mode json`, and interactive TUI), added `-Dtui=native|none` in `build.zig` (`build_options.enable_tui`), modularized `src/tui/` (`terminal.zig`, `theme.zig`, `renderer.zig` with `\x1b[?2026h`..`\x1b[?2026l` synchronized line-diff rendering, and `components/{markdown,message,tool_card,chrome,select_list}.zig` for incremental Markdown/thinking styling, bordered tool cards/diffs, animated `Loader`, compact `Footer`, and unified fuzzy `SelectList` for `/model` and `/tree` with `p` user-message prefill), fixed `config.load` slice lifetime (`src/cli/config.zig`) uncovered by `x86_64-linux-musl` PTY `/model` switching, and extended `scripts/test-cli.py` with `check_tui_components` (`NO_COLOR`, `TERM=dumb`, TrueColor cards/diffs/footer/loader), `/model` fuzzy selection, and `/tree` `/` filtering + `p` prefill.
+
+- **macOS arm64 + Linux 7-target matrix** (`bfad7c2af`, `.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-21136/bfad7c2af.output`, exit 0):
+  - **macOS arm64** passed `zig fmt --check build.zig build.zig.zon src`, `python3 -m py_compile scripts/*.py`, `sh -n scripts/*.sh`, `node --check scripts/*.mjs`, **133/133** build steps (`zig build test install test-binaries --summary all` with `ZPI_PI_SDK` 1.6.0; `harness-tests` **29/29**, `tui-tests` **17/17**, `cli-tests` **5/5**, `skills-tests` **3/3**, `tool-selection-tests` **2/2**, and `extension-tests` **4/4** executed alongside cached unchanged suites), `zig build -Dtui=none test` (**79/79** steps) + `zig build -Dtui=none install` (**8/8** steps) + headless `-p`/`--mode json` loopback HTTP smoke, `scripts/test-cli.py` (with pi 1.6.0 SDK, `ZPI_PI_SESSION_SDK`, C/Zig `.dylib` fixtures, and all PTY checks), `scripts/test-ts-host.py`, `scripts/test-context-budget.py` (**84** checks), and `scripts/test-package-release.py`.
+  - **Linux** passed all seven targets: Alpine arm64 native (**100/100** build steps, **187** passed, **3** SDK skips, **0** failures), four cross-built musl container runs (`aarch64-linux-musl` and translated `x86_64-linux-musl` under Apple Container and Colima, each **187** passed, **3** SDK skips, **0** failures), and cross-built plus native Ubuntu 24.04 arm64 glibc 2.39 (**100/100** native build steps, each **185** passed, **5** skips [3 SDK, 2 search], **0** failures). Every target passed `harness-tests` (**29/29**), `tui-tests` (**17/17**), `scripts/test-cli.py` (with C/Zig `.so` fixtures and full PTY coverage), and **84** context-budget checks.
+
+`bfad7c2af` recorded these exact SHA-256 hashes before and after execution (with only `docs/spec/platform-verification.md` updated afterward to record this run):
+
+| File | SHA-256 |
+| --- | --- |
+| `build.zig` | `83ade9b5fed6e10a26bcac1a8b73a824e4cb693a08a495808e30809601cb47df` |
+| `src/harness.zig` | `9ee6fc34dda145a5b6d5b4d808fafda52aa092d5cdeed721fb2a1168c44ee7a7` |
+| `src/main.zig` | `5af2583d0d7c3b122147150cecccc729115484bf1b904182d1fc533b4f66a51e` |
+| `src/cli/args.zig` | `3aa3f6876ed16b4553ce6090f756cda148598742724ab3bf78b24b4067d161b3` |
+| `src/cli/config.zig` | `97052c922339bf1f64bc86e038e52b2e81cf00dbd14a267f516d70fc5a10c1e5` |
+| `src/tui.zig` | `4a8c07d1fc4f5a8a26ebf116864428b39c582bb8a0f584205b87a1fb42d7fce9` |
+| `src/tui/terminal.zig` | `9a03f31983167ae11d86d5f29bc2c3dee0ca3941f5f18eccea84fe22cb81f869` |
+| `src/tui/theme.zig` | `2fe6de2ecd5729c567a811ed241a548a107d528b662924156e0cf669e6a03ccc` |
+| `src/tui/renderer.zig` | `36dcc3a2ea8e02e7e3e49dc935872f74ac6fe32da81c9b9eaff62feaa4331f7f` |
+| `src/tui/components/chrome.zig` | `15b617b41cf07aec462fab9398d5051f528d0a15d4ce2de9fceeb7e6f8663e9a` |
+| `src/tui/components/markdown.zig` | `adad90eb4882e871cc294ef944e911e0366302d5a7267673dcfab1ef341f4674` |
+| `src/tui/components/message.zig` | `18e2e089a5a528866a683938ab78a63875a0a80334bf1574619dbc88501285dc` |
+| `src/tui/components/select_list.zig` | `948a1c5504321955bda77241f2f2595d63ab9bd49cfb19361fcf4a7d83c2c1a6` |
+| `src/tui/components/tool_card.zig` | `14da76b7211f9b832dc96835093fd20dd949858e74ed47637b024c68a8e0fb2b` |
+| `scripts/test-cli.py` | `61ad356f6294a7dd65b2a5bdaa4b8223c997d4f72724c3b6eb5ab381a8181609` |
+| `scripts/test-linux-artifacts.sh` | `84626d44e36e0a49c4d2a7fbada62b9e63b93bab09af22db1d805e7fefef7bd3` |
+| `README.md` | `2caa1f427c9239b1717d0d4e911b3e77cabc8c848cae6b0c4fd014a11086035d` |
+| `docs/spec/compatibility-matrix.md` | `3c800f678a0ee1637dc7e3e8d80992f745ddac6c6ba16ed5634d216b6a00781f` |
 
 ## Further acceptance
 
