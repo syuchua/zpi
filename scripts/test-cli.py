@@ -1411,7 +1411,7 @@ def check_tree_navigation(root, environment, server):
 
     try:
         prompt_ready = b'\x1b[?2004h'
-        picker_ready = b'Up/Down move  Enter switch  Esc cancel'
+        picker_ready = b'Up/Down move  Enter switch  s summarize  Esc cancel'
         assert expect(prompt_ready)
         start = len(transcript)
         command(b'/tr\t', picker_ready)
@@ -1467,13 +1467,54 @@ def check_tree_navigation(root, environment, server):
         switched = session.read_bytes()
         command(b'/tree --summary 4', b'zpi: BranchSummaryFailed')
         assert session.read_bytes() == switched
+        assert server.tree_summary_requests == 1
         command(b'/tree --summary 4', b'zpi: BranchSummaryFailed')
         assert session.read_bytes() == switched
-        command(b'/tree --summary 4', b'[branched to 4 with summary]')
+        assert server.tree_summary_requests == 2
+        command(b'/tree', picker_ready)
+        start = len(transcript)
+        os.write(master, b'\x1b[A' * 5 + b's')
+        confirmation = b'Send departed branch to provider? y/n'
+        expect(confirmation, start)
+        assert session.read_bytes() == switched and server.tree_summary_requests == 2
+
+        # Enter, arrows, and bracketed paste cannot confirm disclosure.
+        start = len(transcript)
+        os.write(master, b'\r\x1b[A\x1b[200~y\x1b[201~n')
+        frame_end = expect(picker_ready, start)
+        selected = transcript[start:frame_end].split(b'\x1b[7m>')[-1].lstrip()
+        assert selected.startswith(b'4 user '), selected
+        assert session.read_bytes() == switched and server.tree_summary_requests == 2
+
+        # A resize that hides the confirmation dismisses it; invoke the picker
+        # from a fresh prompt afterward to avoid mixing the resize frame with
+        # the active prompt editor's incremental redraw.
+        start = len(transcript)
+        os.write(master, b's')
+        expect(confirmation, start)
+        resize(5, 31)
+        start = len(transcript)
+        os.write(master, b'y')
+        expect(b'Up/Down Enter Esc', start)
+        assert session.read_bytes() == switched and server.tree_summary_requests == 2
+        resize(24, 80)
+        start = len(transcript)
+        os.write(master, b'\x1b/session\r')
+        expect(b'Active entry:', start)
+
+        command(b'/tree', picker_ready)
+        start = len(transcript)
+        os.write(master, b'\x1b[A' * 5 + b's')
+        expect(confirmation, start)
+        assert session.read_bytes() == switched and server.tree_summary_requests == 2
+        start = len(transcript)
+        os.write(master, b'y')
+        expect(b'[branched to 4 with summary]', start)
         added = session.read_bytes()[len(switched):].splitlines()
         assert len(added) == 1, added
         summary = json.loads(added[0])
         assert (summary['type'], summary['parent_id'], summary['from_id']) == ('branch_summary', '4', '9'), summary
+        assert server.tree_summary_requests == 3
         command(b'tree-live', b'tree-live complete')
         os.write(master, b'/exit\n')
         assert process.wait(timeout=5) == 0, bytes(transcript)

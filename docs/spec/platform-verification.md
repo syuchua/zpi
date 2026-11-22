@@ -194,18 +194,22 @@ Unlike the regular matrix, `b29decd46` verifies real pi SDK execution on Linux. 
 
 ### Zig-native `/tree` picker (`feat/tui-tree-picker`)
 
-The PTY fixture checks Tab completion into the picker, selection, narrow-window CJK clipping, idle resize redraw, paste isolation, Escape and SIGINT cancellation, and terminal restoration. It also checks rejection of incomplete tool batches, local branch switching without a model request, and the existing explicit summary command with persistence, reopen, and Skills projection. The plain-text `/tree --list` and `--older ENTRY-ID` routes are retained. The fixture exercises Page Up and Page Down. Home and End are supported by the picker but are outside this fixture.
+The PTY fixture checks Tab completion into the picker, selection, narrow-window CJK clipping, idle resize redraw, paste isolation, Escape and SIGINT cancellation, and terminal restoration. It also checks rejection of incomplete tool batches, local branch switching without a model request, explicit `s` + `y`/`n` summary confirmation (rejecting Enter, arrows, bracketed-paste `y`, and terminal resize dismissal without calling the provider), and explicit `--summary` persistence, reopen, and Skills projection. The plain-text `/tree --list` and `--older ENTRY-ID` routes are retained. The fixture exercises Page Up and Page Down. Home and End are supported by the picker but are outside this fixture.
 
-- **macOS arm64** (`bb61a9ffd`, `.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-94183/bb61a9ffd.output`, exit 0) passed **120/120** build steps, the CLI with pi 1.6.0 and C/Zig fixtures, TypeScript host/deadline fixtures, and **84** budget checks. It executed the four pi SDK extension tests with other test results cached.
-- **Linux** (`b18dbf06b`, `.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-94183/b18dbf06b.output`, exit 0) passed on seven configurations. The native Alpine and Ubuntu arm64 guest builds each passed **91/91** steps. Five musl runs each recorded **168 passes and 3 SDK skips**. Two Ubuntu 24.04 arm64 glibc 2.39 runs, one cross-built and one guest-built, each recorded **166 passes and 5 skips** (3 SDK and 2 search). The musl runs include cross-built arm64 and translated amd64 execution under Apple Container and Colima. All seven passed the CLI with C/Zig native plugins and **84** budget checks.
+- **Base picker (`ec5ecc6`)**:
+  - **macOS arm64** (`bb61a9ffd`, `.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-94183/bb61a9ffd.output`, exit 0) passed **120/120** build steps, the CLI with pi 1.6.0 and C/Zig fixtures, TypeScript host/deadline fixtures, and **84** budget checks (`extension-tests` 4/4 executed; other test steps cached).
+  - **Linux 7-target matrix** (`b18dbf06b`, `.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-94183/b18dbf06b.output`, exit 0) passed on seven configurations: Alpine arm64 native (**91/91** steps, **168** passed, **3** SDK skips), four cross-built musl targets (arm64 and translated amd64 under Apple Container and Colima, each **168** passed, **3** SDK skips), and cross-built plus native Ubuntu 24.04 arm64 glibc 2.39 (**91/91** native steps, each **166** passed, **5** skips: 3 SDK and 2 search). All seven passed the CLI with C/Zig native plugins and **84** budget checks (`src/main.zig` `7488880e...`, `src/tui.zig` `01a67c13...`, `scripts/test-cli.py` `7ba3cca0...`).
+- **Summary-confirmation follow-up (`b477ac513`, `.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-94183/b477ac513.output`, exit 0)**:
+  - **macOS arm64** passed `zig fmt --check src/main.zig src/tui.zig`, `py_compile`, **120/120** build steps (`extension-tests` 4/4 executed; unchanged test steps cached), CLI + pi 1.6.0 + C/Zig native plugins, TypeScript host/deadline fixtures, and **84** budget checks.
+  - **Linux native guests** passed both **Alpine arm64** (`91/91` steps, **168** passed, **3** SDK skips, **0** failures, CLI + native plugins + **84** budget checks) and **Ubuntu 24.04 arm64 glibc 2.39** (`91/91` steps, **166** passed, **5** skips [3 SDK, 2 search], **0** failures, CLI + native plugins + **84** budget checks). Cross-built/translated container targets did not re-run after this UI/test follow-up.
 
-The macOS run recorded these SHA-256 hashes before and after testing. The Linux run matched the implementation and fixture hashes.
+`b477ac513` recorded these SHA-256 hashes before and after testing (with `README.md`, `docs/spec/compatibility-matrix.md`, and `docs/spec/platform-verification.md` updated afterward to document the verified confirmation flow).
 
 | File | SHA-256 |
 | --- | --- |
 | `src/main.zig` | `7488880ec9fe7e8bff2174051a20d3bd25014b2dd0dafc68cb6fe0631bed5e96` |
-| `src/tui.zig` | `01a67c131c8be635474c0d013e492213180f4e5b45b77c22eb4232e167381e4d` |
-| `scripts/test-cli.py` | `7ba3cca040826cd06f686c8aee0c47b31efde331c0794c0f5834ab23004c98f8` |
+| `src/tui.zig` | `fd6424fe7053f25529bb14d818356e5934843ed12bb8eb39b9bedb79754ef65e` |
+| `scripts/test-cli.py` | `72bb3989b213f79102a2fafa2742544a15c4214fe8e38117c4b89689b1411211` |
 
 ## Further acceptance
 

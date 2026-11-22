@@ -60,9 +60,10 @@ Sessions are created under `~/.zpi/agent/sessions/`; pass `--session PATH` to cr
 
 ### Navigate within a session
 
-- `/tree` opens a keyboard picker with message previews and indented entries in session order. `*` marks the active entry and `>` marks the cursor. Move with Up/Down, Page Up/Page Down, or Home/End. Enter switches locally. Esc or Ctrl-C returns to the prompt without switching. The picker lists messages in session order and shows up to 20 rows at once. The picker follows terminal resize and preserves regular scrollback.
+- `/tree` opens a keyboard picker with message previews and indented entries in session order. `*` marks the active entry and `>` marks the cursor. Move with Up/Down, Page Up/Page Down, or Home/End. Enter switches locally. Esc or Ctrl-C returns to the prompt without switching. The picker shows up to 20 entries at once. The picker follows terminal resize and preserves regular scrollback.
 - `/tree --list` prints the 50 most recent entries with their IDs and parent IDs. `/tree --older ENTRY-ID` prints the preceding page. With `TERM=dumb`, bare `/tree` prints the list.
 - `/tree ENTRY-ID` switches directly without a model request. Both picker and direct navigation reject entries with incomplete tool batches. Switching preserves both branches and leaves filesystem changes in place.
+- Press `s` in the picker to request a branch summary. Zpi displays a separate confirmation before sending the departed conversation to the active provider: press `y` to continue, or `n` to return to the picker. If the terminal is too small to display the confirmation, summary generation is unavailable until it is resized.
 - `/tree --summary ENTRY-ID` explicitly sends the departed conversation after the common ancestor to the active provider. The request omits system messages and tool results, retains assistant tool-call descriptions, and exposes no tools. Zpi appends the summary after the selected entry and restores it on reopen. If generation fails or is canceled before the switch commits, the active branch stays where it was.
 
 Pi's prompt prefill, tree filtering, and labels remain pending.

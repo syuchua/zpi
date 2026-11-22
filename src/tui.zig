@@ -22,6 +22,11 @@ pub const TreeSource = struct {
     item: *const fn (*const anyopaque, usize) TreeItem,
 };
 
+const TreeSelection = struct {
+    id: []const u8,
+    summarize: bool = false,
+};
+
 pub const Submit = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -198,6 +203,8 @@ pub fn run(io: std.Io, submit: Submit) !void {
         if (std.mem.eql(u8, text, "/tree") or std.mem.startsWith(u8, text, "/tree ")) {
             const target = if (text.len > "/tree".len) std.mem.trim(u8, text["/tree".len..], " \t") else "";
             if (submit.tree) |run_tree| {
+                var summary_arg: ?[]u8 = null;
+                defer if (summary_arg) |arg| submit.allocator.free(arg);
                 const argument = if (target.len == 0 and color and submit.tree_source != null) blk: {
                     const tree = submit.tree_source.?(submit.context);
                     const choice = selectTree(io, input.handle, output, &queue, submit, tree) catch |err| switch (err) {
@@ -208,7 +215,10 @@ pub fn run(io: std.Io, submit: Submit) !void {
                         else => return err,
                     };
                     if (queue.eof) return;
-                    break :blk choice orelse continue;
+                    const selected = choice orelse continue;
+                    if (!selected.summarize) break :blk selected.id;
+                    summary_arg = try submit.allocator.print("--summary {s}", .{selected.id});
+                    break :blk summary_arg.?;
                 } else target;
                 run_tree(submit.context, argument) catch |err| {
                     var msg: [256]u8 = undefined;
@@ -266,7 +276,7 @@ fn selectTree(
     queue: *InputQueue,
     submit: Submit,
     source: TreeSource,
-) !?[]const u8 {
+) !?TreeSelection {
     if (source.len == 0) {
         try output.writeStreamingAll(io, "No entries in session.\n");
         return null;
@@ -285,8 +295,14 @@ fn selectTree(
     defer frame.deinit(submit.allocator);
     var dirty = true;
     var in_paste = false;
+    var confirm_summary = false;
     while (true) {
         const size = terminalSize(io, output);
+        const can_confirm = size.row >= 2 and size.col > summary_confirmation.len;
+        if (confirm_summary and !can_confirm) {
+            confirm_summary = false;
+            dirty = true;
+        }
         const chrome: usize = @as(usize, @intFromBool(size.row >= 3)) + @intFromBool(size.row >= 2);
         const visible = @max(1, @min(20, @as(usize, size.row) -| chrome));
         if (selected < first) first = selected;
@@ -299,7 +315,7 @@ fn selectTree(
             if (resized) try output.writeStreamingAll(io, "\r\n");
             const end = @min(source.len, first + visible);
             frame.clearRetainingCapacity();
-            try renderTree(&frame, submit.allocator, source, selected, .{ first, end }, size, if (resized) 0 else previous_rows);
+            try renderTree(&frame, submit.allocator, source, selected, .{ first, end }, size, if (resized) 0 else previous_rows, confirm_summary);
             try output.writeStreamingAll(io, frame.items);
             previous_rows = end - first + chrome - 1;
             previous_size = size;
@@ -340,7 +356,7 @@ fn selectTree(
                 in_paste = false;
                 continue;
             }
-            if (in_paste) continue;
+            if (in_paste or confirm_summary) continue;
             const previous = selected;
             switch (final) {
                 'A' => selected -|= 1,
@@ -361,12 +377,35 @@ fn selectTree(
         } else if (!in_paste) {
             switch (key) {
                 0x04 => return null,
-                '\r', '\n' => return source.item(source.context, selected).id,
+                '\r', '\n' => {
+                    if (!confirm_summary) return .{ .id = source.item(source.context, selected).id };
+                },
+                's', 'S' => {
+                    if (!confirm_summary and can_confirm and source.active != selected) {
+                        confirm_summary = true;
+                        dirty = true;
+                    }
+                },
+                'n', 'N' => {
+                    if (confirm_summary) {
+                        confirm_summary = false;
+                        dirty = true;
+                    }
+                },
+                'y', 'Y' => {
+                    if (confirm_summary) {
+                        const current_size = terminalSize(io, output);
+                        if (current_size.row >= 2 and current_size.col > summary_confirmation.len)
+                            return .{ .id = source.item(source.context, selected).id, .summarize = true };
+                    }
+                },
                 else => {},
             }
         }
     }
 }
+
+const summary_confirmation = "Send departed branch to provider? y/n";
 
 fn renderTree(
     out: *std.ArrayList(u8),
@@ -376,6 +415,7 @@ fn renderTree(
     range: struct { usize, usize },
     size: std.posix.winsize,
     previous_rows: usize,
+    confirm_summary: bool,
 ) !void {
     // Leave room at the right edge to avoid wrapping clipped previews.
     const width = @max(1, @as(usize, size.col) -| 1);
@@ -408,8 +448,13 @@ fn renderTree(
     }
     if (size.row >= 2) {
         try out.appendSlice(allocator, "\r\n");
-        const shortcuts = if (width >= 38) "Up/Down move  Enter switch  Esc cancel" else "Up/Down Enter Esc";
-        _ = try appendTreeText(out, allocator, shortcuts, width);
+        if (confirm_summary) {
+            _ = try appendTreeText(out, allocator, summary_confirmation, width);
+        } else {
+            const full = "Up/Down move  Enter switch  s summarize  Esc cancel";
+            const shortcuts = if (width >= full.len) full else if (width >= summary_confirmation.len) "Up/Down Enter s=summary Esc" else "Up/Down Enter Esc";
+            _ = try appendTreeText(out, allocator, shortcuts, width);
+        }
     }
 }
 
