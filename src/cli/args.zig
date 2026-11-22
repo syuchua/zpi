@@ -40,6 +40,7 @@ pub const Options = struct {
     trust_project_prompts: bool = false,
     no_proxy: bool = false,
     no_tools: bool = false,
+    allow_loopback_web_fetch: bool = false,
     print_version: bool = false,
     print_help: bool = false,
 };
@@ -97,6 +98,10 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
         }
         if (!positional_only and std.mem.eql(u8, arg, "--no-proxy")) {
             result.no_proxy = true;
+            continue;
+        }
+        if (!positional_only and std.mem.eql(u8, arg, "--allow-loopback-web-fetch")) {
+            result.allow_loopback_web_fetch = true;
             continue;
         }
         if (!positional_only and (std.mem.eql(u8, arg, "--no-tools") or std.mem.eql(u8, arg, "-nt"))) {

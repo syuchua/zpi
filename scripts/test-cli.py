@@ -49,6 +49,22 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if self.path == '/web-fetch-doc':
+            body = (b'<html><head><title>Native Fetch Doc</title></head>'
+                    b'<body><script>evil()</script><h1>Heading One</h1>'
+                    b'<p>Alpha beta target_phrase gamma.</p></body></html>')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == '/web-fetch-redir':
+            self.send_response(302)
+            self.send_header('Location', '/web-fetch-doc')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         self.server.failures.append(f'Unexpected provider GET: {self.path}')
         self.send_error(405)
 
@@ -104,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == '/settings-switch/v1/chat/completions':
                 tools = {t['function']['name'] for t in request.get('tools', [])}
-                assert tools == {'read', 'edit', 'write', 'grep'}, tools
+                assert tools == {'read', 'edit', 'write', 'grep', 'web_fetch', 'get_content'}, tools
                 user = [m['content'] for m in request['messages'] if m['role'] == 'user'][-1]
                 if user == 'settings-check':
                     assert request.get('reasoning_effort') == 'medium', request
@@ -685,6 +701,34 @@ class Handler(BaseHTTPRequestHandler):
                     assert completed[3]['content'] == 'Tool blocked by extension: fixture denied'
                     assert 'Wrote' in completed[4]['content']
                     response = self.text('extension complete')
+            elif user == 'web-fetch-ssrf':
+                results = [m for m in messages if m['role'] == 'tool']
+                if not results:
+                    url = f'http://127.0.0.1:{self.server.server_port}/web-fetch-doc'
+                    response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'wf-ssrf', 'type': 'function',
+                        'function': {'name': 'web_fetch', 'arguments': json.dumps({'url': url})},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+                else:
+                    assert 'SsrfBlocked' in results[-1]['content'], results
+                    response = self.text('ssrf blocked ok')
+            elif user == 'web-fetch-loopback':
+                results = [m for m in messages if m['role'] == 'tool']
+                if not results:
+                    url = f'http://127.0.0.1:{self.server.server_port}/web-fetch-redir'
+                    response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'wf-get', 'type': 'function',
+                        'function': {'name': 'web_fetch', 'arguments': json.dumps({'url': url})},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+                elif len(results) == 1:
+                    assert 'Native Fetch Doc' in results[0]['content'] and 'evil()' not in results[0]['content'], results[0]
+                    response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'wf-search', 'type': 'function',
+                        'function': {'name': 'get_content', 'arguments': json.dumps({'responseId': 'wf_1', 'findText': 'TARGET_PHRASE'})},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+                else:
+                    assert 'target_phrase' in results[-1]['content'], results[-1]
+                    response = self.text('web fetch loopback ok')
             elif user == 'native-workflow':
                 assert any(t['function']['name'] == 'echo_native' for t in request['tools'])
                 results = [m for m in messages if m['role'] == 'tool']
@@ -3348,12 +3392,12 @@ for line in sys.stdin:
                                         input='', text=True, capture_output=True, env=environment, timeout=20)
                 assert result.returncode != 0 and expected in result.stderr, result.stderr
                 assert not rejected_path.exists()
-            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls'}
+            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'get_content'}
             for index, (flags, expected) in enumerate([
                 (['--tools', 'read,ls'], {'read', 'ls'}),
                 (['-t', 'r*,*sh', '-xt', '*sh'], {'read'}),
-                (['--tools=+write,-write,-bash'], {'read', 'edit'}),
-                ([], {'read', 'write', 'edit', 'bash'}),
+                (['--tools=+write,-write,-bash,-web_fetch,-get_content'], {'read', 'edit'}),
+                ([], {'read', 'write', 'edit', 'bash', 'web_fetch', 'get_content'}),
                 (['-nt', '-t', '+read,+ls', '--exclude-tools=ls'], {'read'}),
                 (['-nbt'], set()), (['--tools', ''], set()),
                 (['--tools', 'unknown'], set()),
@@ -3363,6 +3407,12 @@ for line in sys.stdin:
                 selected_run = run_repo_cli(common + flags + ['-p', prompt_name], input='', text=True,
                                               capture_output=True, env=environment, timeout=20)
                 assert selected_run.returncode == 0 and selected_run.stdout == 'selection complete\n', selected_run.stderr
+            wf_ssrf = run_repo_cli(common[:-2] + ['--no-session', '-p', 'web-fetch-ssrf'], input='', text=True,
+                                   capture_output=True, env=environment, timeout=20)
+            assert wf_ssrf.returncode == 0 and wf_ssrf.stdout == 'ssrf blocked ok\n', (wf_ssrf.stderr, server.failures)
+            wf_loop = run_repo_cli(common[:-2] + ['--no-session', '--allow-loopback-web-fetch', '-p', 'web-fetch-loopback'], input='', text=True,
+                                   capture_output=True, env=environment, timeout=20)
+            assert wf_loop.returncode == 0 and wf_loop.stdout == 'web fetch loopback ok\n', (wf_loop.stderr, server.failures)
             disabled_session = root / 'disabled.jsonl'
             disabled_args = common.copy()
             disabled_args[-1] = str(disabled_session)

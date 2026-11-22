@@ -62,11 +62,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const web_fetch = b.addModule("web_fetch", .{
+        .root_source_file = b.path("src/web_fetch.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "model", .module = model } },
+    });
     const tools = b.addModule("tools", .{
         .root_source_file = b.path("src/tools.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "replacements", .module = replacements }, .{ .name = "search", .module = search } },
+        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "replacements", .module = replacements }, .{ .name = "search", .module = search }, .{ .name = "web_fetch", .module = web_fetch } },
     });
     const openai = b.addModule("openai", .{
         .root_source_file = b.path("src/openai.zig"),
@@ -258,6 +264,7 @@ pub fn build(b: *std.Build) void {
     const mcp_tool_tests = b.addTest(.{ .name = "mcp-tool-tests", .root_module = mcp_tools });
     const replacement_tests = b.addTest(.{ .name = "replacement-tests", .root_module = replacements });
     const search_tests = b.addTest(.{ .name = "search-tests", .root_module = search });
+    const web_fetch_tests = b.addTest(.{ .name = "web-fetch-tests", .root_module = web_fetch });
     const session_tests = b.addTest(.{
         .name = "session-tests",
         .root_module = b.createModule(.{
@@ -442,6 +449,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(session_tests).step);
     test_step.dependOn(&b.addRunArtifact(replacement_tests).step);
     test_step.dependOn(&b.addRunArtifact(search_tests).step);
+    test_step.dependOn(&b.addRunArtifact(web_fetch_tests).step);
 
     // Compile/install target tests without executing them on the build host.
     test_binaries.dependOn(&b.addInstallArtifact(native_tests, .{}).step);
@@ -473,4 +481,5 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(session_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(replacement_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(search_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(web_fetch_tests, .{}).step);
 }

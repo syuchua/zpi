@@ -58,6 +58,7 @@ pub const Options = struct {
     exclude_tools: ?[]const u8 = null,
     no_builtin_tools: bool = false,
     no_tools: bool = false,
+    allow_loopback_web_fetch: bool = false,
     cancel_token: ?zpi.model.Cancel = null,
 };
 
@@ -416,10 +417,13 @@ pub const Harness = struct {
             .trust_project = options.trust_project_prompts,
         });
 
-        self.tool_set = try zpi.tools.ToolSet.initWithTempDir(gpa, environ.get("TMPDIR") orelse "/tmp");
+        self.tool_set = try zpi.tools.ToolSet.initWithOptions(gpa, .{
+            .temp_dir = environ.get("TMPDIR") orelse "/tmp",
+            .allow_loopback_web_fetch = options.allow_loopback_web_fetch,
+        });
         errdefer self.tool_set.deinit();
 
-        var registered_tools: []const agent.Tool = &self.tool_set.tools;
+        var registered_tools: []const agent.Tool = self.tool_set.tools;
         self.native_modules = try a.alloc(zpi.native_runtime.Module, options.native_plugins.len);
         errdefer for (self.native_modules[0..self.native_loaded]) |*module| {
             module.close() catch {};

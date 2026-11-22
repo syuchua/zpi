@@ -187,6 +187,7 @@ fn run(init: std.process.Init) !void {
         .exclude_tools = options.exclude_tools,
         .no_builtin_tools = options.no_builtin_tools,
         .no_tools = options.no_tools,
+        .allow_loopback_web_fetch = options.allow_loopback_web_fetch,
         .cancel_token = cancel_token,
     }, .{ .context = &adapter, .emit = CliAdapter.emit });
     defer {

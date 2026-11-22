@@ -4,35 +4,56 @@ const std = @import("std");
 const agent = @import("agent");
 const replacements = @import("replacements");
 const search = @import("search");
+const web_fetch = @import("web_fetch");
+
+pub const Options = struct {
+    temp_dir: []const u8 = "/tmp",
+    allow_loopback_web_fetch: bool = false,
+};
 
 pub const ToolSet = struct {
     arena: std.heap.ArenaAllocator,
-    tools: [7]agent.Tool,
+    tools: []agent.Tool,
     temp_dir: []const u8,
+    web_fetch_store: *web_fetch.Store,
 
     pub fn init(allocator: std.mem.Allocator) !ToolSet {
-        return initWithTempDir(allocator, "/tmp");
+        return initWithOptions(allocator, .{});
     }
 
     pub fn initWithTempDir(allocator: std.mem.Allocator, temp_dir: []const u8) !ToolSet {
+        return initWithOptions(allocator, .{ .temp_dir = temp_dir });
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, opts: Options) !ToolSet {
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         const a = arena.allocator();
-        const owned_temp = try a.dupe(u8, if (temp_dir.len > 0) temp_dir else "/tmp");
+        const owned_temp = try a.dupe(u8, if (opts.temp_dir.len > 0) opts.temp_dir else "/tmp");
         const bash_ctx: *BashContext = try a.create(BashContext);
         bash_ctx.* = .{ .temp_dir = owned_temp };
-        const definitions = [7]agent.Tool{
-            try definition(a, "read", "Read a text file. Output is truncated to 2000 lines or 50 KiB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Maximum number of lines to read\"}},\"required\":[\"path\"],\"additionalProperties\":false}", null, read),
-            try definition(a, "write", "Create or overwrite a text file, creating parent directories.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}", null, write),
-            try definition(a, "edit", "Make precise unique exact replacements. All edits match the original file; overlapping edits, duplicates and no-ops are rejected.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"oldText\",\"newText\"],\"additionalProperties\":false},\"minItems\":1,\"maxItems\":1024}},\"required\":[\"path\"],\"additionalProperties\":false}", null, edit),
-            try definition(a, "bash", "Execute a shell command in the project directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optional timeout in seconds (default 60, maximum 3600).", "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":3600}},\"required\":[\"command\"],\"additionalProperties\":false}", bash_ctx, bash),
-            try definition(a, "grep", "Search with installed ripgrep, respecting gitignore. Returns paths and line numbers; bounded to 50 KiB and an optional match limit.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"ignoreCase\":{\"type\":\"boolean\"},\"literal\":{\"type\":\"boolean\"},\"context\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, grep),
-            try definition(a, "find", "Find paths with installed fd/fdfind using glob patterns and gitignore rules. Results are relative to the search directory.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, find),
-            try definition(a, "ls", "List directory entries including dotfiles, sorted by ASCII case-insensitive name; directory names end with a slash.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"additionalProperties\":false}", null, ls),
-        };
-        return .{ .arena = arena, .tools = definitions, .temp_dir = owned_temp };
+
+        const wf_store = try allocator.create(web_fetch.Store);
+        errdefer allocator.destroy(wf_store);
+        wf_store.* = web_fetch.Store.init(allocator, opts.allow_loopback_web_fetch);
+        errdefer wf_store.deinit();
+
+        const definitions = try a.alloc(agent.Tool, 9);
+        definitions[0] = try definition(a, "read", "Read a text file. Output is truncated to 2000 lines or 50 KiB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Maximum number of lines to read\"}},\"required\":[\"path\"],\"additionalProperties\":false}", null, read);
+        definitions[1] = try definition(a, "write", "Create or overwrite a text file, creating parent directories.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}", null, write);
+        definitions[2] = try definition(a, "edit", "Make precise unique exact replacements. All edits match the original file; overlapping edits, duplicates and no-ops are rejected.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"oldText\",\"newText\"],\"additionalProperties\":false},\"minItems\":1,\"maxItems\":1024}},\"required\":[\"path\"],\"additionalProperties\":false}", null, edit);
+        definitions[3] = try definition(a, "bash", "Execute a shell command in the project directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optional timeout in seconds (default 60, maximum 3600).", "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":3600}},\"required\":[\"command\"],\"additionalProperties\":false}", bash_ctx, bash);
+        definitions[4] = try definition(a, "grep", "Search with installed ripgrep, respecting gitignore. Returns paths and line numbers; bounded to 50 KiB and an optional match limit.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"ignoreCase\":{\"type\":\"boolean\"},\"literal\":{\"type\":\"boolean\"},\"context\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, grep);
+        definitions[5] = try definition(a, "find", "Find paths with installed fd/fdfind using glob patterns and gitignore rules. Results are relative to the search directory.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, find);
+        definitions[6] = try definition(a, "ls", "List directory entries including dotfiles, sorted by ASCII case-insensitive name; directory names end with a slash.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"additionalProperties\":false}", null, ls);
+        definitions[7] = try definition(a, "web_fetch", "Fetch public HTTP(S) web pages with SSRF protection, returning readable text/markdown or raw content plus a cached responseId for pagination via get_content.", "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Public http(s) URL to fetch\"},\"urls\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"maxItems\":10},\"mode\":{\"type\":\"string\",\"enum\":[\"readable\",\"raw\"]},\"redirects\":{\"type\":\"string\",\"enum\":[\"follow\",\"same-origin\"]},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":120}},\"additionalProperties\":false}", wf_store, web_fetch.executeWebFetch);
+        definitions[8] = try definition(a, "get_content", "Page through or search stored content returned by web_fetch using responseId.", "{\"type\":\"object\",\"properties\":{\"responseId\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"urlIndex\":{\"type\":\"integer\",\"minimum\":0},\"offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":50000},\"findText\":{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"maxItems\":10}]},\"findMode\":{\"type\":\"string\",\"enum\":[\"exact\",\"case-insensitive\"]}},\"required\":[\"responseId\"],\"additionalProperties\":false}", wf_store, web_fetch.executeGetContent);
+        return .{ .arena = arena, .tools = definitions, .temp_dir = owned_temp, .web_fetch_store = wf_store };
     }
     pub fn deinit(self: *ToolSet) void {
+        const alloc = self.arena.child_allocator;
+        self.web_fetch_store.deinit();
+        alloc.destroy(self.web_fetch_store);
         self.arena.deinit();
     }
 };
