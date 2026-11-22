@@ -78,6 +78,21 @@ pub const ModelSource = struct {
     deinit: *const fn (*anyopaque) void,
 };
 
+pub const SessionItem = struct {
+    path: []const u8,
+    label: []const u8,
+    preview: []const u8,
+    is_active: bool = false,
+};
+
+pub const SessionSource = struct {
+    context: *anyopaque,
+    len: usize,
+    active: ?usize,
+    item: *const fn (*anyopaque, usize) SessionItem,
+    deinit: *const fn (*anyopaque) void,
+};
+
 const TreeSelection = struct {
     id: []const u8,
     summarize: bool = false,
@@ -103,6 +118,8 @@ pub const Submit = struct {
     model_source: ?*const fn (*anyopaque) anyerror!?ModelSource = null,
     set_thinking: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     cycle_thinking: ?*const fn (*anyopaque) void = null,
+    resume_session: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    session_source: ?*const fn (*anyopaque) anyerror!?SessionSource = null,
     status_info: ?*const fn (*anyopaque) components.chrome.FooterInfo = null,
     toggle_expand: ?*const fn (*anyopaque) bool = null,
     color_mode: ?theme.ColorMode = null,
@@ -327,6 +344,44 @@ pub fn run(io: std.Io, submit: Submit) !void {
             if (submit.session_info) |show| try show(submit.context);
             continue;
         }
+        if (std.mem.eql(u8, text, "/resume") or std.mem.startsWith(u8, text, "/resume ")) {
+            const raw_arg = if (text.len > "/resume".len) std.mem.trim(u8, text["/resume".len..], " \t") else "";
+            if (submit.resume_session) |run_resume| {
+                var path_arg: ?[]u8 = null;
+                defer if (path_arg) |a| submit.allocator.free(a);
+                const arg = if (std.mem.eql(u8, raw_arg, "--list"))
+                    ""
+                else if (raw_arg.len == 0 and color and submit.session_source != null) blk: {
+                    try eraseSubmittedPromptLine(io, output);
+                    var src = (submit.session_source.?(submit.context) catch |err| {
+                        var msg: [256]u8 = undefined;
+                        const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
+                        try std.Io.File.stderr().writeStreamingAll(io, line);
+                        continue;
+                    }) orelse break :blk "";
+                    defer src.deinit(src.context);
+                    const picked = selectSession(submit.allocator, io, input.handle, output, &queue, submit.cancel, src, th) catch |err| switch (err) {
+                        error.Canceled => {
+                            queue.start = queue.end;
+                            continue;
+                        },
+                        else => return err,
+                    };
+                    if (queue.eof) return;
+                    const chosen_path = picked orelse continue;
+                    path_arg = try submit.allocator.dupe(u8, chosen_path);
+                    break :blk path_arg.?;
+                } else raw_arg;
+                run_resume(submit.context, arg) catch |err| {
+                    var msg: [256]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
+                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                };
+            } else {
+                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /resume unavailable\n");
+            }
+            continue;
+        }
         if (color and submit.set_live_writer != null) {
             try runTurnWithLiveEditor(io, input.handle, output, &queue, &history, submit, text, &followups, &carried_draft, use_sgr, th);
         } else {
@@ -452,6 +507,58 @@ fn selectModel(
     );
     const chosen = picked orelse return null;
     return chosen.item.id;
+}
+
+fn selectSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input_fd: std.posix.fd_t,
+    output: std.Io.File,
+    queue: *InputQueue,
+    cancel: ?agent.model.Cancel,
+    source: SessionSource,
+    th: theme.Theme,
+) !?[]const u8 {
+    if (source.len == 0) {
+        try output.writeStreamingAll(io, "No matching sessions found.\n");
+        return null;
+    }
+    const Adapter = struct {
+        src: SessionSource,
+        fn item(ctx: *const anyopaque, idx: usize) components.select_list.Item {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            const si = self.src.item(self.src.context, idx);
+            return .{
+                .id = si.label,
+                .preview = si.preview,
+                .search_text = si.preview,
+                .is_active = si.is_active,
+                .full_text = si.path,
+            };
+        }
+    };
+    const adapter = Adapter{ .src = source };
+    const picked = try components.select_list.run(
+        allocator,
+        io,
+        input_fd,
+        output,
+        queue,
+        cancel,
+        .{ .context = &adapter, .len = source.len, .active = source.active, .item = Adapter.item },
+        .{
+            .title = "Sessions",
+            .title_hint = "  type to filter",
+            .mode = .direct_filter,
+            .footer_full = "Type to filter  Up/Down move  Enter resume  Esc cancel",
+            .footer_medium = "Filter Up/Down Enter Esc",
+            .footer_narrow = "Up/Down Enter Esc",
+            .max_visible = 16,
+        },
+        th,
+    );
+    const chosen = picked orelse return null;
+    return chosen.item.full_text;
 }
 
 const summary_confirmation = "Send departed branch to provider? y/n";
@@ -716,7 +823,7 @@ const EditorState = struct {
     }
 };
 
-const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
+const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/resume", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
 fn handleTab(editor: *EditorState, io: std.Io, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
     // Identify token immediately before cursor (bounded by whitespace).

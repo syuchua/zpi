@@ -18,6 +18,8 @@ pub const Settings = settings_mod.Settings;
 pub const Selection = config.Selection;
 pub const Skill = skills.Skill;
 pub const Template = prompt_templates.Template;
+pub const SessionCandidate = recent_session.SessionCandidate;
+pub const freeSessionList = recent_session.freeList;
 
 pub const McpServer = struct {
     name: []const u8,
@@ -185,6 +187,9 @@ pub const Harness = struct {
     arena: std.heap.ArenaAllocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
+    host_cwd: []const u8,
+    home: ?[]const u8,
+    session_dir_override: ?[]const u8,
     cwd: []const u8,
     settings: Settings,
     selection: Selection,
@@ -228,6 +233,9 @@ pub const Harness = struct {
             .arena = .init(gpa),
             .io = io,
             .environ = environ,
+            .host_cwd = "",
+            .home = null,
+            .session_dir_override = null,
             .cwd = "",
             .settings = .{},
             .selection = .{},
@@ -260,7 +268,10 @@ pub const Harness = struct {
         const a = self.arena.allocator();
 
         const host_cwd = try a.dupe(u8, options.host_cwd);
-        const home = environ.get("HOME");
+        const home = if (environ.get("HOME")) |h| try a.dupe(u8, h) else null;
+        self.host_cwd = host_cwd;
+        self.home = home;
+        self.session_dir_override = if (options.session_dir) |p| try a.dupe(u8, p) else null;
         const replacement = if (options.system_prompt) |input|
             try system_prompt.resolve(a, io, host_cwd, home, input)
         else
@@ -624,6 +635,73 @@ pub const Harness = struct {
         self.explicit_thinking = true;
         self.syncClients();
         return self.thinking_level;
+    }
+
+    pub fn listSessions(self: *const Harness, allocator: std.mem.Allocator) ![]recent_session.SessionCandidate {
+        const env_session_dir = self.environ.get("PI_CODING_AGENT_SESSION_DIR");
+        const fallback_session_dir = if (env_session_dir != null and env_session_dir.?.len > 0) env_session_dir else self.settings.session_dir;
+        const directory = recent_session.resolveDirectory(
+            allocator,
+            self.host_cwd,
+            self.home,
+            self.session_dir_override,
+            fallback_session_dir,
+        ) catch |err| switch (err) {
+            error.MissingHome => return try allocator.alloc(recent_session.SessionCandidate, 0),
+            else => return err,
+        };
+        defer allocator.free(directory);
+        return try recent_session.list(allocator, self.io, directory, self.cwd, 50);
+    }
+
+    pub fn resumeSession(self: *Harness, path_input: []const u8) !StatusSummary {
+        if (self.runtime.running) return error.AgentBusy;
+        if (path_input.len == 0 or std.mem.indexOfScalar(u8, path_input, 0) != null or !std.unicode.utf8ValidateSlice(path_input)) {
+            return error.InvalidSessionPath;
+        }
+        const resolved = blk: {
+            if (std.mem.eql(u8, path_input, "~") or std.mem.startsWith(u8, path_input, "~/")) {
+                const home_path = self.home orelse return error.MissingHome;
+                const expanded = if (path_input.len == 1)
+                    try self.gpa.dupe(u8, home_path)
+                else
+                    try std.fs.path.join(self.gpa, &.{ home_path, path_input[2..] });
+                defer self.gpa.free(expanded);
+                break :blk try std.fs.path.resolveAlloc(self.gpa, &.{ self.host_cwd, expanded });
+            }
+            break :blk try std.fs.path.resolveAlloc(self.gpa, &.{ self.host_cwd, path_input });
+        };
+        defer self.gpa.free(resolved);
+
+        if (self.store.file_path) |active_path| {
+            if (std.mem.eql(u8, active_path, resolved)) return self.statusSummary();
+        }
+
+        var next_store = try zpi.session.Store.open(self.gpa, self.io, resolved);
+        errdefer next_store.deinit();
+
+        const projected = try next_store.projectedActivePath(self.gpa);
+        defer self.gpa.free(projected);
+
+        var staged = agent.Agent.init(self.gpa, self.io, self.provider, self.enabled_tools, self.runtime.cwd);
+        errdefer staged.deinit();
+        staged.cancel = self.runtime.cancel;
+        staged.retry = self.runtime.retry;
+        staged.compaction_hook = self.runtime.compaction_hook;
+
+        for (projected) |entry| try staged.append(entry.message);
+        if (staged.messages.items.len == 0) {
+            try staged.append(.{ .role = .system, .content = &.{.{ .text = system_prompt.default_prompt }} });
+            _ = try next_store.appendMessage(staged.messages.items[0]);
+        }
+        try self.attachSkills(&staged);
+
+        self.store.deinit();
+        self.store = next_store;
+        self.runtime.deinit();
+        self.runtime = staged;
+        try self.runtime.reconcile(.{ .context = self, .emit = agentEmitErased });
+        return self.statusSummary();
     }
 
     pub fn compact(self: *Harness, focus: []const u8) !bool {
@@ -1131,4 +1209,64 @@ test "harness runs prompt against loopback HTTP server without TTY and tracks st
     try std.testing.expectEqualStrings("anthropic", after_switch.provider);
     try std.testing.expectEqualStrings("claude-sonnet-4-5", after_switch.model);
     try std.testing.expectEqual(zpi.model.ThinkingLevel.medium, after_switch.thinking_level);
+}
+
+test "harness lists and resumes sessions in session_dir without mutating state on error" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const host = try std.process.currentPathAlloc(io, a);
+    defer a.free(host);
+    const dir = try std.fs.path.resolveAlloc(a, &.{ host, ".zig-cache", "tmp", &tmp.sub_path });
+    defer a.free(dir);
+
+    const s1_path = try std.fs.path.join(a, &.{ dir, "s1.jsonl" });
+    defer a.free(s1_path);
+    const s2_path = try std.fs.path.join(a, &.{ dir, "s2.jsonl" });
+    defer a.free(s2_path);
+
+    {
+        var s1 = try zpi.session.Store.create(a, io, s1_path, dir);
+        defer s1.deinit();
+        _ = try s1.appendMessage(.{ .role = .system, .content = &.{.{ .text = "sys" }} });
+        _ = try s1.appendMessage(.{ .role = .user, .content = &.{.{ .text = "session one prompt" }} });
+        _ = try s1.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "session one answer" }} });
+    }
+    {
+        var s2 = try zpi.session.Store.create(a, io, s2_path, dir);
+        defer s2.deinit();
+        _ = try s2.appendMessage(.{ .role = .system, .content = &.{.{ .text = "sys" }} });
+        _ = try s2.appendMessage(.{ .role = .user, .content = &.{.{ .text = "session two prompt" }} });
+    }
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const h = try Harness.create(a, io, &env, .{
+        .host_cwd = dir,
+        .session = s1_path,
+        .session_dir = dir,
+        .no_tools = true,
+        .no_skills = true,
+        .no_prompt_templates = true,
+    }, null);
+    defer h.deinit();
+
+    const listed = try h.listSessions(a);
+    defer recent_session.freeList(a, listed);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+
+    // Resuming an already-active session succeeds without hitting self-lock.
+    _ = try h.resumeSession(s1_path);
+    try std.testing.expectEqual(@as(usize, 2), (try h.sessionStats()).total_messages);
+
+    // Resuming a missing session fails closed and preserves active s1 state.
+    try std.testing.expectError(error.FileNotFound, h.resumeSession("missing.jsonl"));
+    try std.testing.expectEqualStrings(s1_path, (try h.sessionStats()).file_path.?);
+
+    // Resuming s2 switches store and runtime cleanly.
+    _ = try h.resumeSession(s2_path);
+    const stats2 = try h.sessionStats();
+    try std.testing.expectEqualStrings(s2_path, stats2.file_path.?);
+    try std.testing.expectEqual(@as(usize, 1), stats2.total_messages);
 }

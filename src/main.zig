@@ -232,6 +232,8 @@ fn run(init: std.process.Init) !void {
                 .model_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.modelSourceErased,
                 .set_thinking = CliAdapter.setThinkingErased,
                 .cycle_thinking = CliAdapter.cycleThinkingErased,
+                .resume_session = CliAdapter.resumeErased,
+                .session_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.sessionSourceErased,
                 .status_info = CliAdapter.statusInfoErased,
                 .toggle_expand = CliAdapter.toggleExpandErased,
                 .color_mode = adapter.tui_theme.mode,
@@ -597,6 +599,104 @@ const CliAdapter = struct {
         );
         defer self.allocator.free(info);
         try writeSafe(self.io, .stdout(), info);
+    }
+
+    fn sessionSourceErased(context: *anyopaque) anyerror!?tui.SessionSource {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness.?;
+        const candidates = try h.listSessions(self.allocator);
+        errdefer harness.freeSessionList(self.allocator, candidates);
+
+        const State = struct {
+            allocator: std.mem.Allocator,
+            candidates: []harness.SessionCandidate,
+            items: []tui.SessionItem,
+            labels: [][]u8,
+            active: ?usize,
+            fn item(ctx: *anyopaque, idx: usize) tui.SessionItem {
+                const st: *@This() = @ptrCast(@alignCast(ctx));
+                return st.items[idx];
+            }
+            fn deinit(ctx: *anyopaque) void {
+                const st: *@This() = @ptrCast(@alignCast(ctx));
+                const alloc = st.allocator;
+                for (st.labels) |lbl| alloc.free(lbl);
+                alloc.free(st.labels);
+                alloc.free(st.items);
+                harness.freeSessionList(alloc, st.candidates);
+                alloc.destroy(st);
+            }
+        };
+
+        const items = try self.allocator.alloc(tui.SessionItem, candidates.len);
+        errdefer self.allocator.free(items);
+        const labels = try self.allocator.alloc([]u8, candidates.len);
+        errdefer self.allocator.free(labels);
+
+        var built_labels: usize = 0;
+        errdefer for (labels[0..built_labels]) |lbl| self.allocator.free(lbl);
+
+        const active_path = h.store.file_path;
+        var active: ?usize = null;
+        for (candidates, items, labels, 0..) |cand, *dst, *lbl, idx| {
+            const is_active = if (active_path) |ap| std.mem.eql(u8, ap, cand.path) else false;
+            if (is_active) active = idx;
+            lbl.* = try std.fmt.allocPrint(self.allocator, "{s} ({d} msgs)", .{ cand.basename, cand.message_count });
+            built_labels += 1;
+            dst.* = .{
+                .path = cand.path,
+                .label = lbl.*,
+                .preview = cand.preview,
+                .is_active = is_active,
+            };
+        }
+        const st = try self.allocator.create(State);
+        st.* = .{
+            .allocator = self.allocator,
+            .candidates = candidates,
+            .items = items,
+            .labels = labels,
+            .active = active,
+        };
+        return .{
+            .context = st,
+            .len = items.len,
+            .active = active,
+            .item = State.item,
+            .deinit = State.deinit,
+        };
+    }
+
+    fn resumeErased(context: *anyopaque, arg: []const u8) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness.?;
+        if (arg.len == 0) {
+            const candidates = try h.listSessions(self.allocator);
+            defer harness.freeSessionList(self.allocator, candidates);
+            if (candidates.len == 0) {
+                try std.Io.File.stdout().writeStreamingAll(self.io, "No matching sessions found.\n");
+                return;
+            }
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.allocator);
+            try out.appendSlice(self.allocator, "Sessions\n");
+            for (candidates) |cand| {
+                const is_active = if (h.store.file_path) |ap| std.mem.eql(u8, ap, cand.path) else false;
+                try out.print(self.allocator, "{s} {s} ({d} msgs)  {s}\n", .{
+                    if (is_active) "*" else " ",
+                    cand.basename,
+                    cand.message_count,
+                    cand.preview,
+                });
+            }
+            try writeSafe(self.io, .stdout(), out.items);
+            return;
+        }
+        _ = try h.resumeSession(arg);
+        self.resetLiveUsageAndRefresh();
+        const notice = try std.fmt.allocPrint(self.allocator, "[resumed: {s}]\n", .{std.fs.path.basename(arg)});
+        defer self.allocator.free(notice);
+        try writeSafe(self.io, .stdout(), notice);
     }
 
     fn emit(context: *anyopaque, event: harness.Event) anyerror!void {

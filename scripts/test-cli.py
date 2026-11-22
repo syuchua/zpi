@@ -2138,6 +2138,140 @@ def check_settings_and_model_switch(root, environment, server):
             process.wait(timeout=5)
 
 
+def check_resume_picker(root, environment):
+    resume_work = root / 'resume-work'
+    resume_work.mkdir()
+    sessions_dir = root / 'resume-sessions'
+    sessions_dir.mkdir()
+    alpha = sessions_dir / 'alpha-session.jsonl'
+    beta = sessions_dir / 'beta-session.jsonl'
+
+    def write_session(path, user_text, assistant_text):
+        records = [
+            {'type': 'session', 'version': 1, 'format': 'zpi', 'cwd': str(resume_work)},
+            {'type': 'message', 'id': '1', 'parent_id': None, 'version': 1,
+             'message': {'role': 'system', 'content': [{'text': 'sys'}]}},
+            {'type': 'message', 'id': '2', 'parent_id': '1', 'version': 1,
+             'message': {'role': 'user', 'content': [{'text': user_text}]}},
+            {'type': 'message', 'id': '3', 'parent_id': '2', 'version': 1,
+             'message': {'role': 'assistant', 'content': [{'text': assistant_text}]}},
+        ]
+        path.write_text(''.join(json.dumps(r) + '\n' for r in records))
+
+    write_session(alpha, 'first task alpha', 'alpha answer')
+    write_session(beta, 'second task beta', 'beta answer')
+    os.utime(alpha, (1000, 1000))
+    os.utime(beta, (2000, 2000))
+
+    env = dict(environment, TERM='xterm-256color', PI_CODING_AGENT_SESSION_DIR=str(sessions_dir))
+    env.pop('NO_COLOR', None)
+    args = [str(BINARY), '--no-proxy', '--cwd', str(resume_work), '--session', str(alpha)]
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
+    before = termios.tcgetattr(slave)
+    process = subprocess.Popen(args, cwd=resume_work, env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+    os.close(slave)
+    transcript = bytearray()
+
+    def expect(marker, start=0):
+        deadline = time.monotonic() + 10
+        while transcript.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('resume PTY timed out', marker, bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            chunk = os.read(master, 16384)
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+        return transcript.find(marker, start)
+
+    try:
+        expect(b'\x1b[?2004h')
+        s = len(transcript)
+        os.write(master, b'/resume --list\n')
+        expect(b'beta-session.jsonl', s)
+        expect(b'second task beta', s)
+        expect(b'alpha-session.jsonl', s)
+
+        # Interactive fuzzy SelectList /resume picker: filter to beta and select.
+        s2 = len(transcript)
+        os.write(master, b'/resume\n')
+        expect(b'Type to filter', s2)
+        os.write(master, b'beta')
+        filt_pos = expect(b'beta-session.jsonl', s2)
+        os.write(master, b'\r')
+        resumed_pos = expect(b'[resumed: beta-session.jsonl]', filt_pos)
+        assert b'\r\x1b[J' in transcript[filt_pos:resumed_pos], bytes(transcript[filt_pos:resumed_pos])
+
+        # /session reflects switched session file and counts.
+        s3 = len(transcript)
+        os.write(master, b'/session\n')
+        expect(str(beta).encode(), s3)
+        expect(b'Messages: 2 total (1 user, 1 assistant)', s3)
+
+        os.write(master, b'/exit\n')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+        after = termios.tcgetattr(master)
+        pendin = getattr(termios, 'PENDIN', 0)
+        assert (after[:3], after[3] & ~pendin, after[4:]) == (before[:3], before[3] & ~pendin, before[4:])
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    # TERM=dumb falls back to plain-text /resume listing without SelectList chrome.
+    dumb_env = dict(env, TERM='dumb')
+    m2, s2_fd = pty.openpty()
+    p2 = subprocess.Popen(args, cwd=resume_work, env=dumb_env, stdin=s2_fd, stdout=s2_fd, stderr=s2_fd, close_fds=True)
+    os.close(s2_fd)
+    t2 = bytearray()
+    try:
+        dl = time.monotonic() + 10
+        while b'> ' not in t2:
+            if select.select([m2], [], [], 0.2)[0]:
+                t2.extend(os.read(m2, 16384))
+            assert time.monotonic() < dl, bytes(t2)
+        os.write(m2, b'/resume\n')
+        while b'beta-session.jsonl' not in t2:
+            if select.select([m2], [], [], 0.2)[0]:
+                t2.extend(os.read(m2, 16384))
+            assert time.monotonic() < dl, bytes(t2)
+        assert b'Type to filter' not in t2, bytes(t2)
+        os.write(m2, b'/exit\n')
+        while True:
+            if not select.select([m2], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(m2, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            t2.extend(chunk)
+        assert p2.wait(timeout=5) == 0, bytes(t2)
+    finally:
+        os.close(m2)
+        if p2.poll() is None:
+            p2.kill()
+            p2.wait(timeout=5)
+
+
 def check_pi_import(root, resume_args, environment, server):
     project = root / 'pi-import-project'
     project.mkdir()
@@ -3474,6 +3608,7 @@ for line in sys.stdin:
             assert not (root / 'responses-uncommitted.txt').exists()
             check_https_proxy(root, environment, server)
             check_settings_and_model_switch(root, environment, server)
+            check_resume_picker(root, environment)
             check_tree_navigation(root, environment, server)
             check_queued_followup_editing(root, environment, server)
             check_tui_components(root, environment, server)
