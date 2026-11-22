@@ -341,6 +341,7 @@ const bash_max_bytes: usize = 50 * 1024;
 const bash_tail_keep_bytes: usize = 64 * 1024;
 const bash_tail_compact_threshold: usize = 128 * 1024;
 const bash_max_spill_bytes: usize = 32 * 1024 * 1024;
+const bash_stream_preview_cap: usize = 64 * 1024;
 
 const BashAccumulator = struct {
     allocator: std.mem.Allocator,
@@ -462,15 +463,54 @@ const BashAccumulator = struct {
 fn shellDrain(ctx: agent.ToolContext, temp_dir: []const u8, stdout: std.Io.File) anyerror!BashAccumulator {
     var acc = BashAccumulator{ .allocator = ctx.allocator, .io = ctx.io, .temp_dir = temp_dir };
     errdefer acc.deinitAndCleanupOnError();
-    var buf: [16 * 1024]u8 = undefined;
-    var reader = stdout.readerStreaming(ctx.io, &buf);
+    var stream_buf: std.ArrayList(u8) = .empty;
+    defer stream_buf.deinit(ctx.allocator);
+    var emitted_bytes: usize = 0;
     while (true) {
         var read_buf: [8192]u8 = undefined;
-        const n = reader.interface.readSliceShort(&read_buf) catch |err| switch (err) {
-            error.ReadFailed => return reader.err orelse error.ReadFailed,
+        const n = stdout.readStreaming(ctx.io, &.{&read_buf}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
         };
-        if (n == 0) break;
-        try acc.append(read_buf[0..n]);
+        if (n == 0) continue;
+        const chunk = read_buf[0..n];
+        try acc.append(chunk);
+        if (ctx.on_update) |emit| {
+            if (emitted_bytes < bash_stream_preview_cap) {
+                const remain = bash_stream_preview_cap - emitted_bytes;
+                const take = @min(chunk.len, remain);
+                try stream_buf.appendSlice(ctx.allocator, chunk[0..take]);
+                if (std.mem.lastIndexOfScalar(u8, stream_buf.items, '\n')) |last_nl| {
+                    const text = stream_buf.items[0..last_nl];
+                    if (text.len > 0) {
+                        try emit(ctx.update_context, .{ .text = text });
+                        emitted_bytes += text.len;
+                    }
+                    const tail_len = stream_buf.items.len - (last_nl + 1);
+                    if (tail_len > 0) {
+                        std.mem.copyForwards(u8, stream_buf.items[0..tail_len], stream_buf.items[last_nl + 1 ..]);
+                    }
+                    stream_buf.items.len = tail_len;
+                } else if (stream_buf.items.len >= 2048) {
+                    var cut = stream_buf.items.len;
+                    while (cut > 0 and (stream_buf.items[cut - 1] & 0xc0) == 0x80) : (cut -= 1) {}
+                    if (cut == 0) cut = stream_buf.items.len;
+                    try emit(ctx.update_context, .{ .text = stream_buf.items[0..cut] });
+                    emitted_bytes += cut;
+                    const tail_len = stream_buf.items.len - cut;
+                    if (tail_len > 0) {
+                        std.mem.copyForwards(u8, stream_buf.items[0..tail_len], stream_buf.items[cut..]);
+                    }
+                    stream_buf.items.len = tail_len;
+                }
+            }
+        }
+    }
+    if (ctx.on_update) |emit| {
+        if (stream_buf.items.len > 0 and emitted_bytes < bash_stream_preview_cap) {
+            const trimmed = std.mem.trimEnd(u8, stream_buf.items, "\n");
+            if (trimmed.len > 0) try emit(ctx.update_context, .{ .text = trimmed });
+        }
     }
     return acc;
 }

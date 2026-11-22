@@ -103,6 +103,7 @@ pub const Submit = struct {
     model_source: ?*const fn (*anyopaque) anyerror!?ModelSource = null,
     set_thinking: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     status_info: ?*const fn (*anyopaque) components.chrome.FooterInfo = null,
+    toggle_expand: ?*const fn (*anyopaque) bool = null,
     color_mode: ?theme.ColorMode = null,
     quiet_startup: bool = false,
 };
@@ -1002,6 +1003,12 @@ fn readPromptLine(
                 try editor.moveDownLineOrHistory(history);
                 dirty = true;
             },
+            0x0f => {
+                if (submit.toggle_expand) |toggle| {
+                    _ = toggle(submit.context);
+                    dirty = true;
+                }
+            },
             0x15 => {
                 editor.killToLineStart();
                 dirty = true;
@@ -1769,6 +1776,12 @@ fn runTurnWithLiveEditor(
             0x0e => {
                 try editor.moveDownLineOrHistory(history);
                 dirty = true;
+            },
+            0x0f => {
+                if (submit.toggle_expand) |toggle| {
+                    _ = toggle(submit.context);
+                    dirty = true;
+                }
             },
             0x15 => {
                 editor.killToLineStart();

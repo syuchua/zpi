@@ -286,3 +286,44 @@ test "bash truncates tail by lines and bytes and spills full output to temp file
     defer a.free(full_bytes);
     try std.testing.expectEqual(@as(usize, 54 * 1024), full_bytes.len);
 }
+
+test "bash streams incremental tool_update chunks via on_update" {
+    const a = std.testing.allocator;
+    var set = try tools_mod.ToolSet.init(a);
+    defer set.deinit();
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        chunks: std.ArrayList([]u8) = .empty,
+        fn emit(ctx_ptr: ?*anyopaque, res: agent.ToolResult) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            try self.chunks.append(self.allocator, try self.allocator.dupe(u8, res.text));
+        }
+        fn deinit(self: *@This()) void {
+            for (self.chunks.items) |c| self.allocator.free(c);
+            self.chunks.deinit(self.allocator);
+        }
+    };
+    var cap = Capture{ .allocator = a };
+    defer cap.deinit();
+
+    var ctx = fixture.context();
+    ctx.update_context = &cap;
+    ctx.on_update = Capture.emit;
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        "{\"command\":\"printf 'tick1\\\\n'; sleep 0.05; printf 'tick2\\\\n'\",\"timeout\":5}",
+        .{},
+    );
+    defer parsed.deinit();
+    const res = try set.tools[3].execute(set.tools[3].context, ctx, parsed.value);
+    try std.testing.expect(!res.is_error);
+    try std.testing.expect(cap.chunks.items.len >= 2);
+    const joined = try std.mem.join(a, "\n", cap.chunks.items);
+    defer a.free(joined);
+    try std.testing.expectEqualStrings("tick1\ntick2", joined);
+}

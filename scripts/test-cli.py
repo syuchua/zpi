@@ -350,7 +350,26 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == '/comp-fixture/chat/completions':
                 messages = request['messages']
+                user_msg = [m['content'] for m in messages if m['role'] == 'user'][-1]
                 results = [m for m in messages if m['role'] == 'tool']
+                if user_msg == 'stream-bash':
+                    bash_turns = sum(1 for m in messages if m['role'] == 'user' and m['content'] == 'stream-bash')
+                    bash_results = sum(1 for r in results if r.get('tool_call_id', '').startswith('comp-bash-'))
+                    if bash_results < bash_turns:
+                        cmd = "i=1; while [ $i -le 12 ]; do echo B$i; i=$((i+1)); done"
+                        c = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                            'index': 0, 'id': f'comp-bash-{bash_turns}', 'type': 'function',
+                            'function': {'name': 'bash', 'arguments': json.dumps({'command': cmd, 'timeout': 5})},
+                        }]}, 'finish_reason': 'tool_calls'}]}
+                        data = ('data: ' + json.dumps(c) + '\n\ndata: [DONE]\n\n').encode()
+                    else:
+                        data = ('data: ' + json.dumps(self.text('bash stream done')) + '\n\ndata: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if not results:
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/event-stream')
@@ -1826,13 +1845,14 @@ def check_tui_components(root, environment, server):
         expect(b'comp-fixture/comp-model (medium)')
         expect(b'% ctx')
 
-        # 2. Submit turn: Loader, ThinkingBlock, ToolCard + DiffView, MarkdownStyler, and updated Footer render.
+        # 2. Submit turn: Loader, ThinkingBlock, ToolCard (+ arg header) + DiffView, MarkdownStyler, and updated Footer render.
         start = len(transcript)
         os.write(master, b'update comp\n')
         expect(b'Thinking...', start)
         expect(b'checking file', start)
         expect(b'\xe2\x95\xad\xe2\x94\x80 ', start)
         expect(b'[tool: edit]', start)
+        expect(b'comp.txt', start)
         expect(b'-2 old', start)
         expect(b'+2 new', start)
         expect(b'\xe2\x95\xb0\xe2\x94\x80 ', start)
@@ -1844,7 +1864,40 @@ def check_tui_components(root, environment, server):
         assert b'\x1b[?1049h' not in transcript, 'alt-screen triggered'
         assert (comp_dir / 'comp.txt').read_text() == 'line1\nnew\nline3\n'
 
+        # 2b. Live bash tool_update streaming + Ctrl+O compact/expanded toggle.
+        start = len(transcript)
+        os.write(master, b'stream-bash\n')
+        expect(b'[tool: bash]', start)
+        expect(b'B1', start)
+        expect(b'Ctrl+O to expand', start)
+        done1 = expect(b'bash stream done', start)
+        expect(b'\x1b[?2004h', done1)
+
+        mark_o = len(transcript)
+        os.write(master, b'\x0f')
+        expect(b'expanded', mark_o)
+        start = len(transcript)
+        os.write(master, b'stream-bash\n')
+        expect(b'B12', start)
+        done2 = expect(b'bash stream done', start)
+        expect(b'\x1b[?2004h', done2)
+        assert b'Ctrl+O to expand' not in transcript[start:], transcript[start:]
+        os.write(master, b'\x0f')
+        time.sleep(0.08)
+
         os.write(master, b'/exit\n')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
         assert process.wait(timeout=5) == 0, bytes(transcript)
         term_after = termios.tcgetattr(master)
         term_after[3] &= ~getattr(termios, 'PENDIN', 0)

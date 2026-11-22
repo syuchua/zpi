@@ -20,6 +20,7 @@ pub const hotkeys_lines = [_][]const u8{
     "Enter       Submit prompt (or queue follow-up while busy)",
     "Ctrl-C      Cancel current turn or clear prompt",
     "Ctrl-D      Exit on empty line / delete char",
+    "Ctrl-O      Toggle compact/expanded thinking and tool output",
     "Up/Down     Navigate history or lines",
     "Left/Right  Move cursor (Ctrl-A/E home/end, Ctrl-W/U/K delete)",
     "Tab         Complete /command or @path",

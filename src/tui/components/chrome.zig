@@ -85,6 +85,7 @@ pub const FooterInfo = struct {
     context_tokens: u64 = 0,
     context_window: u32 = 0,
     queued_count: usize = 0,
+    expanded: bool = false,
 };
 
 pub const Footer = struct {
@@ -113,6 +114,9 @@ pub const Footer = struct {
         }
         if (info.queued_count > 0) {
             try raw.print(allocator, " · {d} queued", .{info.queued_count});
+        }
+        if (info.expanded) {
+            try raw.appendSlice(allocator, " · expanded");
         }
         if (info.cwd.len > 0) {
             try raw.appendSlice(allocator, " · ");
@@ -161,12 +165,14 @@ test "Loader and Footer clip to width and format model, thinking, context, and q
         .context_tokens = 25000,
         .context_window = 100000,
         .queued_count = 2,
-    }, 64);
+        .expanded = true,
+    }, 80);
     defer a.free(f_line);
     try std.testing.expect(std.mem.indexOf(u8, f_line, "openai/gpt-5 (high)") != null);
     try std.testing.expect(std.mem.indexOf(u8, f_line, "25% ctx") != null);
     try std.testing.expect(std.mem.indexOf(u8, f_line, "2 queued") != null);
-    try std.testing.expect(terminal.visibleWidth(f_line) <= 64);
+    try std.testing.expect(std.mem.indexOf(u8, f_line, "expanded") != null);
+    try std.testing.expect(terminal.visibleWidth(f_line) <= 80);
 
     const f_narrow = try Footer.renderLineAlloc(a, th, .{
         .provider = "openai",

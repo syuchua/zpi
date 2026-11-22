@@ -232,6 +232,7 @@ fn run(init: std.process.Init) !void {
                 .model_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.modelSourceErased,
                 .set_thinking = CliAdapter.setThinkingErased,
                 .status_info = CliAdapter.statusInfoErased,
+                .toggle_expand = CliAdapter.toggleExpandErased,
                 .color_mode = adapter.tui_theme.mode,
                 .quiet_startup = status.quiet_startup,
             });
@@ -252,6 +253,11 @@ const CliAdapter = struct {
     live_writer: if (build_options.enable_tui) ?tui.LiveWriter else ?void = null,
     tui_theme: if (build_options.enable_tui) tui.theme.Theme else void = if (build_options.enable_tui) .{} else {},
     in_thinking: bool = false,
+    live_thinking_bytes: usize = 0,
+    live_thinking_truncated: bool = false,
+    live_tool_lines: usize = 0,
+    live_tool_truncated: bool = false,
+    expanded_details: bool = false,
     status_mutex: std.Io.Mutex = .init,
     cached_tokens: u64 = 0,
     harness: ?*harness.Harness = null,
@@ -316,12 +322,27 @@ const CliAdapter = struct {
         self.cached_tokens = stats.context_tokens_estimate;
     }
 
+    fn isExpanded(self: *CliAdapter) bool {
+        self.status_mutex.lockUncancelable(self.io);
+        defer self.status_mutex.unlock(self.io);
+        return self.expanded_details;
+    }
+
+    fn toggleExpandErased(context: *anyopaque) bool {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        self.status_mutex.lockUncancelable(self.io);
+        defer self.status_mutex.unlock(self.io);
+        self.expanded_details = !self.expanded_details;
+        return self.expanded_details;
+    }
+
     fn statusInfoErased(context: *anyopaque) tui.components.chrome.FooterInfo {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         const h = self.harness orelse return .{};
         const status = h.statusSummary();
         self.status_mutex.lockUncancelable(self.io);
         const tokens = self.cached_tokens;
+        const expanded = self.expanded_details;
         self.status_mutex.unlock(self.io);
         return .{
             .provider = status.provider,
@@ -330,7 +351,25 @@ const CliAdapter = struct {
             .cwd = status.cwd,
             .context_tokens = tokens,
             .context_window = status.context_window,
+            .expanded = expanded,
         };
+    }
+
+    fn extractToolArgSummary(call: zpi.model.ToolCall) []const u8 {
+        if (call.arguments != .object) return "";
+        const obj = call.arguments.object;
+        const keys = if (std.mem.eql(u8, call.name, "bash"))
+            &[_][]const u8{"command"}
+        else if (std.mem.eql(u8, call.name, "grep") or std.mem.eql(u8, call.name, "find"))
+            &[_][]const u8{ "pattern", "path" }
+        else
+            &[_][]const u8{ "path", "command", "pattern", "query", "url", "name" };
+        for (keys) |key| {
+            if (obj.get(key)) |val| {
+                if (val == .string and val.string.len > 0) return val.string;
+            }
+        }
+        return "";
     }
 
     fn submit(self: *CliAdapter, prompt: []const u8) !void {
@@ -593,13 +632,38 @@ const CliAdapter = struct {
                                 }
                                 if (!self.in_thinking) {
                                     self.in_thinking = true;
+                                    self.live_thinking_bytes = 0;
+                                    self.live_thinking_truncated = false;
                                     const hdr = try tui.components.message.formatThinkingHeaderAlloc(self.allocator, self.tui_theme);
                                     defer self.allocator.free(hdr);
                                     try self.errSegment(hdr, "", "");
                                 }
-                                const chunk = try tui.components.message.formatThinkingDeltaAlloc(self.allocator, self.tui_theme, text);
-                                defer self.allocator.free(chunk);
-                                try self.errSegment(chunk, "", "");
+                                const expanded = self.isExpanded();
+                                const max_thinking_bytes: usize = if (expanded) 16 * 1024 else 240;
+                                if (self.live_thinking_bytes < max_thinking_bytes) {
+                                    const remain = max_thinking_bytes - self.live_thinking_bytes;
+                                    var take = @min(text.len, remain);
+                                    if (take < text.len) {
+                                        while (take > 0 and (text[take] & 0xc0) == 0x80) : (take -= 1) {}
+                                    }
+                                    if (take > 0) {
+                                        const chunk = try tui.components.message.formatThinkingDeltaAlloc(self.allocator, self.tui_theme, text[0..take]);
+                                        defer self.allocator.free(chunk);
+                                        try self.errSegment(chunk, "", "");
+                                        self.live_thinking_bytes += take;
+                                    }
+                                    if (take < text.len and !self.live_thinking_truncated) {
+                                        self.live_thinking_truncated = true;
+                                        const note = try tui.components.message.formatThinkingDeltaAlloc(self.allocator, self.tui_theme, " ... (Ctrl+O to expand)");
+                                        defer self.allocator.free(note);
+                                        try self.errSegment(note, "", "");
+                                    }
+                                } else if (!self.live_thinking_truncated) {
+                                    self.live_thinking_truncated = true;
+                                    const note = try tui.components.message.formatThinkingDeltaAlloc(self.allocator, self.tui_theme, " ... (Ctrl+O to expand)");
+                                    defer self.allocator.free(note);
+                                    try self.errSegment(note, "", "");
+                                }
                             } else {
                                 try self.errSegment(
                                     if (self.stderr_color) "\x1b[2m" else "",
@@ -619,11 +683,14 @@ const CliAdapter = struct {
                             try self.errSegment("\n", "", "");
                         }
                         if (comptime build_options.enable_tui) {
+                            self.live_tool_lines = 0;
+                            self.live_tool_truncated = false;
                             if (self.live_writer) |writer| {
                                 if (writer.set_phase) |set_phase| set_phase(writer.context, .tool, call.name);
                             }
                             const cols = tui.terminal.terminalColumns(self.io, .stdout());
-                            const header = try tui.components.tool_card.formatStartAlloc(self.allocator, self.tui_theme, call.name, cols);
+                            const arg_summary = extractToolArgSummary(call);
+                            const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
                             defer self.allocator.free(header);
                             try self.errSegment(header, "", "");
                         } else {
@@ -636,9 +703,29 @@ const CliAdapter = struct {
                         try self.json(.{ .type = "tool_execution_update", .id = update.call.id, .name = update.call.name, .result = update.result });
                     } else if (self.mode == .interactive) {
                         if (comptime build_options.enable_tui) {
-                            const line = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, update.result.text);
-                            defer self.allocator.free(line);
-                            try self.errSegment(line, "", "");
+                            const max_lines: usize = if (self.isExpanded()) 64 else 8;
+                            if (self.live_tool_lines < max_lines) {
+                                const block = try tui.components.tool_card.formatBodyBlockAlloc(
+                                    self.allocator,
+                                    self.tui_theme,
+                                    update.result.text,
+                                    max_lines - self.live_tool_lines,
+                                );
+                                defer self.allocator.free(block.text);
+                                if (block.text.len > 0) try self.errSegment(block.text, "", "");
+                                self.live_tool_lines += block.lines_written;
+                                if (block.truncated and !self.live_tool_truncated) {
+                                    self.live_tool_truncated = true;
+                                    const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (Ctrl+O to expand)");
+                                    defer self.allocator.free(note);
+                                    try self.errSegment(note, "", "");
+                                }
+                            } else if (!self.live_tool_truncated) {
+                                self.live_tool_truncated = true;
+                                const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (Ctrl+O to expand)");
+                                defer self.allocator.free(note);
+                                try self.errSegment(note, "", "");
+                            }
                         } else {
                             try self.errSegment("", update.result.text, "\n");
                         }
@@ -754,12 +841,14 @@ const CliAdapter = struct {
     }
 
     fn writeDiffPreview(self: *CliAdapter, diff: []const u8) !void {
+        const limit: usize = if (comptime build_options.enable_tui) (if (self.isExpanded()) 80 else 12) else 40;
         var lines = std.mem.splitScalar(u8, diff, '\n');
         var count: usize = 0;
         while (lines.next()) |line| {
-            if (count >= 40) {
+            if (count >= limit) {
                 if (comptime build_options.enable_tui) {
-                    const trunc = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (preview truncated)");
+                    const msg = if (self.isExpanded()) "... (preview truncated)" else "... (preview truncated, Ctrl+O to expand)";
+                    const trunc = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, msg);
                     defer self.allocator.free(trunc);
                     try self.errSegment(trunc, "", "");
                 } else {
