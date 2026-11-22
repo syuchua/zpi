@@ -1971,6 +1971,22 @@ def check_tui_components(root, environment, server):
         expect('─'.encode('utf-8') * 59, resize_mark)
         assert ('─'.encode('utf-8') * 60) not in transcript[resize_mark:], transcript[resize_mark:]
 
+        # 2d. Automatic / and @ autocomplete popup below editor + Down/Esc/Tab interaction.
+        slash_mark = len(transcript)
+        os.write(master, b'/')
+        expect(b'/help', slash_mark)
+        expect(b'/hotkeys', slash_mark)
+        down_mark = len(transcript)
+        os.write(master, b'\x1b[B')
+        expect(b'\xe2\x96\xb8 ', down_mark)  # ▸ highlight indicator
+        os.write(master, b'\x1b')  # Esc dismisses popup while keeping '/'
+        time.sleep(0.06)
+        os.write(master, b'\x15')  # Ctrl-U clears '/'
+        at_mark = len(transcript)
+        os.write(master, b'@c')
+        expect(b'@comp.txt', at_mark)
+        os.write(master, b'\t\x15')  # Tab accepts @comp.txt, Ctrl-U clears line
+
         os.write(master, b'/exit\n')
         while True:
             if not select.select([master], [], [], 5)[0]:
@@ -2317,6 +2333,9 @@ def check_resume_picker(root, environment):
                 t2.extend(os.read(m2, 16384))
             assert time.monotonic() < dl, bytes(t2)
         assert b'Type to filter' not in t2, bytes(t2)
+        os.write(m2, b'/h\x15')
+        time.sleep(0.05)
+        assert b'Show keyboard shortcuts' not in t2 and '─'.encode('utf-8') * 8 not in t2, bytes(t2)
         os.write(m2, b'/exit\n')
         while True:
             if not select.select([m2], [], [], 5)[0]:

@@ -14,6 +14,7 @@ pub const components = struct {
     pub const chrome = @import("tui/components/chrome.zig");
     pub const select_list = @import("tui/components/select_list.zig");
     pub const dialog = @import("tui/components/dialog.zig");
+    pub const autocomplete = @import("tui/components/autocomplete.zig");
 };
 
 const DialogKind = enum { help, hotkeys };
@@ -742,7 +743,7 @@ const EditorState = struct {
 
     fn renderWithFooter(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize, color: bool, footer_line: ?[]const u8) !void {
         const lines: []const []const u8 = if (footer_line) |fl| &.{fl} else &.{};
-        return self.renderWithOverlay(io, output, cols, color, theme.Theme.init(if (color) .ansi16 else .none), &.{}, lines, false);
+        return self.renderWithOverlay(io, output, cols, color, theme.Theme.init(if (color) .ansi16 else .none), &.{}, &.{}, lines, false);
     }
 
     fn appendRuleLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, th: theme.Theme, cols: usize) !usize {
@@ -762,6 +763,7 @@ const EditorState = struct {
         use_sgr: bool,
         th: theme.Theme,
         dialog_lines: []const []const u8,
+        popup_lines: []const []const u8,
         footer_lines: []const []const u8,
         show_rules: bool,
     ) !void {
@@ -799,7 +801,14 @@ const EditorState = struct {
             total_end_row += 1;
             total_end_col = rule_w;
         }
-        if (self.completion_hint) |hint| {
+        if (popup_lines.len > 0) {
+            for (popup_lines) |pl| {
+                try out.appendSlice(self.allocator, "\r\n");
+                try out.appendSlice(self.allocator, pl);
+                total_end_row += 1;
+                total_end_col = terminal.visibleWidth(pl);
+            }
+        } else if (self.completion_hint) |hint| {
             if (hint.len > 0) {
                 try out.appendSlice(self.allocator, "\r\n");
                 var styled_hint: std.ArrayList(u8) = .empty;
@@ -949,6 +958,34 @@ fn commonPrefixLen(items: []const []u8) usize {
     return len;
 }
 
+fn applyAutocomplete(
+    editor: *EditorState,
+    popup: *components.autocomplete.Popup,
+    io: std.Io,
+    submit: Submit,
+    cand: components.autocomplete.Candidate,
+) !void {
+    editor.resetCompletionTrack();
+    const start = @min(popup.token_start, editor.buf.items.len);
+    const end = @min(popup.token_end, editor.buf.items.len);
+    if (end < start) return;
+    const label = try editor.allocator.dupe(u8, cand.label);
+    defer editor.allocator.free(label);
+    const is_cmd = popup.kind == .command;
+    const is_dir = cand.is_dir;
+
+    try editor.buf.replaceRange(editor.allocator, start, end - start, label);
+    editor.cursor = start + label.len;
+    if (is_cmd and editor.cursor == editor.buf.items.len) {
+        try editor.insertSlice(" ");
+        popup.clear();
+    } else if (!is_cmd and is_dir) {
+        try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+    } else {
+        popup.clear();
+    }
+}
+
 fn readPromptLine(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -974,6 +1011,8 @@ fn readPromptLine(
 
     var editor = EditorState{ .allocator = allocator };
     defer editor.deinit();
+    var popup = components.autocomplete.Popup.init(allocator);
+    defer popup.deinit();
 
     const has_footer = th.mode != .none and submit.status_info != null;
     var dialog = initial_dialog;
@@ -991,6 +1030,24 @@ fn readPromptLine(
     while (true) {
         if ((dirty and !queue.hasBuffered()) or (dialog != null and !dialog_on_screen)) {
             cols = terminalColumns(io, output);
+            if (th.mode != .none and !in_paste) {
+                try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+            } else {
+                popup.clear();
+            }
+
+            const popup_lines: [][]u8 = if (popup.isOpen())
+                try popup.renderLinesAlloc(allocator, th, cols)
+            else
+                &.{};
+            defer {
+                for (popup_lines) |pl| allocator.free(pl);
+                if (popup_lines.len > 0) allocator.free(popup_lines);
+            }
+            const popup_slices = try allocator.alloc([]const u8, popup_lines.len);
+            defer allocator.free(popup_slices);
+            for (popup_lines, popup_slices) |pl, *s| s.* = pl;
+
             var footer_buf: ?[2][]u8 = null;
             if (has_footer) {
                 var info = submit.status_info.?(submit.context);
@@ -1018,15 +1075,16 @@ fn readPromptLine(
             defer allocator.free(dialog_slices);
             for (dialog_lines, dialog_slices) |dl, *s| s.* = dl;
 
-            try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, footer_slices, th.mode != .none);
+            try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, popup_slices, footer_slices, th.mode != .none);
             dialog_on_screen = dialog_slices.len > 0;
             dirty = false;
         }
         const b_opt = try queue.readByte(input_fd, submit.cancel);
         const b = b_opt orelse {
+            popup.clear();
             if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                 editor.resetCompletionTrack();
-                editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false) catch {};
+                editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false) catch {};
                 dialog_on_screen = false;
             }
             if (editor.buf.items.len == 0) {
@@ -1050,18 +1108,20 @@ fn readPromptLine(
 
         switch (b) {
             0x03 => {
+                popup.clear();
                 if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                     editor.resetCompletionTrack();
-                    editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false) catch {};
+                    editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false) catch {};
                     dialog_on_screen = false;
                 }
                 return error.Canceled;
             },
             0x04 => {
                 if (editor.buf.items.len == 0) {
+                    popup.clear();
                     if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                         editor.resetCompletionTrack();
-                        editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false) catch {};
+                        editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false) catch {};
                         dialog_on_screen = false;
                     }
                     try output.writeStreamingAll(io, "\n");
@@ -1076,6 +1136,16 @@ fn readPromptLine(
                     dirty = true;
                     continue;
                 }
+                if (th.mode != .none and dirty) {
+                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                }
+                if (popup.isOpen() and popup.user_navigated) {
+                    if (popup.selectedItem()) |cand| {
+                        try applyAutocomplete(&editor, &popup, io, submit, cand);
+                        dirty = true;
+                        continue;
+                    }
+                }
                 if (editor.cursor == editor.buf.items.len and editor.buf.items.len > 0 and editor.buf.items[editor.buf.items.len - 1] == '\\') {
                     editor.buf.items.len -= 1;
                     editor.cursor -= 1;
@@ -1083,11 +1153,12 @@ fn readPromptLine(
                     dirty = true;
                     continue;
                 }
-                const had_hint = editor.completion_hint != null;
+                const had_hint = editor.completion_hint != null or popup.isOpen();
+                popup.clear();
                 editor.resetCompletionTrack();
                 if (dirty or had_hint or has_footer or th.mode != .none) {
                     cols = terminalColumns(io, output);
-                    try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false);
+                    try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false);
                 }
                 try output.writeStreamingAll(io, "\n");
                 return try editor.buf.toOwnedSlice(allocator);
@@ -1113,11 +1184,25 @@ fn readPromptLine(
                 dirty = true;
             },
             0x10 => {
-                try editor.moveUpLineOrHistory(history);
+                if (th.mode != .none and !in_paste and dirty) {
+                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                }
+                if (popup.isOpen()) {
+                    popup.moveUp();
+                } else {
+                    try editor.moveUpLineOrHistory(history);
+                }
                 dirty = true;
             },
             0x0e => {
-                try editor.moveDownLineOrHistory(history);
+                if (th.mode != .none and !in_paste and dirty) {
+                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                }
+                if (popup.isOpen()) {
+                    popup.moveDown();
+                } else {
+                    try editor.moveDownLineOrHistory(history);
+                }
                 dirty = true;
             },
             0x0f => {
@@ -1141,7 +1226,36 @@ fn readPromptLine(
             '\t' => {
                 if (!in_paste) {
                     cols = terminalColumns(io, output);
-                    if (try handleTab(&editor, io, submit, cols, term_ansi, true)) dirty = true;
+                    if (th.mode == .none) {
+                        if (try handleTab(&editor, io, submit, cols, term_ansi, false)) dirty = true;
+                    } else {
+                        try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                        if (popup.items.items.len > 0) {
+                            popup.dismissed = false;
+                            if (popup.user_navigated or popup.items.items.len == 1) {
+                                if (popup.selectedItem()) |cand| {
+                                    try applyAutocomplete(&editor, &popup, io, submit, cand);
+                                    dirty = true;
+                                }
+                            } else {
+                                const lcp_len = popup.commonPrefixLen();
+                                const tok_len = popup.token_end - popup.token_start;
+                                if (lcp_len > tok_len) {
+                                    const start = @min(popup.token_start, editor.buf.items.len);
+                                    const end = @min(popup.token_end, editor.buf.items.len);
+                                    const lcp = try editor.allocator.dupe(u8, popup.items.items[0].label[0..lcp_len]);
+                                    defer editor.allocator.free(lcp);
+                                    try editor.buf.replaceRange(editor.allocator, start, end - start, lcp);
+                                    editor.cursor = start + lcp.len;
+                                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                                    dirty = true;
+                                } else {
+                                    popup.moveDown();
+                                    dirty = true;
+                                }
+                            }
+                        }
+                    }
                 } else {
                     try editor.insertSlice("\t");
                     dirty = true;
@@ -1149,7 +1263,13 @@ fn readPromptLine(
             },
             0x1b => {
                 const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse {
-                    if (editor.completion_hint != null) {
+                    if (th.mode != .none and !in_paste and dirty) {
+                        try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                    }
+                    if (popup.isOpen()) {
+                        popup.dismiss();
+                        dirty = true;
+                    } else if (editor.completion_hint != null) {
                         editor.resetCompletionTrack();
                         dirty = true;
                     }
@@ -1180,11 +1300,25 @@ fn readPromptLine(
                                 dirty = true;
                             },
                             'A' => {
-                                try editor.moveUpLineOrHistory(history);
+                                if (th.mode != .none and !in_paste and dirty) {
+                                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                                }
+                                if (popup.isOpen()) {
+                                    popup.moveUp();
+                                } else {
+                                    try editor.moveUpLineOrHistory(history);
+                                }
                                 dirty = true;
                             },
                             'B' => {
-                                try editor.moveDownLineOrHistory(history);
+                                if (th.mode != .none and !in_paste and dirty) {
+                                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                                }
+                                if (popup.isOpen()) {
+                                    popup.moveDown();
+                                } else {
+                                    try editor.moveDownLineOrHistory(history);
+                                }
                                 dirty = true;
                             },
                             'C' => {
@@ -1214,11 +1348,25 @@ fn readPromptLine(
                         const params = seq[0..slen];
                         if (final_byte) |fin| switch (fin) {
                             'A' => {
-                                try editor.moveUpLineOrHistory(history);
+                                if (th.mode != .none and !in_paste and dirty) {
+                                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                                }
+                                if (popup.isOpen()) {
+                                    popup.moveUp();
+                                } else {
+                                    try editor.moveUpLineOrHistory(history);
+                                }
                                 dirty = true;
                             },
                             'B' => {
-                                try editor.moveDownLineOrHistory(history);
+                                if (th.mode != .none and !in_paste and dirty) {
+                                    try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
+                                }
+                                if (popup.isOpen()) {
+                                    popup.moveDown();
+                                } else {
+                                    try editor.moveDownLineOrHistory(history);
+                                }
                                 dirty = true;
                             },
                             'C' => {
@@ -1317,6 +1465,7 @@ test {
     _ = components.chrome;
     _ = components.select_list;
     _ = components.dialog;
+    _ = components.autocomplete;
 }
 
 test "editor UTF-8 insertion cursor movement deletion and history navigation" {
