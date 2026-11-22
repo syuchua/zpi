@@ -7,6 +7,12 @@ const agent = @import("agent");
 pub const terminal = @import("tui/terminal.zig");
 pub const theme = @import("tui/theme.zig");
 pub const renderer = @import("tui/renderer.zig");
+pub const components = struct {
+    pub const markdown = @import("tui/components/markdown.zig");
+    pub const message = @import("tui/components/message.zig");
+    pub const tool_card = @import("tui/components/tool_card.zig");
+    pub const chrome = @import("tui/components/chrome.zig");
+};
 
 const InputQueue = terminal.InputQueue;
 const enterRawMode = terminal.enterRawMode;
@@ -29,6 +35,8 @@ const max_queued_followups: usize = 32;
 pub const LiveWriter = struct {
     context: *anyopaque,
     write_segment: *const fn (*anyopaque, []const u8, []const u8, []const u8) anyerror!void,
+    write_markdown: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    set_phase: ?*const fn (*anyopaque, components.chrome.Phase, []const u8) void = null,
 };
 
 pub const TreeItem = struct {
@@ -66,6 +74,8 @@ pub const Submit = struct {
     tree_source: ?*const fn (*anyopaque) TreeSource = null,
     switch_model: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     set_thinking: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    status_info: ?*const fn (*anyopaque) components.chrome.FooterInfo = null,
+    color_mode: ?theme.ColorMode = null,
     quiet_startup: bool = false,
 };
 
@@ -93,8 +103,10 @@ pub fn run(io: std.Io, submit: Submit) !void {
     const output = std.Io.File.stdout();
     if (!try input.isTty(io) or !try output.isTty(io)) return error.InteractiveTtyRequired;
     const color = try output.supportsAnsiEscapeCodes(io);
+    const th = theme.Theme.init(submit.color_mode orelse if (color) .ansi16 else .none);
+    const use_sgr = color and th.mode != .none;
     if (!submit.quiet_startup) {
-        try output.writeStreamingAll(io, if (color)
+        try output.writeStreamingAll(io, if (use_sgr)
             "\x1b[1;36mzpi\x1b[0m  /help · /hotkeys · /exit · Ctrl-D exits\n"
         else
             "zpi  /help · /hotkeys · /exit · Ctrl-D exits\n");
@@ -115,17 +127,18 @@ pub fn run(io: std.Io, submit: Submit) !void {
         if (submit.reset_cancel) |reset| reset(submit.context);
         const raw = if (followups.items.len > 0) blk: {
             const next = followups.orderedRemove(0);
-            try output.writeStreamingAll(io, if (color) "\x1b[36m>\x1b[0m " else "> ");
-            try writeText(io, output, next);
+            const echo = try components.message.formatUserEchoAlloc(submit.allocator, th, next);
+            defer submit.allocator.free(echo);
+            try output.writeStreamingAll(io, echo);
             try output.writeStreamingAll(io, "\n");
             break :blk next;
         } else blk: {
             const initial = carried_draft;
             carried_draft = null;
             defer if (initial) |draft| submit.allocator.free(draft);
-            const prompt_prefix = if (color) "\x1b[36m>\x1b[0m " else "> ";
+            const prompt_prefix = if (use_sgr) "\x1b[36m>\x1b[0m " else "> ";
             try output.writeStreamingAll(io, prompt_prefix);
-            break :blk readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, color, initial) catch |err| switch (err) {
+            break :blk readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, use_sgr, th, initial) catch |err| switch (err) {
                 error.Canceled => {
                     try output.writeStreamingAll(io, "\n");
                     continue;
@@ -229,7 +242,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
             continue;
         }
         if (color and submit.set_live_writer != null) {
-            try runTurnWithLiveEditor(io, input.handle, output, &queue, &history, submit, text, &followups, &carried_draft, color);
+            try runTurnWithLiveEditor(io, input.handle, output, &queue, &history, submit, text, &followups, &carried_draft, use_sgr, th);
         } else {
             submit.run(submit.context, text) catch |err| {
                 var msg: [256]u8 = undefined;
@@ -595,6 +608,10 @@ const EditorState = struct {
     }
 
     fn render(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize, color: bool) !void {
+        return self.renderWithFooter(io, output, cols, color, null);
+    }
+
+    fn renderWithFooter(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize, color: bool, footer_line: ?[]const u8) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
         if (self.rendered_cursor_row > 0) {
@@ -607,20 +624,41 @@ const EditorState = struct {
         const layout = computeLayout(self.buf.items, self.cursor, cols, 2);
         try appendSafeTerminalBytes(&out, self.allocator, self.buf.items);
 
-        // If cursor is not at the end, or if final byte wrapped exactly at column boundary,
-        // move from end_row/end_col back to cursor_row/cursor_col.
-        const end_row = layout.end_row;
-        const end_col = layout.end_col;
-        if (end_row > layout.cursor_row) {
-            try out.print(self.allocator, "\x1b[{d}A", .{end_row - layout.cursor_row});
+        var total_end_row = layout.end_row;
+        var total_end_col = layout.end_col;
+        if (footer_line) |fl| {
+            if (fl.len > 0) {
+                try out.appendSlice(self.allocator, "\r\n");
+                try out.appendSlice(self.allocator, fl);
+                total_end_row += 1;
+                total_end_col = terminal.visibleWidth(fl);
+            }
         }
-        if (end_col != layout.cursor_col or end_row != layout.cursor_row) {
+
+        // Move from bottom rendered row back to cursor_row/cursor_col.
+        if (total_end_row > layout.cursor_row) {
+            try out.print(self.allocator, "\x1b[{d}A", .{total_end_row - layout.cursor_row});
+        }
+        if (total_end_col != layout.cursor_col or total_end_row != layout.cursor_row) {
             try out.append(self.allocator, '\r');
             if (layout.cursor_col > 0) {
                 try out.print(self.allocator, "\x1b[{d}C", .{layout.cursor_col});
             }
         }
         self.rendered_cursor_row = layout.cursor_row;
+        try output.writeStreamingAll(io, out.items);
+    }
+
+    fn clearFooterOnly(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize) !void {
+        const layout = computeLayout(self.buf.items, self.cursor, cols, 2);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        if (layout.end_row > layout.cursor_row) {
+            try out.print(self.allocator, "\x1b[{d}B", .{layout.end_row - layout.cursor_row});
+        }
+        try out.appendSlice(self.allocator, "\r\n\x1b[J");
+        try out.print(self.allocator, "\x1b[1A\r", .{});
+        if (layout.end_col > 0) try out.print(self.allocator, "\x1b[{d}C", .{layout.end_col});
         try output.writeStreamingAll(io, out.items);
     }
 };
@@ -709,7 +747,6 @@ fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Subm
     }
     var list_out: std.ArrayList(u8) = .empty;
     defer list_out.deinit(editor.allocator);
-    try list_out.append(editor.allocator, '\n');
     const shown = @min(matches.items.len, 24);
     for (matches.items[0..shown], 0..) |m, idx| {
         if (idx > 0) try list_out.appendSlice(editor.allocator, "  ");
@@ -719,9 +756,19 @@ fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Subm
         try list_out.print(editor.allocator, "  (+{d} more)", .{matches.items.len - shown});
     }
     try list_out.append(editor.allocator, '\n');
+    if (color and submit.status_info != null) {
+        try editor.clearFooterOnly(io, output, cols);
+    }
+    try output.writeStreamingAll(io, "\n");
     try output.writeStreamingAll(io, list_out.items);
     editor.rendered_cursor_row = 0;
-    try editor.render(io, output, cols, color);
+    const footer_line = if (color and submit.status_info != null) blk: {
+        var info = submit.status_info.?(submit.context);
+        info.queued_count = 0;
+        break :blk try components.chrome.Footer.renderLineAlloc(editor.allocator, theme.Theme.init(submit.color_mode orelse .ansi16), info, @max(1, cols -| 1));
+    } else null;
+    defer if (footer_line) |fl| editor.allocator.free(fl);
+    try editor.renderWithFooter(io, output, cols, color, footer_line);
     return false;
 }
 
@@ -753,6 +800,7 @@ fn readPromptLine(
     history: *const History,
     submit: Submit,
     color: bool,
+    th: theme.Theme,
     initial: ?[]const u8,
 ) anyerror!?[]u8 {
     if (submit.cancel) |token| {
@@ -767,9 +815,10 @@ fn readPromptLine(
     var editor = EditorState{ .allocator = allocator };
     defer editor.deinit();
 
+    const has_footer = th.mode != .none and submit.status_info != null;
     var in_paste = false;
     var cols = terminalColumns(io, output);
-    var dirty = false;
+    var dirty = has_footer;
     if (initial) |text| {
         if (text.len > 0) {
             try editor.insertSlice(text);
@@ -780,11 +829,18 @@ fn readPromptLine(
     while (true) {
         if (dirty and !queue.hasBuffered()) {
             cols = terminalColumns(io, output);
-            try editor.render(io, output, cols, color);
+            const footer_line = if (has_footer) blk: {
+                var info = submit.status_info.?(submit.context);
+                info.queued_count = 0;
+                break :blk try components.chrome.Footer.renderLineAlloc(allocator, th, info, @max(1, cols -| 1));
+            } else null;
+            defer if (footer_line) |fl| allocator.free(fl);
+            try editor.renderWithFooter(io, output, cols, color, footer_line);
             dirty = false;
         }
         const b_opt = try queue.readByte(input_fd, submit.cancel);
         const b = b_opt orelse {
+            if (has_footer) editor.clearFooterOnly(io, output, cols) catch {};
             if (editor.buf.items.len == 0) {
                 try output.writeStreamingAll(io, "\n");
                 return null;
@@ -793,9 +849,13 @@ fn readPromptLine(
         };
 
         switch (b) {
-            0x03 => return error.Canceled,
+            0x03 => {
+                if (has_footer) editor.clearFooterOnly(io, output, cols) catch {};
+                return error.Canceled;
+            },
             0x04 => {
                 if (editor.buf.items.len == 0) {
+                    if (has_footer) editor.clearFooterOnly(io, output, cols) catch {};
                     try output.writeStreamingAll(io, "\n");
                     return null;
                 }
@@ -817,7 +877,9 @@ fn readPromptLine(
                 }
                 if (dirty) {
                     cols = terminalColumns(io, output);
-                    try editor.render(io, output, cols, color);
+                    try editor.renderWithFooter(io, output, cols, color, null);
+                } else if (has_footer) {
+                    try editor.clearFooterOnly(io, output, cols);
                 }
                 try output.writeStreamingAll(io, "\n");
                 return try editor.buf.toOwnedSlice(allocator);
@@ -1018,6 +1080,10 @@ test {
     _ = terminal;
     _ = theme;
     _ = renderer;
+    _ = components.markdown;
+    _ = components.message;
+    _ = components.tool_card;
+    _ = components.chrome;
 }
 
 test "editor UTF-8 insertion cursor movement deletion and history navigation" {
@@ -1056,6 +1122,9 @@ const LiveScreen = struct {
     io: std.Io,
     output: std.Io.File,
     color: bool,
+    th: theme.Theme,
+    md: components.markdown.MarkdownStyler = .{},
+    loader: components.chrome.Loader = .{},
     mutex: std.Io.Mutex = .init,
     pending_line: std.ArrayList(u8) = .empty,
     overlay_bytes: std.ArrayList(u8) = .empty,
@@ -1065,8 +1134,8 @@ const LiveScreen = struct {
 
     const max_pending_line_bytes: usize = 4096;
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, output: std.Io.File, color: bool) LiveScreen {
-        return .{ .allocator = allocator, .io = io, .output = output, .color = color };
+    fn init(allocator: std.mem.Allocator, io: std.Io, output: std.Io.File, color: bool, th: theme.Theme) LiveScreen {
+        return .{ .allocator = allocator, .io = io, .output = output, .color = color, .th = th };
     }
 
     fn deinit(self: *LiveScreen) void {
@@ -1075,12 +1144,29 @@ const LiveScreen = struct {
     }
 
     fn writer(self: *LiveScreen) LiveWriter {
-        return .{ .context = self, .write_segment = writeSegmentErased };
+        return .{
+            .context = self,
+            .write_segment = writeSegmentErased,
+            .write_markdown = writeMarkdownErased,
+            .set_phase = setPhaseErased,
+        };
     }
 
     fn writeSegmentErased(context: *anyopaque, prefix: []const u8, safe: []const u8, suffix: []const u8) anyerror!void {
         const self: *LiveScreen = @ptrCast(@alignCast(context));
         return self.writeSegment(prefix, safe, suffix);
+    }
+
+    fn writeMarkdownErased(context: *anyopaque, delta: []const u8) anyerror!void {
+        const self: *LiveScreen = @ptrCast(@alignCast(context));
+        return self.writeMarkdown(delta);
+    }
+
+    fn setPhaseErased(context: *anyopaque, phase: components.chrome.Phase, detail: []const u8) void {
+        const self: *LiveScreen = @ptrCast(@alignCast(context));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.loader.setPhase(phase, detail);
     }
 
     fn writeSegment(self: *LiveScreen, prefix: []const u8, safe: []const u8, suffix: []const u8) !void {
@@ -1112,6 +1198,105 @@ const LiveScreen = struct {
         }
 
         if (frame.items.len > 0) try self.output.writeStreamingAll(self.io, frame.items);
+    }
+
+    fn writeMarkdown(self: *LiveScreen, delta: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(self.allocator);
+
+        if (self.overlay_active) {
+            const p_rows = if (self.pending_line.items.len > 0) pendingLineRows(self.pending_line.items, self.overlay_cols) else 0;
+            const move_up = self.overlay_cursor_row + (if (self.pending_line.items.len > 0) 1 + p_rows else 0);
+            if (move_up > 0) try frame.print(self.allocator, "\x1b[{d}A", .{move_up});
+            try frame.appendSlice(self.allocator, "\r\x1b[J");
+            if (self.pending_line.items.len > 0) try frame.appendSlice(self.allocator, self.pending_line.items);
+            self.overlay_active = false;
+        }
+
+        var rest = delta;
+        while (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+            const seg = rest[0..nl];
+            const had_pending = self.pending_line.items.len > 0;
+            var full_line: std.ArrayList(u8) = .empty;
+            defer full_line.deinit(self.allocator);
+            if (had_pending) try full_line.appendSlice(self.allocator, self.pending_line.items);
+            try full_line.appendSlice(self.allocator, seg);
+
+            if (self.th.mode != .none and (self.md.in_code_fence or components.markdown.MarkdownStyler.hasSyntax(full_line.items))) {
+                const styled = try self.md.styleLine(self.allocator, self.th, full_line.items);
+                defer self.allocator.free(styled);
+                if (had_pending) {
+                    const p_rows = pendingLineRows(self.pending_line.items, self.overlay_cols);
+                    if (p_rows > 0) try frame.print(self.allocator, "\x1b[{d}A", .{p_rows});
+                    try frame.appendSlice(self.allocator, "\r\x1b[J");
+                }
+                try frame.appendSlice(self.allocator, styled);
+                try frame.append(self.allocator, '\n');
+            } else {
+                if (seg.len > 0) try appendSanitizedText(&frame, self.allocator, seg);
+                try frame.append(self.allocator, '\n');
+            }
+            self.pending_line.clearRetainingCapacity();
+            rest = rest[nl + 1 ..];
+        }
+
+        if (rest.len > 0) {
+            const chunk_start = frame.items.len;
+            try appendSanitizedText(&frame, self.allocator, rest);
+            try updatePendingLine(&self.pending_line, self.allocator, frame.items[chunk_start..]);
+        }
+
+        if (self.overlay_bytes.items.len > 0) {
+            if (self.pending_line.items.len > 0) try frame.appendSlice(self.allocator, "\r\n");
+            try frame.appendSlice(self.allocator, self.overlay_bytes.items);
+            self.overlay_active = true;
+        }
+
+        if (frame.items.len > 0) try self.output.writeStreamingAll(self.io, frame.items);
+    }
+
+    fn loaderTickAndRender(
+        self: *LiveScreen,
+        editor: *const EditorState,
+        followups: []const []const u8,
+        submit: Submit,
+        cols: usize,
+        delta_ms: u64,
+    ) !void {
+        var status_buf: ?[]u8 = null;
+        defer if (status_buf) |s| self.allocator.free(s);
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (delta_ms > 0) self.loader.tick(delta_ms);
+            if (self.th.mode != .none) {
+                const max_cols = @max(1, cols -| 1);
+                const loader_line = try self.loader.renderLineAlloc(self.allocator, self.th, max_cols);
+                defer self.allocator.free(loader_line);
+                if (submit.status_info) |get_info| {
+                    var info = get_info(submit.context);
+                    info.queued_count = followups.len;
+                    const footer_line = try components.chrome.Footer.renderLineAlloc(self.allocator, self.th, info, max_cols);
+                    defer self.allocator.free(footer_line);
+                    status_buf = try std.fmt.allocPrint(self.allocator, "{s}\r\n{s}", .{ loader_line, footer_line });
+                } else {
+                    status_buf = try self.allocator.dupe(u8, loader_line);
+                }
+            }
+        }
+        const rendered = try renderLiveOverlayFrameWithChrome(
+            self.allocator,
+            editor,
+            followups,
+            cols,
+            self.color,
+            status_buf,
+        );
+        defer self.allocator.free(rendered.bytes);
+        try self.updateOverlay(rendered.bytes, rendered.cursor_row, cols);
     }
 
     fn updateOverlay(self: *LiveScreen, new_bytes: []const u8, new_cursor_row: usize, cols: usize) !void {
@@ -1174,14 +1359,27 @@ fn updatePendingLine(pending: *std.ArrayList(u8), a: std.mem.Allocator, chunk: [
     try pending.appendSlice(a, chunk);
 }
 
+const LiveOverlayFrame = struct { bytes: []u8, cursor_row: usize };
+
 fn renderLiveOverlayFrame(
     allocator: std.mem.Allocator,
     editor: *const EditorState,
     followups: []const []const u8,
     cols_raw: usize,
     color: bool,
-) !struct { bytes: []u8, cursor_row: usize } {
-    if (followups.len == 0 and editor.buf.items.len == 0) {
+) !LiveOverlayFrame {
+    return renderLiveOverlayFrameWithChrome(allocator, editor, followups, cols_raw, color, null);
+}
+
+fn renderLiveOverlayFrameWithChrome(
+    allocator: std.mem.Allocator,
+    editor: *const EditorState,
+    followups: []const []const u8,
+    cols_raw: usize,
+    color: bool,
+    chrome_block: ?[]const u8,
+) !LiveOverlayFrame {
+    if (followups.len == 0 and editor.buf.items.len == 0 and (chrome_block == null or chrome_block.?.len == 0)) {
         return .{ .bytes = try allocator.alloc(u8, 0), .cursor_row = 0 };
     }
     const cols = @max(cols_raw, 4);
@@ -1221,21 +1419,51 @@ fn renderLiveOverlayFrame(
             if (color) try out.appendSlice(allocator, "\x1b[2m");
             _ = try appendTreeText(&out, allocator, "  Alt+Up edit queued", max_preview_cols);
             if (color) try out.appendSlice(allocator, "\x1b[0m");
+            if (chrome_block) |cb| {
+                if (cb.len > 0) {
+                    try out.appendSlice(allocator, "\r\n");
+                    rows_above += 1;
+                    try out.appendSlice(allocator, cb);
+                    rows_above += std.mem.count(u8, cb, "\n");
+                }
+            }
             return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above };
         }
     }
 
-    try out.appendSlice(allocator, if (color) "\x1b[36m>\x1b[0m " else "> ");
-    const layout = computeLayout(editor.buf.items, editor.cursor, cols, 2);
-    try appendSafeTerminalBytes(&out, allocator, editor.buf.items);
-    if (layout.end_row > layout.cursor_row) {
-        try out.print(allocator, "\x1b[{d}A", .{layout.end_row - layout.cursor_row});
+    if (editor.buf.items.len > 0) {
+        try out.appendSlice(allocator, if (color) "\x1b[36m>\x1b[0m " else "> ");
+        const layout = computeLayout(editor.buf.items, editor.cursor, cols, 2);
+        try appendSafeTerminalBytes(&out, allocator, editor.buf.items);
+        var bottom_row = layout.end_row;
+        var bottom_col = layout.end_col;
+        if (chrome_block) |cb| {
+            if (cb.len > 0) {
+                try out.appendSlice(allocator, "\r\n");
+                try out.appendSlice(allocator, cb);
+                bottom_row += 1 + std.mem.count(u8, cb, "\n");
+                const last_nl = std.mem.lastIndexOfScalar(u8, cb, '\n');
+                const last_line = if (last_nl) |idx| cb[idx + 1 ..] else cb;
+                bottom_col = terminal.visibleWidth(last_line);
+            }
+        }
+        if (bottom_row > layout.cursor_row) {
+            try out.print(allocator, "\x1b[{d}A", .{bottom_row - layout.cursor_row});
+        }
+        if (bottom_col != layout.cursor_col or bottom_row != layout.cursor_row) {
+            try out.append(allocator, '\r');
+            if (layout.cursor_col > 0) try out.print(allocator, "\x1b[{d}C", .{layout.cursor_col});
+        }
+        return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above + layout.cursor_row };
     }
-    if (layout.end_col != layout.cursor_col or layout.end_row != layout.cursor_row) {
-        try out.append(allocator, '\r');
-        if (layout.cursor_col > 0) try out.print(allocator, "\x1b[{d}C", .{layout.cursor_col});
+
+    if (chrome_block) |cb| {
+        if (cb.len > 0) {
+            try out.appendSlice(allocator, cb);
+            return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = std.mem.count(u8, cb, "\n") };
+        }
     }
-    return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above + layout.cursor_row };
+    return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = 0 };
 }
 
 fn restoreFollowupsToEditor(editor: *EditorState, followups: *std.ArrayList([]u8), allocator: std.mem.Allocator) !void {
@@ -1286,6 +1514,7 @@ fn runTurnWithLiveEditor(
     followups: *std.ArrayList([]u8),
     carried_draft: *?[]u8,
     color: bool,
+    th: theme.Theme,
 ) !void {
     const orig_term = try enterRawMode(input_fd);
     defer std.posix.tcsetattr(input_fd, .NOW, orig_term) catch {};
@@ -1296,7 +1525,7 @@ fn runTurnWithLiveEditor(
     var done = try agent.model.Interrupt.init();
     defer done.deinit(io);
 
-    var screen = LiveScreen.init(submit.allocator, io, output, color);
+    var screen = LiveScreen.init(submit.allocator, io, output, color, th);
     defer screen.deinit();
 
     submit.set_live_writer.?(submit.context, screen.writer());
@@ -1334,20 +1563,29 @@ fn runTurnWithLiveEditor(
     var cols = terminalColumns(io, output);
     var dirty = followups.items.len > 0 or editor.buf.items.len > 0;
     const wake = done.cancel();
+    var last_tick_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
 
     while (true) {
         if (done.isCanceled()) break;
         const current_cols = terminalColumns(io, output);
         if ((dirty or current_cols != cols) and !queue.hasBuffered()) {
             cols = current_cols;
-            const rendered = try renderLiveOverlayFrame(submit.allocator, &editor, followups.items, cols, color);
-            defer submit.allocator.free(rendered.bytes);
-            try screen.updateOverlay(rendered.bytes, rendered.cursor_row, cols);
+            try screen.loaderTickAndRender(&editor, followups.items, submit, cols, 0);
             dirty = false;
         }
-        const b_opt = try queue.readByteWithWake(input_fd, wake, 100);
+        const b_opt = try queue.readByteWithWake(input_fd, wake, 120);
         if (done.isCanceled()) break;
-        const b = b_opt orelse continue;
+        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        if (b_opt == null) {
+            const elapsed: u64 = @intCast(@max(@as(i64, 0), now_ms - last_tick_ms));
+            if (elapsed >= 120 and !queue.hasBuffered()) {
+                last_tick_ms = now_ms;
+                cols = terminalColumns(io, output);
+                try screen.loaderTickAndRender(&editor, followups.items, submit, cols, elapsed);
+            }
+            continue;
+        }
+        const b = b_opt.?;
 
         switch (b) {
             0x03 => {

@@ -348,6 +348,34 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if self.path == '/comp-fixture/chat/completions':
+                messages = request['messages']
+                results = [m for m in messages if m['role'] == 'tool']
+                if not results:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.end_headers()
+                    c1 = {'choices': [{'index': 0, 'delta': {'reasoning_content': 'checking file'}}]}
+                    self.wfile.write(('data: ' + json.dumps(c1) + '\n\n').encode())
+                    self.wfile.flush()
+                    time.sleep(0.22)
+                    c2 = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'comp-edit', 'type': 'function',
+                        'function': {'name': 'edit', 'arguments': json.dumps({
+                            'path': 'comp.txt', 'oldText': 'old', 'newText': 'new',
+                        })},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+                    self.wfile.write(('data: ' + json.dumps(c2) + '\n\ndata: [DONE]\n\n').encode())
+                    self.wfile.flush()
+                    return
+                body = '## Summary\n- Updated `comp.txt` with **new**\n```zig\nconst ok = true;\n```\n'
+                data = ('data: ' + json.dumps(self.text(body)) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/queue-fixture/chat/completions':
                 user = [m['content'] for m in request['messages'] if m['role'] == 'user'][-1]
                 self.server.queue_requests.append(user)
@@ -1718,6 +1746,123 @@ def check_queued_followup_editing(root, environment, server):
             process.kill()
             process.wait(timeout=5)
         os.close(master)
+
+
+def check_tui_components(root, environment, server):
+    comp_dir = root / 'comp-work'
+    comp_dir.mkdir()
+    (comp_dir / 'comp.txt').write_text('line1\nold\nline3\n')
+    agent_dir = root / 'comp-agent'
+    agent_dir.mkdir()
+    (agent_dir / 'models.json').write_text(json.dumps({'providers': {'comp-fixture': {
+        'api': 'openai-completions',
+        'baseUrl': f'http://127.0.0.1:{server.server_port}/comp-fixture',
+        'apiKey': 'comp-key',
+        'models': [{'id': 'comp-model', 'contextWindow': 10000}],
+    }}}))
+    (agent_dir / 'settings.json').write_text(json.dumps({
+        'defaultProvider': 'comp-fixture',
+        'defaultModel': 'comp-model',
+        'defaultThinkingLevel': 'medium',
+        'quietStartup': True,
+    }))
+    env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color')
+    args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(comp_dir)]
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
+    term_before = termios.tcgetattr(slave)
+
+    def become_tty_leader():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(
+        args, cwd=comp_dir, env=env, stdin=slave, stdout=slave, stderr=slave,
+        close_fds=True, preexec_fn=become_tty_leader,
+    )
+    os.close(slave)
+    transcript = bytearray()
+
+    def expect(marker, start=0):
+        deadline = time.monotonic() + 10
+        while transcript.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('TUI components PTY timed out', marker, bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('PTY exited early', marker, bytes(transcript[start:]))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+        return transcript.find(marker, start)
+
+    try:
+        # 1. Idle footer shows provider/model, thinking level, context %, and shortened cwd.
+        expect(b'comp-fixture/comp-model (medium)')
+        expect(b'% ctx')
+
+        # 2. Submit turn: Loader, ThinkingBlock, ToolCard + DiffView, MarkdownStyler, and updated Footer render.
+        start = len(transcript)
+        os.write(master, b'update comp\n')
+        expect(b'Thinking...', start)
+        expect(b'checking file', start)
+        expect(b'\xe2\x95\xad\xe2\x94\x80 ', start)
+        expect(b'[tool: edit]', start)
+        expect(b'-2 old', start)
+        expect(b'+2 new', start)
+        expect(b'\xe2\x95\xb0\xe2\x94\x80 ', start)
+        expect(b'\xe2\x9c\x93', start)
+        expect(b'\x1b[1;38;2;103;212;242m## Summary\x1b[0m', start)
+        expect(b'\xe2\x80\xa2 ', start)
+        expect(b'const ok = true;', start)
+        expect(b'comp-fixture/comp-model (medium)', len(transcript) - 256 if len(transcript) > 256 else 0)
+        assert b'\x1b[?1049h' not in transcript, 'alt-screen triggered'
+        assert (comp_dir / 'comp.txt').read_text() == 'line1\nnew\nline3\n'
+
+        os.write(master, b'/exit\n')
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+        term_after = termios.tcgetattr(master)
+        term_after[3] &= ~getattr(termios, 'PENDIN', 0)
+        term_before[3] &= ~getattr(termios, 'PENDIN', 0)
+        assert term_after == term_before
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master)
+
+    # 3. Verify NO_COLOR suppresses ANSI styling in interactive mode.
+    (comp_dir / 'comp.txt').write_text('line1\nold\nline3\n')
+    no_color_env = dict(env, NO_COLOR='1')
+    master2, slave2 = pty.openpty()
+    proc2 = subprocess.Popen(args, cwd=comp_dir, env=no_color_env, stdin=slave2, stdout=slave2, stderr=slave2, close_fds=True)
+    os.close(slave2)
+    t2 = bytearray()
+    try:
+        deadline = time.monotonic() + 10
+        while b'comp-fixture/comp-model' not in t2 and b'> ' not in t2:
+            if select.select([master2], [], [], 0.2)[0]:
+                t2.extend(os.read(master2, 16384))
+            assert time.monotonic() < deadline, bytes(t2)
+        mark = len(t2)
+        os.write(master2, b'update comp\n')
+        while b'const ok = true;' not in t2[mark:]:
+            if select.select([master2], [], [], 0.2)[0]:
+                t2.extend(os.read(master2, 16384))
+            assert time.monotonic() < deadline, bytes(t2)
+        assert b'\x1b[38;' not in t2[mark:] and b'\x1b[32m' not in t2[mark:] and b'\x1b[36m' not in t2, bytes(t2)
+        os.write(master2, b'/exit\n')
+        assert proc2.wait(timeout=5) == 0
+    finally:
+        if proc2.poll() is None:
+            proc2.kill()
+            proc2.wait(timeout=5)
+        os.close(master2)
 
 
 def check_settings_and_model_switch(root, environment, server):
@@ -3180,6 +3325,7 @@ for line in sys.stdin:
             check_settings_and_model_switch(root, environment, server)
             check_tree_navigation(root, environment, server)
             check_queued_followup_editing(root, environment, server)
+            check_tui_components(root, environment, server)
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'

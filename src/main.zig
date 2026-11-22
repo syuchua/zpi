@@ -197,6 +197,11 @@ fn run(init: std.process.Init) !void {
         }
     }
     adapter.harness = h;
+    if (comptime build_options.enable_tui) {
+        const out_color = std.Io.File.stdout().supportsAnsiEscapeCodes(init.io) catch false;
+        adapter.tui_theme = tui.theme.Theme.init(tui.theme.Theme.detect(init.environ_map, out_color));
+        adapter.refreshCachedStats();
+    }
 
     if (options.mode == .json) try adapter.json(.{ .type = "session", .format = "zpi-events", .version = 1 });
     if (prompt.len > 0) try adapter.submit(prompt);
@@ -225,6 +230,8 @@ fn run(init: std.process.Init) !void {
                 .tree_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.treeSourceErased,
                 .switch_model = CliAdapter.switchModelErased,
                 .set_thinking = CliAdapter.setThinkingErased,
+                .status_info = CliAdapter.statusInfoErased,
+                .color_mode = adapter.tui_theme.mode,
                 .quiet_startup = status.quiet_startup,
             });
         } else {
@@ -242,7 +249,11 @@ const CliAdapter = struct {
     stderr_is_tty: bool = false,
     stderr_color: bool = false,
     live_writer: if (build_options.enable_tui) ?tui.LiveWriter else ?void = null,
-    harness: *harness.Harness = undefined,
+    tui_theme: if (build_options.enable_tui) tui.theme.Theme else void = if (build_options.enable_tui) .{} else {},
+    in_thinking: bool = false,
+    status_mutex: std.Io.Mutex = .init,
+    cached_tokens: u64 = 0,
+    harness: ?*harness.Harness = null,
 
     fn writeSafe(io: std.Io, file: std.Io.File, text: []const u8) !void {
         var start: usize = 0;
@@ -295,13 +306,58 @@ const CliAdapter = struct {
         if (suffix.len > 0) try stderr.writeStreamingAll(self.io, suffix);
     }
 
+    fn refreshCachedStats(self: *CliAdapter) void {
+        if (self.mode != .interactive) return;
+        const h = self.harness orelse return;
+        const stats = h.sessionStats() catch return;
+        self.status_mutex.lockUncancelable(self.io);
+        defer self.status_mutex.unlock(self.io);
+        self.cached_tokens = stats.context_tokens_estimate;
+    }
+
+    fn statusInfoErased(context: *anyopaque) tui.components.chrome.FooterInfo {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness orelse return .{};
+        const status = h.statusSummary();
+        self.status_mutex.lockUncancelable(self.io);
+        const tokens = self.cached_tokens;
+        self.status_mutex.unlock(self.io);
+        return .{
+            .provider = status.provider,
+            .model = status.model,
+            .thinking_level = @tagName(status.thinking_level),
+            .cwd = status.cwd,
+            .context_tokens = tokens,
+            .context_window = status.context_window,
+        };
+    }
+
     fn submit(self: *CliAdapter, prompt: []const u8) !void {
-        const result = try self.harness.submit(prompt);
+        self.in_thinking = false;
+        const result = try self.harness.?.submit(prompt);
         if (result.handled) return;
+        if (self.in_thinking) {
+            self.in_thinking = false;
+            if (self.mode == .interactive) try self.errSegment("\n", "", "");
+        }
         if (self.mode == .print and result.final_text.len > 0) {
             try std.Io.File.stdout().writeStreamingAll(self.io, result.final_text);
         }
-        if (self.mode != .json) try self.outSegment("\n", "", "");
+        if (self.mode != .json) {
+            if (comptime build_options.enable_tui) {
+                if (self.mode == .interactive) {
+                    if (self.live_writer) |writer| {
+                        if (writer.write_markdown) |write_md| {
+                            try write_md(writer.context, "\n");
+                            self.refreshCachedStats();
+                            return;
+                        }
+                    }
+                }
+            }
+            try self.outSegment("\n", "", "");
+        }
+        self.refreshCachedStats();
     }
 
     fn submitErased(context: *anyopaque, prompt: []const u8) anyerror!void {
@@ -311,7 +367,7 @@ const CliAdapter = struct {
 
     fn switchModelErased(context: *anyopaque, arg: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
-        var outcome = try self.harness.switchModel(arg);
+        var outcome = try self.harness.?.switchModel(arg);
         switch (outcome) {
             .listed => |*listed| {
                 defer listed.deinit();
@@ -330,6 +386,7 @@ const CliAdapter = struct {
                 try writeSafe(self.io, .stdout(), out.items);
             },
             .switched => |status| {
+                self.refreshCachedStats();
                 const notice = try std.fmt.allocPrint(self.allocator, "[model: {s}/{s} ({s}), thinking: {s}]\n", .{
                     status.provider,
                     status.model,
@@ -344,7 +401,8 @@ const CliAdapter = struct {
 
     fn setThinkingErased(context: *anyopaque, arg: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
-        const level = try self.harness.setThinking(arg);
+        const level = try self.harness.?.setThinking(arg);
+        self.refreshCachedStats();
         const msg = if (arg.len == 0)
             try std.fmt.allocPrint(self.allocator, "Thinking: {s} (off, minimal, low, medium, high, xhigh, max)\n", .{@tagName(level)})
         else
@@ -355,22 +413,24 @@ const CliAdapter = struct {
 
     fn compactErased(context: *anyopaque, focus: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
-        _ = try self.harness.compact(focus);
+        _ = try self.harness.?.compact(focus);
+        self.refreshCachedStats();
     }
 
     fn treeSourceErased(context: *anyopaque) tui.TreeSource {
         const self: *const CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness.?;
         return .{
             .context = self,
-            .len = self.harness.treeCount(),
-            .active = self.harness.treeActiveIndex(),
+            .len = h.treeCount(),
+            .active = h.treeActiveIndex(),
             .item = treeItemErased,
         };
     }
 
     fn treeItemErased(context: *const anyopaque, index: usize) tui.TreeItem {
         const self: *const CliAdapter = @ptrCast(@alignCast(context));
-        const view = self.harness.treeEntryAt(index);
+        const view = self.harness.?.treeEntryAt(index);
         return .{
             .id = view.id,
             .role = view.role,
@@ -381,7 +441,7 @@ const CliAdapter = struct {
 
     fn treeErased(context: *anyopaque, args: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
-        var res = try self.harness.runTreeCommand(args);
+        var res = try self.harness.?.runTreeCommand(args);
         switch (res) {
             .list => |*page| {
                 defer page.deinit();
@@ -404,6 +464,7 @@ const CliAdapter = struct {
             },
             .already_active => try std.Io.File.stdout().writeStreamingAll(self.io, "[already at this entry]\n"),
             .branched => |b| {
+                self.refreshCachedStats();
                 const line = try std.fmt.allocPrint(self.allocator, "[branched to {s}{s}]\n", .{ b.target, if (b.summarized) " with summary" else "" });
                 defer self.allocator.free(line);
                 try writeSafe(self.io, .stdout(), line);
@@ -413,7 +474,7 @@ const CliAdapter = struct {
 
     fn sessionInfoErased(context: *anyopaque) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
-        const stats = try self.harness.sessionStats();
+        const stats = try self.harness.?.sessionStats();
         const info = try std.fmt.allocPrint(
             self.allocator,
             "Session Info\n\nFile: {s}\nModel: {s}/{s} ({s}, thinking: {s})\nMessages: {d} total ({d} user, {d} assistant)\nTools: {d} calls, {d} results\nActive entry: {s}\n",
@@ -446,18 +507,49 @@ const CliAdapter = struct {
             .agent => |agent_event| switch (agent_event) {
                 .message_appended => |message| {
                     if (self.mode == .json) try self.json(.{ .type = "message_end", .message = message });
+                    self.refreshCachedStats();
                 },
                 .provider => |provider_event| {
                     if (self.mode == .json) {
                         try self.json(.{ .type = "provider_event", .event = provider_event });
                     } else if (self.mode == .interactive) switch (provider_event) {
-                        .text_delta => |text| try self.outSegment("", text, ""),
-                        .thinking_delta => |text| if (!self.harness.settings.hide_thinking_block) {
-                            try self.errSegment(
-                                if (self.stderr_color) "\x1b[2m" else "",
-                                text,
-                                if (self.stderr_color) "\x1b[0m" else "",
-                            );
+                        .text_delta => |text| {
+                            if (self.in_thinking) {
+                                self.in_thinking = false;
+                                try self.errSegment("\n", "", "");
+                            }
+                            if (comptime build_options.enable_tui) {
+                                if (self.live_writer) |writer| {
+                                    if (writer.set_phase) |set_phase| set_phase(writer.context, .streaming, "");
+                                    if (writer.write_markdown) |write_md| {
+                                        try write_md(writer.context, text);
+                                        return;
+                                    }
+                                }
+                            }
+                            try self.outSegment("", text, "");
+                        },
+                        .thinking_delta => |text| if (!(if (self.harness) |h| h.settings.hide_thinking_block else false)) {
+                            if (comptime build_options.enable_tui) {
+                                if (self.live_writer) |writer| {
+                                    if (writer.set_phase) |set_phase| set_phase(writer.context, .thinking, "");
+                                }
+                                if (!self.in_thinking) {
+                                    self.in_thinking = true;
+                                    const hdr = try tui.components.message.formatThinkingHeaderAlloc(self.allocator, self.tui_theme);
+                                    defer self.allocator.free(hdr);
+                                    try self.errSegment(hdr, "", "");
+                                }
+                                const chunk = try tui.components.message.formatThinkingDeltaAlloc(self.allocator, self.tui_theme, text);
+                                defer self.allocator.free(chunk);
+                                try self.errSegment(chunk, "", "");
+                            } else {
+                                try self.errSegment(
+                                    if (self.stderr_color) "\x1b[2m" else "",
+                                    text,
+                                    if (self.stderr_color) "\x1b[0m" else "",
+                                );
+                            }
                         },
                         else => {},
                     };
@@ -465,34 +557,88 @@ const CliAdapter = struct {
                 .tool_start => |call| {
                     if (self.mode == .json) try self.json(.{ .type = "tool_execution_start", .id = call.id, .name = call.name });
                     if (self.mode == .interactive) {
-                        try self.errSegment("\n[tool: ", call.name, "]\n");
+                        if (self.in_thinking) {
+                            self.in_thinking = false;
+                            try self.errSegment("\n", "", "");
+                        }
+                        if (comptime build_options.enable_tui) {
+                            if (self.live_writer) |writer| {
+                                if (writer.set_phase) |set_phase| set_phase(writer.context, .tool, call.name);
+                            }
+                            const cols = tui.terminal.terminalColumns(self.io, .stdout());
+                            const header = try tui.components.tool_card.formatStartAlloc(self.allocator, self.tui_theme, call.name, cols);
+                            defer self.allocator.free(header);
+                            try self.errSegment(header, "", "");
+                        } else {
+                            try self.errSegment("\n[tool: ", call.name, "]\n");
+                        }
                     }
                 },
                 .tool_update => |update| {
                     if (self.mode == .json) {
                         try self.json(.{ .type = "tool_execution_update", .id = update.call.id, .name = update.call.name, .result = update.result });
                     } else if (self.mode == .interactive) {
-                        try self.errSegment("", update.result.text, "\n");
+                        if (comptime build_options.enable_tui) {
+                            const line = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, update.result.text);
+                            defer self.allocator.free(line);
+                            try self.errSegment(line, "", "");
+                        } else {
+                            try self.errSegment("", update.result.text, "\n");
+                        }
                     }
                 },
                 .tool_end => |ended| {
                     if (self.mode == .json) {
                         try self.json(.{ .type = "tool_execution_end", .id = ended.call.id, .result = ended.result });
                     } else if (self.mode == .interactive) {
-                        if (ended.result.is_error) {
-                            try self.errSegment("", ended.result.text, "\n");
-                        } else if (ended.result.details) |details_val| {
-                            if (details_val == .object) {
-                                if (std.mem.eql(u8, ended.call.name, "edit")) {
-                                    if (details_val.object.get("diff")) |diff_val| {
-                                        if (diff_val == .string and diff_val.string.len > 0) {
-                                            try self.writeDiffPreview(diff_val.string);
+                        if (comptime build_options.enable_tui) {
+                            if (self.live_writer) |writer| {
+                                if (writer.set_phase) |set_phase| set_phase(writer.context, .streaming, "");
+                            }
+                            if (ended.result.is_error) {
+                                const err_line = try tui.components.tool_card.formatEndErrorAlloc(self.allocator, self.tui_theme, ended.result.text);
+                                defer self.allocator.free(err_line);
+                                try self.errSegment(err_line, "", "");
+                            } else {
+                                if (ended.result.details) |details_val| {
+                                    if (details_val == .object) {
+                                        if (std.mem.eql(u8, ended.call.name, "edit")) {
+                                            if (details_val.object.get("diff")) |diff_val| {
+                                                if (diff_val == .string and diff_val.string.len > 0) {
+                                                    try self.writeDiffPreview(diff_val.string);
+                                                }
+                                            }
+                                        } else if (std.mem.eql(u8, ended.call.name, "bash")) {
+                                            if (details_val.object.get("fullOutputPath")) |path_val| {
+                                                if (path_val == .string and path_val.string.len > 0) {
+                                                    const spill = try tui.components.tool_card.formatSpillLineAlloc(self.allocator, self.tui_theme, path_val.string);
+                                                    defer self.allocator.free(spill);
+                                                    try self.errSegment(spill, "", "");
+                                                }
+                                            }
                                         }
                                     }
-                                } else if (std.mem.eql(u8, ended.call.name, "bash")) {
-                                    if (details_val.object.get("fullOutputPath")) |path_val| {
-                                        if (path_val == .string and path_val.string.len > 0) {
-                                            try self.errSegment("[full output: ", path_val.string, "]\n");
+                                }
+                                const ok_line = try tui.components.tool_card.formatEndOkAlloc(self.allocator, self.tui_theme);
+                                defer self.allocator.free(ok_line);
+                                try self.errSegment(ok_line, "", "");
+                            }
+                        } else {
+                            if (ended.result.is_error) {
+                                try self.errSegment("", ended.result.text, "\n");
+                            } else if (ended.result.details) |details_val| {
+                                if (details_val == .object) {
+                                    if (std.mem.eql(u8, ended.call.name, "edit")) {
+                                        if (details_val.object.get("diff")) |diff_val| {
+                                            if (diff_val == .string and diff_val.string.len > 0) {
+                                                try self.writeDiffPreview(diff_val.string);
+                                            }
+                                        }
+                                    } else if (std.mem.eql(u8, ended.call.name, "bash")) {
+                                        if (details_val.object.get("fullOutputPath")) |path_val| {
+                                            if (path_val == .string and path_val.string.len > 0) {
+                                                try self.errSegment("[full output: ", path_val.string, "]\n");
+                                            }
                                         }
                                     }
                                 }
@@ -505,6 +651,14 @@ const CliAdapter = struct {
                         try self.json(.{ .type = "auto_retry_start", .attempt = r.attempt, .max_attempts = r.max_attempts, .delay_ms = r.delay_ms, .error_code = r.error_code });
                     } else if (self.mode == .interactive) {
                         var msg: [160]u8 = undefined;
+                        if (comptime build_options.enable_tui) {
+                            if (self.live_writer) |writer| {
+                                if (writer.set_phase) |set_phase| {
+                                    const detail = std.fmt.bufPrint(&msg, "{d}/{d}", .{ r.attempt, r.max_attempts }) catch "";
+                                    set_phase(writer.context, .retrying, detail);
+                                }
+                            }
+                        }
                         const line = try std.fmt.bufPrint(&msg, "\n[retrying {d}/{d} in {d}ms: {s}]\n", .{ r.attempt, r.max_attempts, r.delay_ms, r.error_code });
                         try self.errSegment(line, "", "");
                     }
@@ -512,16 +666,28 @@ const CliAdapter = struct {
                 .retry_finished => |r| {
                     if (self.mode == .json) {
                         try self.json(.{ .type = "auto_retry_end", .success = r.success, .attempt = r.attempt, .error_code = r.error_code });
+                    } else if (self.mode == .interactive) {
+                        if (comptime build_options.enable_tui) {
+                            if (self.live_writer) |writer| {
+                                if (writer.set_phase) |set_phase| set_phase(writer.context, .streaming, "");
+                            }
+                        }
                     }
                 },
                 .compacted => |c| {
                     if (self.mode == .json) {
                         try self.json(.{ .type = "compaction", .tokens_before = c.tokens_before, .first_kept_id = c.first_kept_id, .automatic = c.automatic });
                     } else if (self.mode == .interactive) {
+                        if (comptime build_options.enable_tui) {
+                            if (self.live_writer) |writer| {
+                                if (writer.set_phase) |set_phase| set_phase(writer.context, .compacting, "");
+                            }
+                        }
                         var msg: [160]u8 = undefined;
                         const line = try std.fmt.bufPrint(&msg, "\n[compacted: {d} tokens before compaction]\n", .{c.tokens_before});
                         try self.errSegment(line, "", "");
                     }
+                    self.refreshCachedStats();
                 },
                 .settled => if (self.mode == .json) {
                     try self.json(.{ .type = "agent_settled" });
@@ -535,10 +701,20 @@ const CliAdapter = struct {
         var count: usize = 0;
         while (lines.next()) |line| {
             if (count >= 40) {
-                try self.errSegment(if (self.stderr_color) "\x1b[2m... (preview truncated)\x1b[0m\n" else "... (preview truncated)\n", "", "");
+                if (comptime build_options.enable_tui) {
+                    const trunc = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (preview truncated)");
+                    defer self.allocator.free(trunc);
+                    try self.errSegment(trunc, "", "");
+                } else {
+                    try self.errSegment(if (self.stderr_color) "\x1b[2m... (preview truncated)\x1b[0m\n" else "... (preview truncated)\n", "", "");
+                }
                 break;
             }
-            if (self.stderr_color) {
+            if (comptime build_options.enable_tui) {
+                const formatted = try tui.components.tool_card.formatDiffLineAlloc(self.allocator, self.tui_theme, line);
+                defer self.allocator.free(formatted);
+                try self.errSegment(formatted, "", "");
+            } else if (self.stderr_color) {
                 const prefix = if (std.mem.startsWith(u8, line, "+"))
                     "\x1b[32m"
                 else if (std.mem.startsWith(u8, line, "-"))
