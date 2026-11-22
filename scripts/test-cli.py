@@ -54,6 +54,52 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['stream'] is True
+            if self.path == '/tree-fixture/chat/completions':
+                messages = request['messages']
+                assert not request.get('tools')
+                user = messages[-1]['content']
+                if '<departed-branch>' in user:
+                    assert len(messages) == 2, messages
+                    assert '[User]: departed request' in user and '[Assistant]: departed answer' in user, user
+                    assert '[Assistant]: [call read]' in user, user
+                    assert 'destination request' not in user and 'shared request' not in user, user
+                    assert 'old instructions' not in user and 'tool output to omit' not in user, user
+                    self.server.tree_summary_requests += 1
+                    if self.server.tree_summary_requests == 1:
+                        response = self.text('partial summary')
+                        response['choices'][0]['finish_reason'] = 'length'
+                    elif self.server.tree_summary_requests == 2:
+                        response = self.text('')
+                    else:
+                        response = self.text('## Goal\nInvestigated the alternative\n\n## Constraints & Preferences\n- none\n\n## Progress\n### Done\n- [x] explored\n\n### In Progress\n- [ ] none\n\n### Blocked\n- none\n\n## Key Decisions\n- **Branch**: explored\n\n## Next Steps\n1. continue')
+                elif user in ('tree-live', 'tree-reopen'):
+                    system = messages[0]['content']
+                    if user == 'tree-live':
+                        assert system.startswith('destination instructions\n'), messages
+                        assert 'tree-fixture-skill' in system, messages
+                    else:
+                        assert system == 'destination instructions', messages
+                    users = [m['content'] for m in messages if m['role'] == 'user']
+                    summary_text = ('The following is a summary of a branch that this conversation came back from:'
+                                    '\n\n<summary>\n## Goal\nInvestigated the alternative\n\n'
+                                    '## Constraints & Preferences\n- none\n\n## Progress\n### Done\n- [x] explored\n\n'
+                                    '### In Progress\n- [ ] none\n\n### Blocked\n- none\n\n'
+                                    '## Key Decisions\n- **Branch**: explored\n\n## Next Steps\n1. continue</summary>')
+                    expected = ['shared request', 'destination request', summary_text, 'tree-live']
+                    if user == 'tree-reopen':
+                        expected.append('tree-reopen')
+                    assert users == expected, users
+                    assert not any(m['role'] == 'tool' for m in messages), messages
+                    response = self.text(user + ' complete')
+                else:
+                    raise AssertionError(f'Unexpected tree fixture prompt: {user!r}')
+                data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/settings-switch/v1/chat/completions':
                 tools = {t['function']['name'] for t in request.get('tools', [])}
                 assert tools == {'read', 'edit', 'write', 'grep'}, tools
@@ -1295,6 +1341,105 @@ def check_https_proxy(root, environment, server):
         proxy_server.shutdown()
         proxy_server.server_close()
         proxy_thread.join(timeout=2)
+
+
+def check_tree_navigation(root, environment, server):
+    config = root / 'tree-models.json'
+    config.write_text(json.dumps({'providers': {'tree-fixture': {
+        'api': 'openai-completions', 'apiKey': 'tree-fixture-key',
+        'baseUrl': f'http://127.0.0.1:{server.server_port}/tree-fixture',
+        'models': [{'id': 'tree-model'}],
+    }}}))
+    skills = root / 'tree-fixture-skill'
+    skills.mkdir()
+    (skills / 'SKILL.md').write_text('---\nname: tree-fixture-skill\ndescription: Test branch context.\n---\nBody.\n')
+    session = root / 'interactive-tree.jsonl'
+    def message(entry, parent, role, text, **fields):
+        return {'type': 'message', 'id': entry, 'parent_id': parent,
+                'version': 2 if fields.get('system_prompt_replace') else 1,
+                'message': dict(role=role, content=[{'text': text}], **fields)}
+
+    records = [
+        {'type': 'session', 'cwd': str(root)},
+        message('1', None, 'system', 'base instructions'),
+        message('2', '1', 'user', 'shared request'),
+        message('3', '2', 'system', 'destination instructions', system_prompt_replace=True),
+        message('4', '3', 'user', 'destination request'),
+        message('5', '2', 'system', 'old instructions', system_prompt_replace=True),
+        message('6', '5', 'user', 'departed request'),
+        {'type': 'message', 'id': '7', 'parent_id': '6', 'message': {
+            'role': 'assistant', 'content': [{'tool_call': {
+                'id': 'historical', 'name': 'read', 'arguments': {'path': 'example.txt'},
+            }}],
+        }},
+        message('8', '7', 'tool_result', 'tool output to omit', tool_call_id='historical', tool_name='read'),
+        message('9', '8', 'assistant', 'departed answer'),
+    ]
+    before = ''.join(json.dumps(record) + '\n' for record in records).encode()
+    session.write_bytes(before)
+    args = [str(BINARY), '--no-proxy', '--models-file', str(config), '--provider', 'tree-fixture',
+            '--session', str(session), '--no-tools', '--skill', str(skills)]
+    server.tree_summary_requests = 0
+    master, slave = pty.openpty()
+    term_before = termios.tcgetattr(slave)
+    process = subprocess.Popen(args, stdin=slave, stdout=slave, stderr=slave, env=environment)
+    transcript = bytearray()
+
+    def expect(marker, start=0):
+        deadline = time.monotonic() + 10
+        while (found := transcript.find(marker, start)) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, (marker, bytes(transcript[start:]), server.failures)
+            if select.select([master], [], [], remaining)[0]:
+                chunk = os.read(master, 16384)
+                assert chunk, (marker, bytes(transcript[start:]))
+                transcript.extend(chunk)
+        return found + len(marker)
+
+    def command(text, marker):
+        start = len(transcript)
+        os.write(master, text + b'\n')
+        return expect(marker, start)
+
+    try:
+        expect(b'Ctrl-D exits')
+        command(b'/tr\t', b'Use /tree ENTRY-ID')
+        assert b'Session tree (active: 9)' in transcript and b'* 9 <- 8' in transcript
+        command(b'/tree --older 4', b'Use /tree ENTRY-ID or /tree --summary ENTRY-ID.')
+        command(b'/tree 7', b'zpi: IncompleteBranchToolBatch')
+        assert session.read_bytes() == before
+        command(b'/tree 4', b'[branched to 4]')
+        assert server.tree_summary_requests == 0
+        command(b'/tree 9', b'[branched to 9]')
+        switched = session.read_bytes()
+        command(b'/tree --summary 4', b'zpi: BranchSummaryFailed')
+        assert session.read_bytes() == switched
+        command(b'/tree --summary 4', b'zpi: BranchSummaryFailed')
+        assert session.read_bytes() == switched
+        command(b'/tree --summary 4', b'[branched to 4 with summary]')
+        added = session.read_bytes()[len(switched):].splitlines()
+        assert len(added) == 1, added
+        summary = json.loads(added[0])
+        assert (summary['type'], summary['parent_id'], summary['from_id']) == ('branch_summary', '4', '9'), summary
+        command(b'tree-live', b'tree-live complete')
+        os.write(master, b'/exit\n')
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+        term_after = termios.tcgetattr(slave)
+        term_after[3] &= ~getattr(termios, 'PENDIN', 0)
+        term_before[3] &= ~getattr(termios, 'PENDIN', 0)
+        assert term_after == term_before
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master)
+        os.close(slave)
+    assert server.tree_summary_requests == 3
+    reopened_args = args.copy()
+    reopened_args[reopened_args.index('--skill'):reopened_args.index('--skill') + 2] = ['--no-skills']
+    resumed = run_cli(reopened_args + ['-p', 'tree-reopen'], input='', text=True,
+                      capture_output=True, env=environment, timeout=15)
+    assert resumed.returncode == 0 and resumed.stdout == 'tree-reopen complete\n', (resumed, server.failures)
 
 
 def check_settings_and_model_switch(root, environment, server):
@@ -2751,6 +2896,7 @@ for line in sys.stdin:
             assert not (root / 'responses-uncommitted.txt').exists()
             check_https_proxy(root, environment, server)
             check_settings_and_model_switch(root, environment, server)
+            check_tree_navigation(root, environment, server)
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'

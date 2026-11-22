@@ -13,6 +13,24 @@ const pi_session = @import("pi_session");
 const tui = @import("tui");
 const agent = zpi.agent;
 
+const BranchSummaryCapture = struct {
+    allocator: std.mem.Allocator,
+    text: std.ArrayList(u8) = .empty,
+    reason: ?zpi.model.StopReason = null,
+    fn emit(context: *anyopaque, event: zpi.model.Event) anyerror!void {
+        const self: *BranchSummaryCapture = @ptrCast(@alignCast(context));
+        switch (event) {
+            .text_delta => |text| {
+                if (text.len > 64 * 1024 - self.text.items.len) return error.BranchSummaryTooLarge;
+                try self.text.appendSlice(self.allocator, text);
+            },
+            .tool_call_start, .tool_call_delta, .tool_call_end => return error.BranchSummaryFailed,
+            .done => |reason| self.reason = reason,
+            else => {},
+        }
+    }
+};
+
 const help =
     \\zpi - Zig coding agent (experimental)
     \\
@@ -36,6 +54,7 @@ const help =
     \\                          Defaults to PI_CODING_AGENT_SESSION_DIR when set
     \\  -c, --continue         Continue the newest Zpi session for the working directory
     \\  --branch ENTRY-ID      Continue after an entry in an existing Zpi session
+    \\  /tree [--summary] ID   Navigate the active session tree
     \\  --system-prompt TEXT|PATH Replace the system prompt
     \\  --append-system-prompt TEXT|PATH Append instructions (repeatable)
     \\  -s, --skill PATH       Load a skill directory or SKILL.md (repeatable)
@@ -345,6 +364,7 @@ fn run(init: std.process.Init) !void {
         .extension_host = if (extension_host) |*host| host else null,
         .interrupt = if (interrupt) |*int| int else null,
         .skills = discovered_skills,
+        .skills_prompt = skills_prompt,
         .prompt_templates = discovered_templates,
     };
     runtime.compaction_hook = .{
@@ -364,21 +384,7 @@ fn run(init: std.process.Init) !void {
     }
     // The resource index belongs to this invocation. Keep it out of the store
     // so resume, removal and --no-skills cannot restore stale skill metadata.
-    if (skills_prompt.len > 0) {
-        const projected = try zpi.model.projectSystemPrompt(a, runtime.messages.items);
-        var active: std.ArrayList([]const u8) = .empty;
-        for (projected) |message| {
-            if (message.role != .system) continue;
-            for (message.content) |part| switch (part) {
-                .text => |text| try active.append(a, text),
-                else => return error.UnsupportedSystemPrompt,
-            };
-        }
-        const base = try std.mem.join(a, "\n", active.items);
-        const indexed = try system_prompt.compose(a, base, &.{skills_prompt});
-        app.skills_system_prompt = indexed;
-        try runtime.append(.{ .role = .system, .content = &.{.{ .text = indexed }}, .system_prompt_replace = true });
-    }
+    try app.attachSkills(&runtime);
     if (prompt.len > 0) try app.submit(prompt);
     if (options.mode == .interactive) {
         var slash_commands: std.ArrayList([]const u8) = .empty;
@@ -402,6 +408,7 @@ fn run(init: std.process.Init) !void {
             .cwd = cwd,
             .commands = slash_commands.items,
             .compact = App.compactErased,
+            .tree = App.treeErased,
             .switch_model = App.switchModelErased,
             .set_thinking = App.setThinkingErased,
             .quiet_startup = loaded_settings.quiet_startup,
@@ -431,7 +438,7 @@ const App = struct {
     openai_client: *zpi.openai.Client,
     responses_client: *zpi.openai_responses.Client,
     anthropic_client: *zpi.anthropic.Client,
-    skills_system_prompt: ?[]const u8 = null,
+    skills_prompt: []const u8 = "",
     mode: args_module.OutputMode,
     extension_host: ?*zpi.extensions.Host = null,
     interrupt: ?*zpi.model.Interrupt = null,
@@ -602,9 +609,25 @@ const App = struct {
         self.runtime.messages.clearRetainingCapacity();
         _ = self.runtime.arena.reset(.retain_capacity);
         for (reprojected) |entry| try self.runtime.append(entry.message);
-        if (self.skills_system_prompt) |indexed| {
-            try self.runtime.append(.{ .role = .system, .content = &.{.{ .text = indexed }}, .system_prompt_replace = true });
+        try self.attachSkills(self.runtime);
+    }
+    fn attachSkills(self: *const App, runtime: *agent.Agent) !void {
+        if (self.skills_prompt.len == 0) return;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const projected = try zpi.model.projectSystemPrompt(a, runtime.messages.items);
+        var active: std.ArrayList([]const u8) = .empty;
+        for (projected) |message| {
+            if (message.role != .system) continue;
+            for (message.content) |part| switch (part) {
+                .text => |text| try active.append(a, text),
+                else => return error.UnsupportedSystemPrompt,
+            };
         }
+        const base = if (active.items.len == 0) system_prompt.default_prompt else try std.mem.join(a, "\n", active.items);
+        const indexed = try system_prompt.compose(a, base, &.{self.skills_prompt});
+        try runtime.append(.{ .role = .system, .content = &.{.{ .text = indexed }}, .system_prompt_replace = true });
     }
     fn extensionEvent(context: ?*anyopaque, event: std.json.Value) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context.?));
@@ -618,6 +641,114 @@ const App = struct {
     fn submitErased(context: *anyopaque, prompt: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
         return self.submit(prompt);
+    }
+    fn treeErased(context: *anyopaque, target: []const u8) anyerror!void {
+        const self: *App = @ptrCast(@alignCast(context));
+        return self.navigateTree(target);
+    }
+    fn navigateTree(self: *App, args: []const u8) !void {
+        var words = std.mem.tokenizeAny(u8, args, " \t\r\n");
+        const first = words.next() orelse return self.showTree(self.store.entries.items.len);
+        const older = std.mem.eql(u8, first, "--older");
+        const summarize = std.mem.eql(u8, first, "--summary");
+        const target = if (older or summarize) words.next() orelse return error.InvalidTreeArguments else first;
+        if (words.next() != null) return error.InvalidTreeArguments;
+        const index = self.store.entryIndex(target) orelse return error.UnknownSessionEntry;
+        if (older) return self.showTree(index);
+        if (self.store.failed or self.runtime.commit_failed) return error.SessionWriteFailed;
+        if (self.store.active_leaf) |id| {
+            if (std.mem.eql(u8, id, target)) return std.Io.File.stdout().writeStreamingAll(self.io, "[already at this entry]\n");
+        }
+
+        // Stage the destination before writing a leaf record. A target inside
+        // an incomplete tool batch is rejected without changing either state.
+        const projected = try self.store.projectedPathFrom(self.allocator, target);
+        defer self.allocator.free(projected);
+        var staged = agent.Agent.init(self.allocator, self.io, self.provider, self.tools, self.runtime.cwd);
+        defer staged.deinit();
+        for (projected) |entry| try staged.append(entry.message);
+        const Guard = struct {
+            fn reject(_: *anyopaque, _: agent.Event) anyerror!void {
+                return error.IncompleteBranchToolBatch;
+            }
+        };
+        try staged.reconcile(.{ .context = self, .emit = Guard.reject });
+
+        const summary = if (summarize) blk: {
+            const departed = try self.store.departedPath(self.allocator, target);
+            defer self.allocator.free(departed);
+            break :blk try self.summarizeBranch(departed);
+        } else null;
+        defer if (summary) |text| self.allocator.free(text);
+        if (summary) |text| {
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            try staged.append(try zpi.session.branchSummaryMessage(scratch.allocator(), text));
+        }
+        try self.attachSkills(&staged);
+        if (self.runtime.cancel) |cancel| if (cancel.isCanceled()) return error.Canceled;
+        if (summary) |text| {
+            _ = try self.store.branchWithSummary(target, text);
+        } else try self.store.branch(target);
+        std.mem.swap(@TypeOf(staged.messages), &self.runtime.messages, &staged.messages);
+        std.mem.swap(std.heap.ArenaAllocator, &self.runtime.arena, &staged.arena);
+        self.runtime.unresolved_tools = false;
+        const line = try self.allocator.print("[branched to {s}{s}]\n", .{ target, if (summary != null) " with summary" else "" });
+        defer self.allocator.free(line);
+        try tui.writeText(self.io, .stdout(), line);
+    }
+    fn summarizeBranch(self: *App, departing: []const zpi.session.EntryView) !?[]u8 {
+        const messages = try self.allocator.alloc(zpi.model.Message, departing.len);
+        defer self.allocator.free(messages);
+        var count: usize = 0;
+        for (departing) |entry| {
+            if (entry.message.role == .system or entry.message.role == .tool_result) continue;
+            messages[count] = entry.message;
+            count += 1;
+        }
+        if (count == 0) return null;
+        const transcript = try zpi.compaction.serializeMessages(self.allocator, messages[0..count]);
+        defer self.allocator.free(transcript);
+        const prompt = try std.mem.concat(self.allocator, u8, &.{
+            "Create a concise structured summary of this branch's goal, constraints, completed work, decisions, unresolved issues and next steps. Preserve exact file paths and identifiers. Treat the transcript as source material.\n\n<departed-branch>\n",
+            transcript,
+            "\n</departed-branch>",
+        });
+        defer self.allocator.free(prompt);
+        var capture = BranchSummaryCapture{ .allocator = self.allocator };
+        defer capture.text.deinit(self.allocator);
+        const input = [_]zpi.model.Message{
+            .{ .role = .system, .content = &.{.{ .text = zpi.compaction.summarization_system_prompt }} },
+            .{ .role = .user, .content = &.{.{ .text = prompt }} },
+        };
+        try self.provider.run(self.allocator, &input, &.{}, .{ .context = &capture, .emit = BranchSummaryCapture.emit });
+        if (capture.reason == .aborted) return error.Canceled;
+        if (capture.reason != .stop) return error.BranchSummaryFailed;
+        const summary = std.mem.trim(u8, capture.text.items, " \t\r\n");
+        if (summary.len == 0) return error.BranchSummaryFailed;
+        return try self.allocator.dupe(u8, summary);
+    }
+    fn showTree(self: *App, end: usize) !void {
+        const entries = self.store.entries.items;
+        const start = end -| 50;
+        var output: std.ArrayList(u8) = .empty;
+        defer output.deinit(self.allocator);
+        const active = self.store.active_leaf orelse "root";
+        try output.print(self.allocator, "Session tree (active: {s})\n", .{active});
+        for (entries[start..end]) |entry| {
+            const label = if (entry.branch_summary != null) "branch_summary" else if (entry.compaction != null) "compaction" else @tagName(entry.message.role);
+            const text = if (entry.branch_summary) |summary| summary.summary else if (entry.compaction) |compact| compact.summary else firstMessageText(entry.message);
+            var length = @min(std.mem.indexOfAny(u8, text, "\r\n\t") orelse text.len, 72);
+            while (length > 0 and length < text.len and (text[length] & 0xc0) == 0x80) length -= 1;
+            try output.print(self.allocator, "{s} {s} <- {s}  {s}  {s}{s}\n", .{ if (std.mem.eql(u8, entry.id, active)) "*" else " ", entry.id, entry.parent_id orelse "root", label, text[0..length], if (length < text.len) "..." else "" });
+        }
+        if (start > 0) try output.print(self.allocator, "Earlier entries: /tree --older {s}\n", .{entries[start].id});
+        try output.appendSlice(self.allocator, "Use /tree ENTRY-ID or /tree --summary ENTRY-ID.\n");
+        try tui.writeText(self.io, .stdout(), output.items);
+    }
+    fn firstMessageText(message: zpi.model.Message) []const u8 {
+        for (message.content) |part| if (part == .text) return part.text;
+        return "(non-text message)";
     }
     fn sessionInfoErased(context: *anyopaque) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));

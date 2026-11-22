@@ -20,10 +20,22 @@ pub const EntryView = struct {
     parent_id: ?[]const u8,
     message: model.Message,
     compaction: ?CompactionView = null,
+    branch_summary: ?BranchSummaryView = null,
 };
 
+pub const BranchSummaryView = struct {
+    from_id: []const u8,
+    summary: []const u8,
+};
+
+/// The caller supplies an arena for the synthetic message's content.
+pub fn branchSummaryMessage(a: std.mem.Allocator, summary: []const u8) !model.Message {
+    const text = try a.print("The following is a summary of a branch that this conversation came back from:\n\n<summary>\n{s}</summary>", .{summary});
+    return .{ .role = .user, .content = try a.dupe(model.Content, &.{.{ .text = text }}) };
+}
+
 const Record = struct {
-    type: enum { session, message, leaf, compaction },
+    type: enum { session, message, leaf, compaction, branch_summary },
     version: u32 = 1,
     format: []const u8 = "zpi",
     cwd: ?[]const u8 = null,
@@ -33,6 +45,7 @@ const Record = struct {
     summary: ?[]const u8 = null,
     first_kept_id: ?[]const u8 = null,
     tokens_before: ?u64 = null,
+    from_id: ?[]const u8 = null,
 };
 
 /// Publish a linear transcript under a new path after all records are written.
@@ -198,6 +211,51 @@ pub const Store = struct {
         const index = self.find(target) orelse return error.UnknownSessionEntry;
         return self.setLeaf(self.entries.items[index].id);
     }
+
+    /// Switch and attach a summary in one append, so interruption cannot
+    /// commit a leaf change while losing the summary intended for that branch.
+    pub fn branchWithSummary(self: *Store, target: []const u8, summary: []const u8) ![]const u8 {
+        if (self.failed) return error.SessionWriteFailed;
+        if (self.next_id == std.math.maxInt(u64)) return error.SessionIdExhausted;
+        if (std.mem.trim(u8, summary, " \t\r\n").len == 0 or !std.unicode.utf8ValidateSlice(summary)) return error.InvalidBranchSummary;
+        const from_id = self.active_leaf orelse return error.UnknownSessionEntry;
+        const target_index = self.find(target) orelse return error.UnknownSessionEntry;
+        const parent_id = self.entries.items[target_index].id;
+        if (std.mem.eql(u8, from_id, parent_id)) return error.SameSessionEntry;
+        const a = self.arena.allocator();
+        const id = try a.print("{x:0>16}", .{self.next_id});
+        const owned_summary = try a.dupe(u8, summary);
+        const entry = EntryView{
+            .id = id,
+            .parent_id = parent_id,
+            .message = try branchSummaryMessage(a, owned_summary),
+            .branch_summary = .{ .from_id = from_id, .summary = owned_summary },
+        };
+        try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+        try self.writeRecord(.{ .type = .branch_summary, .id = id, .parent_id = parent_id, .from_id = from_id, .summary = owned_summary });
+        self.entries.appendAssumeCapacity(entry);
+        self.id_index.putAssumeCapacityNoClobber(id, self.entries.items.len - 1);
+        self.next_id += 1;
+        self.active_leaf = id;
+        return id;
+    }
+
+    /// Entries on the old branch after the common ancestor, in chronological order.
+    pub fn departedPath(self: *const Store, a: std.mem.Allocator, target: []const u8) ![]EntryView {
+        const prior = try self.activePath(a);
+        defer a.free(prior);
+        const destination = try self.pathFrom(a, target);
+        defer a.free(destination);
+        var common: usize = 0;
+        while (common < @min(prior.len, destination.len) and std.mem.eql(u8, prior[common].id, destination[common].id)) : (common += 1) {}
+        return a.dupe(EntryView, prior[common..]);
+    }
+
+    pub fn entryIndex(self: *const Store, id: []const u8) ?usize {
+        return self.find(id);
+    }
+
     /// Record the active tip, including null to return to an empty root. Entries
     /// remain append-only; rollback changes only which branch supplies context.
     pub fn setLeaf(self: *Store, target: ?[]const u8) !void {
@@ -306,7 +364,7 @@ pub const Store = struct {
             const record = parsed.value;
             if (!std.mem.eql(u8, record.format, "zpi")) return error.UnsupportedSessionVersion;
             switch (record.type) {
-                .session, .leaf, .compaction => if (record.version != 1) return error.UnsupportedSessionVersion,
+                .session, .leaf, .compaction, .branch_summary => if (record.version != 1) return error.UnsupportedSessionVersion,
                 .message => {
                     if (record.version != 1 and record.version != 2) return error.UnsupportedSessionVersion;
                     if (record.message != null and record.message.?.system_prompt_replace != (record.version == 2)) return error.UnsupportedSystemPromptCheckpointVersion;
@@ -366,6 +424,31 @@ pub const Store = struct {
                             .first_kept_id = owned_kept,
                             .tokens_before = record.tokens_before orelse 0,
                         },
+                    };
+                    try self.entries.ensureUnusedCapacity(self.allocator, 1);
+                    try self.id_index.ensureUnusedCapacity(self.allocator, 1);
+                    self.entries.appendAssumeCapacity(entry);
+                    self.id_index.putAssumeCapacityNoClobber(entry.id, self.entries.items.len - 1);
+                    self.active_leaf = entry.id;
+                    self.next_id = @max(self.next_id, number + 1);
+                },
+                .branch_summary => {
+                    if (!header_seen) return error.MissingSessionHeader;
+                    const id = record.id orelse return error.InvalidSessionEntry;
+                    if (self.find(id) != null) return error.DuplicateSessionEntry;
+                    const number = std.fmt.parseInt(u64, id, 16) catch return error.InvalidSessionEntry;
+                    if (number == std.math.maxInt(u64)) return error.SessionIdExhausted;
+                    const parent = self.find(record.parent_id orelse return error.InvalidSessionEntry) orelse return error.UnknownParentEntry;
+                    const from = self.find(record.from_id orelse return error.InvalidSessionEntry) orelse return error.InvalidSessionEntry;
+                    const old_leaf = self.active_leaf orelse return error.InvalidSessionEntry;
+                    if (parent == from or !std.mem.eql(u8, self.entries.items[from].id, old_leaf)) return error.InvalidSessionEntry;
+                    const summary = record.summary orelse return error.InvalidSessionEntry;
+                    if (std.mem.trim(u8, summary, " \t\r\n").len == 0 or !std.unicode.utf8ValidateSlice(summary)) return error.InvalidSessionEntry;
+                    const entry = EntryView{
+                        .id = try self.arena.allocator().dupe(u8, id),
+                        .parent_id = self.entries.items[parent].id,
+                        .message = try branchSummaryMessage(self.arena.allocator(), summary),
+                        .branch_summary = .{ .from_id = self.entries.items[from].id, .summary = try self.arena.allocator().dupe(u8, summary) },
                     };
                     try self.entries.ensureUnusedCapacity(self.allocator, 1);
                     try self.id_index.ensureUnusedCapacity(self.allocator, 1);

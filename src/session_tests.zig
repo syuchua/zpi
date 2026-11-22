@@ -241,6 +241,70 @@ test "jsonl session reloads messages" {
     try std.testing.expectEqualStrings("hello", active[0].message.content[0].text);
 }
 
+test "tree branch summaries attach atomically to the selected user branch and survive reload" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/branch-summary.jsonl", .{&tmp.sub_path});
+    defer a.free(path);
+
+    var store = try session.Store.create(a, std.testing.io, path, "/workspace");
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    _ = try store.appendMessage(.{ .role = .system, .content = &.{.{ .text = "system" }} });
+    const target = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "target request" }} });
+    _ = try store.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "target answer" }} });
+    const old_user = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "explore alternative" }} });
+    _ = try store.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "alternative done" }} });
+
+    const departed = try store.departedPath(a, target);
+    defer a.free(departed);
+    try std.testing.expectEqual(@as(usize, 3), departed.len);
+    try std.testing.expectEqualStrings("target answer", departed[0].message.content[0].text);
+    try std.testing.expectEqualStrings("explore alternative", departed[1].message.content[0].text);
+    try std.testing.expectEqualStrings("alternative done", departed[2].message.content[0].text);
+
+    const original_leaf = store.active_leaf.?;
+    const summary_id = try a.dupe(u8, try store.branchWithSummary(target, "## Goal\nAlternative exploration"));
+    defer a.free(summary_id);
+    const old_path = try store.pathFrom(a, original_leaf);
+    defer a.free(old_path);
+    try std.testing.expectEqualStrings(summary_id, store.active_leaf.?);
+    try std.testing.expectEqualStrings(original_leaf, store.entries.items[store.entries.items.len - 1].branch_summary.?.from_id);
+    try std.testing.expectEqualStrings("## Goal\nAlternative exploration", store.entries.last().?.branch_summary.?.summary);
+
+    const active = try store.projectedActivePath(a);
+    defer a.free(active);
+    try std.testing.expectEqual(@as(usize, 3), active.len);
+    try std.testing.expectEqualStrings("target request", active[1].message.content[0].text);
+    try std.testing.expectEqualStrings("The following is a summary of a branch that this conversation came back from:\n\n<summary>\n## Goal\nAlternative exploration</summary>", active[2].message.content[0].text);
+    try std.testing.expectEqual(@as(usize, 5), old_path.len);
+    try std.testing.expectEqualStrings(old_user, old_path[3].id);
+    store.deinit();
+    store_open = false;
+
+    var reopened = try session.Store.open(a, std.testing.io, path);
+    defer reopened.deinit();
+    try std.testing.expectEqualStrings(summary_id, reopened.active_leaf.?);
+    const restored = try reopened.projectedActivePath(a);
+    defer a.free(restored);
+    try std.testing.expectEqual(@as(usize, 3), restored.len);
+    try std.testing.expect(restored[2].branch_summary != null);
+    try std.testing.expectEqualStrings("## Goal\nAlternative exploration", restored[2].branch_summary.?.summary);
+}
+
+test "tree summary rejects invalid and converged navigation without changing the active leaf" {
+    const a = std.testing.allocator;
+    var store = session.Store.memory(a, std.testing.io);
+    defer store.deinit();
+    const root = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "root" }} });
+    _ = try store.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "answer" }} });
+    const tip = store.active_leaf.?;
+    try std.testing.expectError(error.SameSessionEntry, store.branchWithSummary(tip, "summary"));
+    try std.testing.expectError(error.InvalidBranchSummary, store.branchWithSummary(root, "  "));
+    try std.testing.expectEqualStrings(tip, store.active_leaf.?);
+}
+
 test "compaction entries persist project kept span preserve system prompt and keep raw branch intact" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
