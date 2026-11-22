@@ -348,6 +348,46 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if self.path == '/queue-fixture/chat/completions':
+                user = [m['content'] for m in request['messages'] if m['role'] == 'user'][-1]
+                self.server.queue_requests.append(user)
+                if user == 'queue-slow':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.end_headers()
+                    chunk1 = {'choices': [{'index': 0, 'delta': {'content': 'working...'}}]}
+                    self.wfile.write(('data: ' + json.dumps(chunk1) + '\n\n').encode())
+                    self.wfile.flush()
+                    assert self.server.queue_stream_mid.wait(timeout=10)
+                    chunk2 = {'choices': [{'index': 0, 'delta': {'content': ' mid\n'}}]}
+                    self.wfile.write(('data: ' + json.dumps(chunk2) + '\n\n').encode())
+                    self.wfile.flush()
+                    assert self.server.queue_stream_release.wait(timeout=10)
+                    chunk3 = {'choices': [{'index': 0, 'delta': {'content': 'done'}, 'finish_reason': 'stop'}]}
+                    self.wfile.write(('data: ' + json.dumps(chunk3) + '\n\ndata: [DONE]\n\n').encode())
+                    self.wfile.flush()
+                    return
+                if user == 'queue-cancel-stream':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.end_headers()
+                    partial = {'choices': [{'index': 0, 'delta': {'content': 'cancel-partial-'}}]}
+                    self.wfile.write(('data: ' + json.dumps(partial) + '\n\n').encode())
+                    self.wfile.flush()
+                    self.server.queue_cancel_release.wait(timeout=10)
+                    return
+                reply = {
+                    'queued-edited': 'queued-edited complete',
+                    'queued-beta': 'queued-beta complete',
+                    'unsubmitted draft': 'draft complete',
+                }[user]
+                data = ('data: ' + json.dumps(self.text(reply)) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/v1/chat/completions':
                 assert request['max_tokens'] == 3000
             else:
@@ -1536,6 +1576,150 @@ def check_tree_navigation(root, environment, server):
     assert resumed.returncode == 0 and resumed.stdout == 'tree-reopen complete\n', (resumed, server.failures)
 
 
+def check_queued_followup_editing(root, environment, server):
+    agent_dir = root / 'queue-agent'
+    agent_dir.mkdir()
+    (agent_dir / 'models.json').write_text(json.dumps({'providers': {'queue-fixture': {
+        'api': 'openai-completions',
+        'baseUrl': f'http://127.0.0.1:{server.server_port}/queue-fixture',
+        'apiKey': 'queue-key',
+        'models': [{'id': 'queue-model'}],
+    }}}))
+    session = root / 'queue-session.jsonl'
+    env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm')
+    args = [str(BINARY), '--no-proxy', '--provider', 'queue-fixture', '--session', str(session)]
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
+    term_before = termios.tcgetattr(slave)
+
+    def become_tty_leader():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    process = subprocess.Popen(
+        args, cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave,
+        close_fds=True, preexec_fn=become_tty_leader,
+    )
+    os.close(slave)
+    transcript = bytearray()
+
+    def expect(marker, start=0):
+        deadline = time.monotonic() + 10
+        while transcript.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('queued follow-up PTY timed out', marker, bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    raise AssertionError(('PTY exited early', marker, bytes(transcript[start:]))) from exc
+                raise
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+        return transcript.find(marker, start)
+
+    try:
+        prompt_ready = b'\x1b[?2004h'
+        expect(prompt_ready)
+
+        # 1. Start a streaming turn; no live prompt overlay renders until user types.
+        start = len(transcript)
+        os.write(master, b'queue-slow\n')
+        end = expect(b'working...', start)
+        assert b'> ' not in transcript[start:end + len(b'working...')], transcript[start:]
+
+        # 2. Type a live draft while streaming; mid-stream output preserves the draft cleanly.
+        prompt_marker = b'\x1b[36m>\x1b[0m '
+        start = len(transcript)
+        os.write(master, b'first follow')
+        expect(prompt_marker + b'first follow', start)
+        start = len(transcript)
+        server.queue_stream_mid.set()
+        expect(b'working... mid', start)
+        expect(prompt_marker + b'first follow', start)
+
+        # 3. Queue two follow-up messages with Enter, then restore with Alt+Up and clear with Esc.
+        start = len(transcript)
+        os.write(master, b'\r')
+        expect(b'[queued 1] first follow', start)
+        expect(b'Alt+Up edit queued', start)
+        assert server.queue_requests == ['queue-slow'], server.queue_requests
+
+        start = len(transcript)
+        os.write(master, b'second follow\r')
+        expect(b'[queued 2] second follow', start)
+
+        start = len(transcript)
+        os.write(master, b'\x1b[1;3A')
+        expect(prompt_marker + b'first follow\r\n  \r\n  second follow', start)
+
+        # Bare Esc clears draft; re-queue two items and leave an unsubmitted draft.
+        os.write(master, b'\x1b')
+        time.sleep(0.05)
+        start = len(transcript)
+        os.write(master, b'queued-edited\r')
+        expect(b'[queued 1] queued-edited', start)
+        start = len(transcript)
+        os.write(master, b'queued-beta\r')
+        expect(b'[queued 2] queued-beta', start)
+        start = len(transcript)
+        os.write(master, b'unsubmitted draft')
+        expect(prompt_marker + b'unsubmitted draft', start)
+
+        # 4. Finish active turn: queued items drain in order and unsubmitted draft remains editable.
+        start = len(transcript)
+        server.queue_stream_release.set()
+        expect(b'done', start)
+        expect(b'queued-edited complete', start)
+        expect(b'queued-beta complete', start)
+        expect(prompt_marker + b'unsubmitted draft', start)
+        assert server.queue_requests == ['queue-slow', 'queued-edited', 'queued-beta'], server.queue_requests
+
+        # 5. Submit the preserved draft from the idle prompt.
+        start = len(transcript)
+        os.write(master, b'\r')
+        expect(b'draft complete', start)
+        expect(prompt_ready, start)
+
+        # 6. Canceling a busy turn restores queued follow-ups to the idle prompt without sending them.
+        start = len(transcript)
+        os.write(master, b'queue-cancel-stream\n')
+        expect(b'cancel-partial-', start)
+        start = len(transcript)
+        os.write(master, b'saved-after-cancel\r')
+        expect(b'[queued 1] saved-after-cancel', start)
+        start = len(transcript)
+        os.write(master, b'\x03')
+        expect(b'zpi: Canceled', start)
+        expect(prompt_marker + b'saved-after-cancel', start)
+        server.queue_cancel_release.set()
+        assert server.queue_requests == [
+            'queue-slow', 'queued-edited', 'queued-beta', 'unsubmitted draft', 'queue-cancel-stream',
+        ], server.queue_requests
+
+        # Discard restored draft with Ctrl-C, then exit cleanly.
+        start = len(transcript)
+        os.write(master, b'\x03')
+        expect(prompt_ready, start)
+        os.write(master, b'/exit\n')
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+        term_after = termios.tcgetattr(master)
+        term_after[3] &= ~getattr(termios, 'PENDIN', 0)
+        term_before[3] &= ~getattr(termios, 'PENDIN', 0)
+        assert term_after == term_before
+    finally:
+        server.queue_stream_mid.set()
+        server.queue_stream_release.set()
+        server.queue_cancel_release.set()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master)
+
+
 def check_settings_and_model_switch(root, environment, server):
     agent_dir = root / 'settings-agent'
     agent_dir.mkdir()
@@ -1898,6 +2082,10 @@ def main():
     server.retry_request_count = 0
     server.responses_retry_count = 0
     server.cancel_stream_release = threading.Event()
+    server.queue_requests = []
+    server.queue_stream_mid = threading.Event()
+    server.queue_stream_release = threading.Event()
+    server.queue_cancel_release = threading.Event()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -2991,6 +3179,7 @@ for line in sys.stdin:
             check_https_proxy(root, environment, server)
             check_settings_and_model_switch(root, environment, server)
             check_tree_navigation(root, environment, server)
+            check_queued_followup_editing(root, environment, server)
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'

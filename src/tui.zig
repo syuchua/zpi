@@ -7,6 +7,12 @@ const agent = @import("agent");
 
 pub const max_prompt_bytes: usize = 64 * 1024;
 const max_history_entries: usize = 200;
+const max_queued_followups: usize = 32;
+
+pub const LiveWriter = struct {
+    context: *anyopaque,
+    write_segment: *const fn (*anyopaque, []const u8, []const u8, []const u8) anyerror!void,
+};
 
 pub const TreeItem = struct {
     id: []const u8,
@@ -33,6 +39,8 @@ pub const Submit = struct {
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
     cancel: ?agent.model.Cancel = null,
     reset_cancel: ?*const fn (*anyopaque) void = null,
+    trigger_cancel: ?*const fn (*anyopaque) void = null,
+    set_live_writer: ?*const fn (*anyopaque, ?LiveWriter) void = null,
     allocator: std.mem.Allocator = std.heap.page_allocator,
     cwd: ?[]const u8 = null,
     commands: []const []const u8 = &.{},
@@ -108,6 +116,57 @@ const InputQueue = struct {
     fn readByte(self: *InputQueue, fd: std.posix.fd_t, cancel: ?agent.model.Cancel) !?u8 {
         return self.readByteTimeout(fd, cancel, -1);
     }
+
+    fn readByteWithWake(self: *InputQueue, fd: std.posix.fd_t, wake: agent.model.Cancel, timeout_ms: i32) !?u8 {
+        if (wake.isCanceled()) return null;
+        if (self.start < self.end) {
+            const b = self.buf[self.start];
+            self.start += 1;
+            return b;
+        }
+        if (self.eof) {
+            if (wake.poll_fd) |wake_fd| {
+                var fds = [_]std.posix.pollfd{.{ .fd = wake_fd, .events = std.posix.POLL.IN, .revents = 0 }};
+                _ = std.posix.poll(&fds, timeout_ms) catch {};
+            }
+            return null;
+        }
+        var pollfds: [2]std.posix.pollfd = undefined;
+        var nfds: usize = 1;
+        pollfds[0] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+        if (wake.poll_fd) |wake_fd| {
+            pollfds[1] = .{ .fd = wake_fd, .events = std.posix.POLL.IN, .revents = 0 };
+            nfds = 2;
+        }
+        while (true) {
+            const ready = std.posix.poll(pollfds[0..nfds], timeout_ms) catch |err| switch (err) {
+                else => return err,
+            };
+            if (wake.isCanceled() or (nfds == 2 and (pollfds[1].revents & std.posix.POLL.IN) != 0)) {
+                return null;
+            }
+            if (ready == 0) return null;
+            if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
+                const n = std.posix.read(fd, &self.buf) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        pollfds[0].revents = 0;
+                        if (nfds == 2) pollfds[1].revents = 0;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (n == 0) {
+                    self.eof = true;
+                    return null;
+                }
+                self.start = 1;
+                self.end = n;
+                return self.buf[0];
+            }
+            pollfds[0].revents = 0;
+            if (nfds == 2) pollfds[1].revents = 0;
+        }
+    }
 };
 
 const History = struct {
@@ -144,22 +203,40 @@ pub fn run(io: std.Io, submit: Submit) !void {
     var queue = InputQueue{};
     var history = History{ .allocator = submit.allocator };
     defer history.deinit();
+    var followups: std.ArrayList([]u8) = .empty;
+    defer {
+        for (followups.items) |item| submit.allocator.free(item);
+        followups.deinit(submit.allocator);
+    }
+    var carried_draft: ?[]u8 = null;
+    defer if (carried_draft) |draft| submit.allocator.free(draft);
 
     while (true) {
         if (submit.reset_cancel) |reset| reset(submit.context);
-        const prompt_prefix = if (color) "\x1b[36m>\x1b[0m " else "> ";
-        try output.writeStreamingAll(io, prompt_prefix);
-        const raw = readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, color) catch |err| switch (err) {
-            error.Canceled => {
-                try output.writeStreamingAll(io, "\n");
-                continue;
-            },
-            error.StreamTooLong => {
-                try std.Io.File.stderr().writeStreamingAll(io, "zpi: prompt exceeds 64 KiB; discarded\n");
-                continue;
-            },
-            else => return err,
-        } orelse return;
+        const raw = if (followups.items.len > 0) blk: {
+            const next = followups.orderedRemove(0);
+            try output.writeStreamingAll(io, if (color) "\x1b[36m>\x1b[0m " else "> ");
+            try writeText(io, output, next);
+            try output.writeStreamingAll(io, "\n");
+            break :blk next;
+        } else blk: {
+            const initial = carried_draft;
+            carried_draft = null;
+            defer if (initial) |draft| submit.allocator.free(draft);
+            const prompt_prefix = if (color) "\x1b[36m>\x1b[0m " else "> ";
+            try output.writeStreamingAll(io, prompt_prefix);
+            break :blk readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, color, initial) catch |err| switch (err) {
+                error.Canceled => {
+                    try output.writeStreamingAll(io, "\n");
+                    continue;
+                },
+                error.StreamTooLong => {
+                    try std.Io.File.stderr().writeStreamingAll(io, "zpi: prompt exceeds 64 KiB; discarded\n");
+                    continue;
+                },
+                else => return err,
+            } orelse return;
+        };
         defer submit.allocator.free(raw);
 
         const text = std.mem.trim(u8, raw, " \t\r\n");
@@ -171,7 +248,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
             continue;
         }
         if (std.mem.eql(u8, text, "/hotkeys")) {
-            try output.writeStreamingAll(io, "Keyboard shortcuts\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\n/model    List or switch model (/model [provider/id])\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Pick a branch (Up/Down, Enter, Esc); /tree --list prints IDs\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+            try output.writeStreamingAll(io, "Keyboard shortcuts\nEnter     Submit prompt (or queue follow-up while busy)\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\nAlt+Up    Edit queued follow-up messages\nEsc       Clear draft while busy / cancel /tree picker\n/model    List or switch model (/model [provider/id])\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Pick a branch (Up/Down, Enter, Esc); /tree --list prints IDs\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
             continue;
         }
         if (std.mem.eql(u8, text, "/model") or std.mem.startsWith(u8, text, "/model ")) {
@@ -210,6 +287,10 @@ pub fn run(io: std.Io, submit: Submit) !void {
                     const choice = selectTree(io, input.handle, output, &queue, submit, tree) catch |err| switch (err) {
                         error.Canceled => {
                             queue.start = queue.end;
+                            const prev_draft = carried_draft;
+                            carried_draft = null;
+                            defer if (prev_draft) |d| submit.allocator.free(d);
+                            carried_draft = try buildCarriedDraft(submit.allocator, &followups, prev_draft orelse "");
                             continue;
                         },
                         else => return err,
@@ -247,11 +328,15 @@ pub fn run(io: std.Io, submit: Submit) !void {
             if (submit.session_info) |show| try show(submit.context);
             continue;
         }
-        submit.run(submit.context, text) catch |err| {
-            var msg: [256]u8 = undefined;
-            const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-            try std.Io.File.stderr().writeStreamingAll(io, line);
-        };
+        if (color and submit.set_live_writer != null) {
+            try runTurnWithLiveEditor(io, input.handle, output, &queue, &history, submit, text, &followups, &carried_draft, color);
+        } else {
+            submit.run(submit.context, text) catch |err| {
+                var msg: [256]u8 = undefined;
+                const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
+                try std.Io.File.stderr().writeStreamingAll(io, line);
+            };
+        }
     }
 }
 
@@ -795,7 +880,7 @@ fn computeLayout(text: []const u8, cursor: usize, cols_raw: usize, prompt_cols: 
 
 const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
-fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Submit, cols: usize, color: bool) !bool {
+fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
     // Identify token immediately before cursor (bounded by whitespace).
     var token_start = editor.cursor;
     while (token_start > 0 and !std.ascii.isWhitespace(editor.buf.items[token_start - 1])) : (token_start -= 1) {}
@@ -868,6 +953,7 @@ fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Subm
     }
 
     // Second Tab on the same ambiguous prefix prints candidate list below prompt.
+    if (!allow_list) return false;
     const same_prefix = if (editor.last_tab_prefix) |prev| std.mem.eql(u8, prev, token) else false;
     if (!same_prefix) {
         editor.resetCompletionTrack();
@@ -934,6 +1020,7 @@ fn readPromptLine(
     history: *const History,
     submit: Submit,
     color: bool,
+    initial: ?[]const u8,
 ) anyerror!?[]u8 {
     if (submit.cancel) |token| {
         if (token.isCanceled()) return error.Canceled;
@@ -950,6 +1037,12 @@ fn readPromptLine(
     var in_paste = false;
     var cols = terminalColumns(io, output);
     var dirty = false;
+    if (initial) |text| {
+        if (text.len > 0) {
+            try editor.insertSlice(text);
+            dirty = true;
+        }
+    }
 
     while (true) {
         if (dirty and !queue.hasBuffered()) {
@@ -1039,7 +1132,7 @@ fn readPromptLine(
             '\t' => {
                 if (!in_paste) {
                     cols = terminalColumns(io, output);
-                    if (try handleTab(&editor, io, output, submit, cols, color)) dirty = true;
+                    if (try handleTab(&editor, io, output, submit, cols, color, true)) dirty = true;
                 } else {
                     try editor.insertSlice("\t");
                     dirty = true;
@@ -1220,15 +1313,689 @@ test "editor UTF-8 insertion cursor movement deletion and history navigation" {
 }
 
 test "computeLayout tracks wide characters newlines and wrapping" {
-    const l1 = computeLayout("你好\nab", 7, 10, 2);
-    // "你好" takes 4 cols on row 0 (after 2-col "> "), "\n" moves to row 1 col 2, "ab" adds 2 cols -> col 4.
+    const l1 = computeLayout("你好\nab", 6, 10, 2);
+    // "你好" (6 bytes, 4 cols) ends at row 0 col 6 (after 2-col "> "), "\n" moves to row 1 col 2, "ab" adds 2 cols -> col 4.
     try std.testing.expectEqual(@as(usize, 0), l1.cursor_row);
     try std.testing.expectEqual(@as(usize, 6), l1.cursor_col);
     try std.testing.expectEqual(@as(usize, 1), l1.end_row);
     try std.testing.expectEqual(@as(usize, 4), l1.end_col);
 
+    const l1_after = computeLayout("你好\nab", 7, 10, 2);
+    try std.testing.expectEqual(@as(usize, 1), l1_after.cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), l1_after.cursor_col);
+
     const l2 = computeLayout("abcdef", 6, 6, 2);
     // 2 + 4 = 6 wraps at col 6 onto row 1, then "ef" lands at col 2.
     try std.testing.expectEqual(@as(usize, 1), l2.cursor_row);
     try std.testing.expectEqual(@as(usize, 2), l2.cursor_col);
+}
+
+const LiveScreen = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: std.Io.File,
+    color: bool,
+    mutex: std.Io.Mutex = .init,
+    pending_line: std.ArrayList(u8) = .empty,
+    overlay_bytes: std.ArrayList(u8) = .empty,
+    overlay_cursor_row: usize = 0,
+    overlay_cols: usize = 80,
+    overlay_active: bool = false,
+
+    const max_pending_line_bytes: usize = 4096;
+
+    fn init(allocator: std.mem.Allocator, io: std.Io, output: std.Io.File, color: bool) LiveScreen {
+        return .{ .allocator = allocator, .io = io, .output = output, .color = color };
+    }
+
+    fn deinit(self: *LiveScreen) void {
+        self.pending_line.deinit(self.allocator);
+        self.overlay_bytes.deinit(self.allocator);
+    }
+
+    fn writer(self: *LiveScreen) LiveWriter {
+        return .{ .context = self, .write_segment = writeSegmentErased };
+    }
+
+    fn writeSegmentErased(context: *anyopaque, prefix: []const u8, safe: []const u8, suffix: []const u8) anyerror!void {
+        const self: *LiveScreen = @ptrCast(@alignCast(context));
+        return self.writeSegment(prefix, safe, suffix);
+    }
+
+    fn writeSegment(self: *LiveScreen, prefix: []const u8, safe: []const u8, suffix: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(self.allocator);
+
+        if (self.overlay_active) {
+            const p_rows = if (self.pending_line.items.len > 0) pendingLineRows(self.pending_line.items, self.overlay_cols) else 0;
+            const move_up = self.overlay_cursor_row + (if (self.pending_line.items.len > 0) 1 + p_rows else 0);
+            if (move_up > 0) try frame.print(self.allocator, "\x1b[{d}A", .{move_up});
+            try frame.appendSlice(self.allocator, "\r\x1b[J");
+            if (self.pending_line.items.len > 0) try frame.appendSlice(self.allocator, self.pending_line.items);
+            self.overlay_active = false;
+        }
+
+        const chunk_start = frame.items.len;
+        if (prefix.len > 0) try frame.appendSlice(self.allocator, prefix);
+        if (safe.len > 0) try appendSanitizedText(&frame, self.allocator, safe);
+        if (suffix.len > 0) try frame.appendSlice(self.allocator, suffix);
+        try updatePendingLine(&self.pending_line, self.allocator, frame.items[chunk_start..]);
+
+        if (self.overlay_bytes.items.len > 0) {
+            if (self.pending_line.items.len > 0) try frame.appendSlice(self.allocator, "\r\n");
+            try frame.appendSlice(self.allocator, self.overlay_bytes.items);
+            self.overlay_active = true;
+        }
+
+        if (frame.items.len > 0) try self.output.writeStreamingAll(self.io, frame.items);
+    }
+
+    fn updateOverlay(self: *LiveScreen, new_bytes: []const u8, new_cursor_row: usize, cols: usize) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var frame: std.ArrayList(u8) = .empty;
+        defer frame.deinit(self.allocator);
+
+        if (self.overlay_active) {
+            if (new_bytes.len == 0) {
+                const p_rows = if (self.pending_line.items.len > 0) pendingLineRows(self.pending_line.items, self.overlay_cols) else 0;
+                const move_up = self.overlay_cursor_row + (if (self.pending_line.items.len > 0) 1 + p_rows else 0);
+                if (move_up > 0) try frame.print(self.allocator, "\x1b[{d}A", .{move_up});
+                try frame.appendSlice(self.allocator, "\r\x1b[J");
+                if (self.pending_line.items.len > 0) try frame.appendSlice(self.allocator, self.pending_line.items);
+                self.overlay_active = false;
+            } else if (cols != self.overlay_cols) {
+                try frame.appendSlice(self.allocator, "\r\n");
+                self.pending_line.clearRetainingCapacity();
+                try frame.appendSlice(self.allocator, new_bytes);
+                self.overlay_active = true;
+            } else {
+                if (self.overlay_cursor_row > 0) try frame.print(self.allocator, "\x1b[{d}A", .{self.overlay_cursor_row});
+                try frame.appendSlice(self.allocator, "\r\x1b[J");
+                try frame.appendSlice(self.allocator, new_bytes);
+                self.overlay_active = true;
+            }
+        } else if (new_bytes.len > 0) {
+            if (self.pending_line.items.len > 0) try frame.appendSlice(self.allocator, "\r\n");
+            try frame.appendSlice(self.allocator, new_bytes);
+            self.overlay_active = true;
+        }
+
+        self.overlay_bytes.clearRetainingCapacity();
+        try self.overlay_bytes.appendSlice(self.allocator, new_bytes);
+        self.overlay_cursor_row = new_cursor_row;
+        self.overlay_cols = cols;
+
+        if (frame.items.len > 0) try self.output.writeStreamingAll(self.io, frame.items);
+    }
+
+    fn clearOverlay(self: *LiveScreen) !void {
+        try self.updateOverlay(&.{}, 0, self.overlay_cols);
+    }
+};
+
+fn appendSanitizedText(out: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) !void {
+    var start: usize = 0;
+    for (text, 0..) |byte, i| {
+        if ((byte < 0x20 and byte != '\n' and byte != '\t') or byte == 0x7f) {
+            try out.appendSlice(a, text[start..i]);
+            try out.append(a, '?');
+            start = i + 1;
+        }
+    }
+    try out.appendSlice(a, text[start..]);
+}
+
+fn updatePendingLine(pending: *std.ArrayList(u8), a: std.mem.Allocator, chunk: []const u8) !void {
+    if (chunk.len == 0) return;
+    if (std.mem.lastIndexOfScalar(u8, chunk, '\n')) |nl| {
+        pending.clearRetainingCapacity();
+        const tail = chunk[nl + 1 ..];
+        if (tail.len <= LiveScreen.max_pending_line_bytes) try pending.appendSlice(a, tail);
+        return;
+    }
+    if (pending.items.len + chunk.len > LiveScreen.max_pending_line_bytes) {
+        pending.clearRetainingCapacity();
+        return;
+    }
+    try pending.appendSlice(a, chunk);
+}
+
+fn pendingLineRows(line: []const u8, cols_raw: usize) usize {
+    const cols = @max(cols_raw, 4);
+    var row: usize = 0;
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < line.len) {
+        if (line[i] == '\x1b' and i + 1 < line.len and line[i + 1] == '[') {
+            var j = i + 2;
+            while (j < line.len and !(line[j] >= 0x40 and line[j] <= 0x7e)) : (j += 1) {}
+            i = if (j < line.len) j + 1 else line.len;
+            continue;
+        }
+        if (line[i] == '\r') {
+            col = 0;
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+        const step = @min(len, line.len - i);
+        const cp = std.unicode.utf8Decode(line[i .. i + step]) catch 0xFFFD;
+        const w: usize = if (line[i] == '\t') 4 else codepointWidth(cp);
+        if (col + w > cols) {
+            row += 1;
+            col = w;
+        } else {
+            col += w;
+        }
+        i += step;
+    }
+    return row;
+}
+
+fn renderLiveOverlayFrame(
+    allocator: std.mem.Allocator,
+    editor: *const EditorState,
+    followups: []const []const u8,
+    cols_raw: usize,
+    color: bool,
+) !struct { bytes: []u8, cursor_row: usize } {
+    if (followups.len == 0 and editor.buf.items.len == 0) {
+        return .{ .bytes = try allocator.alloc(u8, 0), .cursor_row = 0 };
+    }
+    const cols = @max(cols_raw, 4);
+    const max_preview_cols = @max(1, cols -| 1);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var rows_above: usize = 0;
+    if (followups.len > 0) {
+        const shown = @min(followups.len, 4);
+        for (followups[0..shown], 1..) |item, idx| {
+            var label_buf: [32]u8 = undefined;
+            const label = try std.fmt.bufPrint(&label_buf, "[queued {d}] ", .{idx});
+            if (color) try out.appendSlice(allocator, "\x1b[2m");
+            const used = try appendTreeText(&out, allocator, label, max_preview_cols);
+            _ = try appendTreeText(&out, allocator, item, max_preview_cols -| used);
+            if (color) try out.appendSlice(allocator, "\x1b[0m");
+            if (idx < shown or followups.len > shown or editor.buf.items.len > 0) {
+                try out.appendSlice(allocator, "\r\n");
+                rows_above += 1;
+            }
+        }
+        if (followups.len > shown) {
+            var more_buf: [48]u8 = undefined;
+            const more = try std.fmt.bufPrint(&more_buf, "  (+{d} more queued)", .{followups.len - shown});
+            if (color) try out.appendSlice(allocator, "\x1b[2m");
+            _ = try appendTreeText(&out, allocator, more, max_preview_cols);
+            if (color) try out.appendSlice(allocator, "\x1b[0m");
+            if (editor.buf.items.len > 0) {
+                try out.appendSlice(allocator, "\r\n");
+                rows_above += 1;
+            }
+        }
+        if (editor.buf.items.len == 0) {
+            try out.appendSlice(allocator, "\r\n");
+            rows_above += 1;
+            if (color) try out.appendSlice(allocator, "\x1b[2m");
+            _ = try appendTreeText(&out, allocator, "  Alt+Up edit queued", max_preview_cols);
+            if (color) try out.appendSlice(allocator, "\x1b[0m");
+            return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above };
+        }
+    }
+
+    try out.appendSlice(allocator, if (color) "\x1b[36m>\x1b[0m " else "> ");
+    const layout = computeLayout(editor.buf.items, editor.cursor, cols, 2);
+    try appendSafeTerminalBytes(&out, allocator, editor.buf.items);
+    if (layout.end_row > layout.cursor_row) {
+        try out.print(allocator, "\x1b[{d}A", .{layout.end_row - layout.cursor_row});
+    }
+    if (layout.end_col != layout.cursor_col or layout.end_row != layout.cursor_row) {
+        try out.append(allocator, '\r');
+        if (layout.cursor_col > 0) try out.print(allocator, "\x1b[{d}C", .{layout.cursor_col});
+    }
+    return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above + layout.cursor_row };
+}
+
+fn restoreFollowupsToEditor(editor: *EditorState, followups: *std.ArrayList([]u8), allocator: std.mem.Allocator) !void {
+    if (followups.items.len == 0) return;
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(allocator);
+    for (followups.items, 0..) |item, i| {
+        if (i > 0) try combined.appendSlice(allocator, "\n\n");
+        try combined.appendSlice(allocator, item);
+    }
+    if (editor.buf.items.len > 0) {
+        try combined.appendSlice(allocator, "\n\n");
+        try combined.appendSlice(allocator, editor.buf.items);
+    }
+    if (combined.items.len > max_prompt_bytes) return error.StreamTooLong;
+    try editor.replaceBuffer(combined.items);
+    for (followups.items) |item| allocator.free(item);
+    followups.clearRetainingCapacity();
+}
+
+fn buildCarriedDraft(allocator: std.mem.Allocator, followups: *std.ArrayList([]u8), draft: []const u8) !?[]u8 {
+    if (followups.items.len == 0 and draft.len == 0) return null;
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(allocator);
+    for (followups.items, 0..) |item, i| {
+        if (i > 0) try combined.appendSlice(allocator, "\n\n");
+        try combined.appendSlice(allocator, item);
+    }
+    if (draft.len > 0) {
+        if (combined.items.len > 0) try combined.appendSlice(allocator, "\n\n");
+        try combined.appendSlice(allocator, draft);
+    }
+    for (followups.items) |item| allocator.free(item);
+    followups.clearRetainingCapacity();
+    if (combined.items.len == 0) return null;
+    if (combined.items.len > max_prompt_bytes) combined.items.len = max_prompt_bytes;
+    return try combined.toOwnedSlice(allocator);
+}
+
+fn runTurnWithLiveEditor(
+    io: std.Io,
+    input_fd: std.posix.fd_t,
+    output: std.Io.File,
+    queue: *InputQueue,
+    history: *History,
+    submit: Submit,
+    text: []const u8,
+    followups: *std.ArrayList([]u8),
+    carried_draft: *?[]u8,
+    color: bool,
+) !void {
+    const orig_term = try enterRawMode(input_fd);
+    defer std.posix.tcsetattr(input_fd, .NOW, orig_term) catch {};
+
+    try output.writeStreamingAll(io, "\x1b[?2004h");
+    defer output.writeStreamingAll(io, "\x1b[?2004l") catch {};
+
+    var done = try agent.model.Interrupt.init();
+    defer done.deinit(io);
+
+    var screen = LiveScreen.init(submit.allocator, io, output, color);
+    defer screen.deinit();
+
+    submit.set_live_writer.?(submit.context, screen.writer());
+    defer submit.set_live_writer.?(submit.context, null);
+
+    var editor = EditorState{ .allocator = submit.allocator };
+    defer editor.deinit();
+    if (carried_draft.*) |draft| {
+        if (draft.len > 0) try editor.insertSlice(draft);
+        submit.allocator.free(draft);
+        carried_draft.* = null;
+    }
+
+    const WorkerState = struct {
+        submit: Submit,
+        text: []const u8,
+        done: *agent.model.Interrupt,
+        err: ?anyerror = null,
+        fn run(state: *@This()) void {
+            state.submit.run(state.submit.context, state.text) catch |e| {
+                state.err = e;
+            };
+            state.done.trigger();
+        }
+    };
+    var worker = WorkerState{ .submit = submit, .text = text, .done = &done };
+    var thread = try std.Thread.spawn(.{}, WorkerState.run, .{&worker});
+    var joined = false;
+    errdefer if (!joined) {
+        if (submit.trigger_cancel) |trig| trig(submit.context);
+        thread.join();
+    };
+
+    var in_paste = false;
+    var cols = terminalColumns(io, output);
+    var dirty = followups.items.len > 0 or editor.buf.items.len > 0;
+    const wake = done.cancel();
+
+    while (true) {
+        if (done.isCanceled()) break;
+        const current_cols = terminalColumns(io, output);
+        if ((dirty or current_cols != cols) and !queue.hasBuffered()) {
+            cols = current_cols;
+            const rendered = try renderLiveOverlayFrame(submit.allocator, &editor, followups.items, cols, color);
+            defer submit.allocator.free(rendered.bytes);
+            try screen.updateOverlay(rendered.bytes, rendered.cursor_row, cols);
+            dirty = false;
+        }
+        const b_opt = try queue.readByteWithWake(input_fd, wake, 100);
+        if (done.isCanceled()) break;
+        const b = b_opt orelse continue;
+
+        switch (b) {
+            0x03 => {
+                if (submit.trigger_cancel) |trig| trig(submit.context);
+            },
+            0x04 => {
+                if (editor.buf.items.len > 0) {
+                    editor.deleteAtCursor();
+                    dirty = true;
+                }
+            },
+            '\r', '\n' => {
+                if (in_paste) {
+                    try editor.insertSlice("\n");
+                    dirty = true;
+                    continue;
+                }
+                if (editor.cursor == editor.buf.items.len and editor.buf.items.len > 0 and editor.buf.items[editor.buf.items.len - 1] == '\\') {
+                    editor.buf.items.len -= 1;
+                    editor.cursor -= 1;
+                    try editor.insertSlice("\n");
+                    dirty = true;
+                    continue;
+                }
+                const trimmed = std.mem.trim(u8, editor.buf.items, " \t\r\n");
+                if (trimmed.len > 0 and followups.items.len < max_queued_followups) {
+                    try history.push(trimmed);
+                    try followups.append(submit.allocator, try submit.allocator.dupe(u8, trimmed));
+                    try editor.replaceBuffer("");
+                    editor.history_idx = null;
+                    if (editor.draft) |d| {
+                        submit.allocator.free(d);
+                        editor.draft = null;
+                    }
+                    dirty = true;
+                } else if (trimmed.len == 0 and editor.buf.items.len > 0) {
+                    try editor.replaceBuffer("");
+                    dirty = true;
+                }
+            },
+            0x7f, 0x08 => {
+                editor.backspace();
+                dirty = true;
+            },
+            0x01 => {
+                editor.moveHome();
+                dirty = true;
+            },
+            0x05 => {
+                editor.moveEnd();
+                dirty = true;
+            },
+            0x02 => {
+                editor.moveLeft();
+                dirty = true;
+            },
+            0x06 => {
+                editor.moveRight();
+                dirty = true;
+            },
+            0x10 => {
+                try editor.moveUpLineOrHistory(history);
+                dirty = true;
+            },
+            0x0e => {
+                try editor.moveDownLineOrHistory(history);
+                dirty = true;
+            },
+            0x15 => {
+                editor.killToLineStart();
+                dirty = true;
+            },
+            0x0b => {
+                editor.killToLineEnd();
+                dirty = true;
+            },
+            0x17 => {
+                editor.killWordBack();
+                dirty = true;
+            },
+            '\t' => {
+                if (!in_paste) {
+                    cols = terminalColumns(io, output);
+                    if (try handleTab(&editor, io, output, submit, cols, color, false)) dirty = true;
+                } else {
+                    try editor.insertSlice("\t");
+                    dirty = true;
+                }
+            },
+            0x1b => {
+                const next = try queue.readByteWithWake(input_fd, wake, 25) orelse {
+                    if (done.isCanceled()) break;
+                    if (editor.buf.items.len > 0) {
+                        try editor.replaceBuffer("");
+                        editor.history_idx = null;
+                        dirty = true;
+                    }
+                    continue;
+                };
+                switch (next) {
+                    '\r', '\n' => {
+                        try editor.insertSlice("\n");
+                        dirty = true;
+                    },
+                    'b' => {
+                        editor.moveWordLeft();
+                        dirty = true;
+                    },
+                    'f' => {
+                        editor.moveWordRight();
+                        dirty = true;
+                    },
+                    0x1b => {
+                        const third = try queue.readByteWithWake(input_fd, wake, 25) orelse continue;
+                        if (third == '[' or third == 'O') {
+                            const fourth = try queue.readByteWithWake(input_fd, wake, 25) orelse continue;
+                            if (fourth == 'A') {
+                                restoreFollowupsToEditor(&editor, followups, submit.allocator) catch {};
+                                dirty = true;
+                            }
+                        }
+                    },
+                    'O' => {
+                        const code = try queue.readByteWithWake(input_fd, wake, 25) orelse continue;
+                        switch (code) {
+                            'H' => {
+                                editor.moveHome();
+                                dirty = true;
+                            },
+                            'F' => {
+                                editor.moveEnd();
+                                dirty = true;
+                            },
+                            'A' => {
+                                try editor.moveUpLineOrHistory(history);
+                                dirty = true;
+                            },
+                            'B' => {
+                                try editor.moveDownLineOrHistory(history);
+                                dirty = true;
+                            },
+                            'C' => {
+                                editor.moveRight();
+                                dirty = true;
+                            },
+                            'D' => {
+                                editor.moveLeft();
+                                dirty = true;
+                            },
+                            else => {},
+                        }
+                    },
+                    '[' => {
+                        var seq: [32]u8 = undefined;
+                        var slen: usize = 0;
+                        var final_byte: ?u8 = null;
+                        while (slen < seq.len) {
+                            const c = try queue.readByteWithWake(input_fd, wake, 25) orelse break;
+                            if (c >= 0x40 and c <= 0x7e) {
+                                final_byte = c;
+                                break;
+                            }
+                            seq[slen] = c;
+                            slen += 1;
+                        }
+                        const params = seq[0..slen];
+                        if (final_byte) |fin| switch (fin) {
+                            'A' => {
+                                if (std.mem.eql(u8, params, "1;3")) {
+                                    restoreFollowupsToEditor(&editor, followups, submit.allocator) catch {};
+                                } else {
+                                    try editor.moveUpLineOrHistory(history);
+                                }
+                                dirty = true;
+                            },
+                            'B' => {
+                                try editor.moveDownLineOrHistory(history);
+                                dirty = true;
+                            },
+                            'C' => {
+                                if (std.mem.eql(u8, params, "1;5") or std.mem.eql(u8, params, "1;3")) editor.moveWordRight() else editor.moveRight();
+                                dirty = true;
+                            },
+                            'D' => {
+                                if (std.mem.eql(u8, params, "1;5") or std.mem.eql(u8, params, "1;3")) editor.moveWordLeft() else editor.moveLeft();
+                                dirty = true;
+                            },
+                            'H' => {
+                                editor.moveHome();
+                                dirty = true;
+                            },
+                            'F' => {
+                                editor.moveEnd();
+                                dirty = true;
+                            },
+                            'u' => {
+                                if (std.mem.eql(u8, params, "13;2")) {
+                                    try editor.insertSlice("\n");
+                                    dirty = true;
+                                }
+                            },
+                            '~' => {
+                                if (std.mem.eql(u8, params, "200")) {
+                                    in_paste = true;
+                                } else if (std.mem.eql(u8, params, "201")) {
+                                    in_paste = false;
+                                } else if (std.mem.eql(u8, params, "3")) {
+                                    editor.deleteAtCursor();
+                                    dirty = true;
+                                } else if (std.mem.eql(u8, params, "1") or std.mem.eql(u8, params, "7")) {
+                                    editor.moveHome();
+                                    dirty = true;
+                                } else if (std.mem.eql(u8, params, "4") or std.mem.eql(u8, params, "8")) {
+                                    editor.moveEnd();
+                                    dirty = true;
+                                }
+                            },
+                            else => {},
+                        };
+                    },
+                    else => {},
+                }
+            },
+            else => {
+                if (b >= 0x20 and b < 0x7f) {
+                    editor.insertSlice(&.{b}) catch {};
+                    dirty = true;
+                } else if (b >= 0xc2 and b <= 0xf4) {
+                    const expected_len = std.unicode.utf8ByteSequenceLength(b) catch continue;
+                    var utf8_buf: [4]u8 = undefined;
+                    utf8_buf[0] = b;
+                    var ok = true;
+                    for (1..expected_len) |idx| {
+                        const cb = try queue.readByteWithWake(input_fd, wake, 25) orelse {
+                            ok = false;
+                            break;
+                        };
+                        if ((cb & 0xc0) != 0x80) {
+                            ok = false;
+                            break;
+                        }
+                        utf8_buf[idx] = cb;
+                    }
+                    if (ok and std.unicode.utf8ValidateSlice(utf8_buf[0..expected_len])) {
+                        editor.insertSlice(utf8_buf[0..expected_len]) catch {};
+                        dirty = true;
+                    }
+                }
+            },
+        }
+    }
+
+    thread.join();
+    joined = true;
+    try screen.clearOverlay();
+
+    if (worker.err) |err| {
+        var msg: [256]u8 = undefined;
+        const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
+        try std.Io.File.stderr().writeStreamingAll(io, line);
+        carried_draft.* = try buildCarriedDraft(submit.allocator, followups, editor.buf.items);
+    } else if (editor.buf.items.len > 0) {
+        carried_draft.* = try submit.allocator.dupe(u8, editor.buf.items);
+    }
+}
+
+test "pendingLineRows tracks wrapped text and ignores CSI SGR sequences" {
+    try std.testing.expectEqual(@as(usize, 0), pendingLineRows("0123456789", 10));
+    try std.testing.expectEqual(@as(usize, 1), pendingLineRows("0123456789a", 10));
+    try std.testing.expectEqual(@as(usize, 0), pendingLineRows("\x1b[2m0123456789\x1b[0m", 10));
+    try std.testing.expectEqual(@as(usize, 1), pendingLineRows("\x1b[2m中文中文中文\x1b[0m", 10));
+}
+
+test "restoreFollowupsToEditor and buildCarriedDraft preserve queued items and draft" {
+    const a = std.testing.allocator;
+    var followups: std.ArrayList([]u8) = .empty;
+    defer {
+        for (followups.items) |item| a.free(item);
+        followups.deinit(a);
+    }
+    try followups.append(a, try a.dupe(u8, "first"));
+    try followups.append(a, try a.dupe(u8, "second"));
+
+    var editor = EditorState{ .allocator = a };
+    defer editor.deinit();
+    try editor.insertSlice("draft");
+
+    try restoreFollowupsToEditor(&editor, &followups, a);
+    try std.testing.expectEqual(@as(usize, 0), followups.items.len);
+    try std.testing.expectEqualStrings("first\n\nsecond\n\ndraft", editor.buf.items);
+
+    try followups.append(a, try a.dupe(u8, "queued"));
+    const carried = (try buildCarriedDraft(a, &followups, "wip")).?;
+    defer a.free(carried);
+    try std.testing.expectEqual(@as(usize, 0), followups.items.len);
+    try std.testing.expectEqualStrings("queued\n\nwip", carried);
+}
+
+test "renderLiveOverlayFrame clips queued previews and tracks multiline draft cursor" {
+    const a = std.testing.allocator;
+    var editor = EditorState{ .allocator = a };
+    defer editor.deinit();
+
+    const empty = try renderLiveOverlayFrame(a, &editor, &.{}, 80, false);
+    defer a.free(empty.bytes);
+    try std.testing.expectEqual(@as(usize, 0), empty.bytes.len);
+
+    const queued = [_][]const u8{
+        "first 中文日本語",
+        "second",
+        "third",
+        "fourth",
+        "fifth",
+    };
+    const q_only = try renderLiveOverlayFrame(a, &editor, &queued, 24, false);
+    defer a.free(q_only.bytes);
+    try std.testing.expect(std.mem.indexOf(u8, q_only.bytes, "[queued 1] first 中文") != null);
+    try std.testing.expect(std.mem.indexOf(u8, q_only.bytes, "(+1 more queued)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, q_only.bytes, "Alt+Up edit queued") != null);
+    try std.testing.expectEqual(@as(usize, 5), q_only.cursor_row);
+
+    try editor.insertSlice("line1\nline2");
+    editor.moveLeft();
+    const with_draft = try renderLiveOverlayFrame(a, &editor, &queued, 40, false);
+    defer a.free(with_draft.bytes);
+    try std.testing.expect(std.mem.indexOf(u8, with_draft.bytes, "> line1\n  line2") != null);
+    try std.testing.expectEqual(@as(usize, 6), with_draft.cursor_row);
 }

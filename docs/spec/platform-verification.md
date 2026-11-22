@@ -211,6 +211,25 @@ The PTY fixture checks Tab completion into the picker, selection, narrow-window 
 | `src/tui.zig` | `fd6424fe7053f25529bb14d818356e5934843ed12bb8eb39b9bedb79754ef65e` |
 | `scripts/test-cli.py` | `72bb3989b213f79102a2fafa2742544a15c4214fe8e38117c4b89689b1411211` |
 
+### Queued follow-up editing during generation (`feat/tui-queued-followup`)
+
+Added `LiveScreen` (mutex-synchronized stream + overlay rendering preserving unfinished output lines), `runTurnWithLiveEditor` (worker-thread turn execution with raw-mode queued follow-up editing, `Enter` queuing, `Alt+Up` restore-to-editor, `Esc` draft clear, `Ctrl-C` cancel preserving queued text in the idle prompt, and carried unsubmitted drafts), wired `tui-tests` into `build.zig` and `scripts/test-linux-artifacts.sh`, and added `check_queued_followup_editing` to `scripts/test-cli.py`.
+
+- **macOS arm64 + Linux 7-target matrix** (`bceb0a601`, `.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-94183/bceb0a601.output`, exit 0):
+  - **macOS arm64** passed `zig fmt --check`, `py_compile`, `sh -n`, **123/123** build steps (`tui-tests` **5/5** and `extension-tests` **4/4** executed; unchanged test suites cached from prior runs on this tree), `scripts/test-cli.py` (with pi 1.6.0 SDK + C/Zig `.dylib` fixtures + `check_queued_followup_editing`), `scripts/test-ts-host.py`, and `scripts/test-context-budget.py` (**84** checks).
+  - **Linux** passed all seven targets: Alpine arm64 native (**93/93** steps, **173** passed, **3** SDK skips, **0** failures), four cross-built musl container runs (`aarch64-linux-musl` and translated `x86_64-linux-musl` under Apple Container and Colima, each **173** passed, **3** SDK skips, **0** failures), and cross-built plus native Ubuntu 24.04 arm64 glibc 2.39 (**93/93** native steps, each **171** passed, **5** skips [3 SDK, 2 search], **0** failures). Every target passed `tui-tests` (**5/5**), `scripts/test-cli.py` (including `check_queued_followup_editing` PTY coverage and C/Zig `.so` fixtures), and **84** budget checks.
+
+`bceb0a601` recorded these exact SHA-256 hashes before and after execution (with only `docs/spec/compatibility-matrix.md` and `docs/spec/platform-verification.md` updated afterward to record this run):
+
+| File | SHA-256 |
+| --- | --- |
+| `build.zig` | `facca3876adc059072ec9789330caf0f8e6bbb08506bed13475d688bd3d7742d` |
+| `src/main.zig` | `02422c43b4941f56866b3fc2aafa623cfe7f069258d182de0bd17d3094f979c9` |
+| `src/tui.zig` | `64e74309d39830efbde545c7a3f9b3f0af53bf8115890c628bf331e720fcc61a` |
+| `scripts/test-cli.py` | `cda955bba3a19407a48cd11c251272c64555f05ea254318b3a8d725cf5d1f67e` |
+| `scripts/test-linux-artifacts.sh` | `bd917cc1c6ef7df6609759ac180ecda1e806dbdf656b5d52b18daf1933dc31dc` |
+| `README.md` | `cf34b256a8d92e4bffec874ea5311f397a54b0e5421855cf2373c46af0e57f9c` |
+
 ## Further acceptance
 
 - Extend the same build-installed test executables as real core behavior lands; preserve failures and distinguish compilation from execution.

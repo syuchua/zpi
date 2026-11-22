@@ -363,6 +363,8 @@ fn run(init: std.process.Init) !void {
         .mode = options.mode,
         .extension_host = if (extension_host) |*host| host else null,
         .interrupt = if (interrupt) |*int| int else null,
+        .stderr_is_tty = std.Io.File.stderr().isTty(init.io) catch false,
+        .stderr_color = std.Io.File.stderr().supportsAnsiEscapeCodes(init.io) catch false,
         .skills = discovered_skills,
         .skills_prompt = skills_prompt,
         .prompt_templates = discovered_templates,
@@ -404,6 +406,8 @@ fn run(init: std.process.Init) !void {
             .session_info = App.sessionInfoErased,
             .cancel = cancel_token,
             .reset_cancel = App.resetCancelErased,
+            .trigger_cancel = App.triggerCancelErased,
+            .set_live_writer = App.setLiveWriterErased,
             .allocator = init.gpa,
             .cwd = cwd,
             .commands = slash_commands.items,
@@ -443,11 +447,40 @@ const App = struct {
     mode: args_module.OutputMode,
     extension_host: ?*zpi.extensions.Host = null,
     interrupt: ?*zpi.model.Interrupt = null,
+    stderr_is_tty: bool = false,
+    stderr_color: bool = false,
+    live_writer: ?tui.LiveWriter = null,
     skills: []const skills.Skill = &.{},
     prompt_templates: []const prompt_templates.Template = &.{},
     fn resetCancelErased(context: *anyopaque) void {
         const self: *App = @ptrCast(@alignCast(context));
         if (self.interrupt) |int| int.reset();
+    }
+    fn triggerCancelErased(context: *anyopaque) void {
+        const self: *App = @ptrCast(@alignCast(context));
+        if (self.interrupt) |int| int.trigger();
+    }
+    fn setLiveWriterErased(context: *anyopaque, writer: ?tui.LiveWriter) void {
+        const self: *App = @ptrCast(@alignCast(context));
+        self.live_writer = writer;
+    }
+    fn outSegment(self: *App, prefix: []const u8, safe: []const u8, suffix: []const u8) !void {
+        if (self.live_writer) |writer| {
+            return writer.write_segment(writer.context, prefix, safe, suffix);
+        }
+        const stdout = std.Io.File.stdout();
+        if (prefix.len > 0) try stdout.writeStreamingAll(self.io, prefix);
+        if (safe.len > 0) try tui.writeText(self.io, stdout, safe);
+        if (suffix.len > 0) try stdout.writeStreamingAll(self.io, suffix);
+    }
+    fn errSegment(self: *App, prefix: []const u8, safe: []const u8, suffix: []const u8) !void {
+        if (self.live_writer) |writer| {
+            if (self.stderr_is_tty) return writer.write_segment(writer.context, prefix, safe, suffix);
+        }
+        const stderr = std.Io.File.stderr();
+        if (prefix.len > 0) try stderr.writeStreamingAll(self.io, prefix);
+        if (safe.len > 0) try tui.writeText(self.io, stderr, safe);
+        if (suffix.len > 0) try stderr.writeStreamingAll(self.io, suffix);
     }
     fn switchModelErased(context: *anyopaque, arg: []const u8) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
@@ -636,7 +669,7 @@ const App = struct {
             try self.json(.{ .type = "extension_event", .event = event });
         } else if (event.object.get("type")) |kind| {
             if (kind == .string and std.mem.eql(u8, kind.string, "extension_error"))
-                try std.Io.File.stderr().writeStreamingAll(self.io, "zpi: extension handler failed\n");
+                try self.errSegment("zpi: extension handler failed\n", "", "");
         }
     }
     fn submitErased(context: *anyopaque, prompt: []const u8) anyerror!void {
@@ -840,7 +873,7 @@ const App = struct {
         self.runtime.prompt(effective, .{ .context = self, .emit = emit }) catch |err| {
             // Never rerun an interrupted external effect to repair history.
             // Append explicit unknown outcomes before accepting more input.
-            if (self.mode == .interactive) std.Io.File.stdout().writeStreamingAll(self.io, "\n") catch {};
+            if (self.mode == .interactive) self.outSegment("\n", "", "") catch {};
             try self.runtime.reconcile(.{ .context = self, .emit = emit });
             if (self.mode == .json) try self.json(.{ .type = "error", .error_code = @errorName(err) });
             return err;
@@ -852,7 +885,7 @@ const App = struct {
                 else => {},
             };
         }
-        if (self.mode != .json) try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+        if (self.mode != .json) try self.outSegment("\n", "", "");
     }
     fn emit(context: *anyopaque, event: agent.Event) anyerror!void {
         const self: *App = @ptrCast(@alignCast(context));
@@ -865,13 +898,13 @@ const App = struct {
                 if (self.mode == .json) {
                     try self.json(.{ .type = "provider_event", .event = provider_event });
                 } else if (self.mode == .interactive) switch (provider_event) {
-                    .text_delta => |text| try tui.writeText(self.io, .stdout(), text),
+                    .text_delta => |text| try self.outSegment("", text, ""),
                     .thinking_delta => |text| if (!self.hide_thinking_block) {
-                        const stderr = std.Io.File.stderr();
-                        const color = stderr.supportsAnsiEscapeCodes(self.io) catch false;
-                        if (color) try stderr.writeStreamingAll(self.io, "\x1b[2m");
-                        try tui.writeText(self.io, stderr, text);
-                        if (color) try stderr.writeStreamingAll(self.io, "\x1b[0m");
+                        try self.errSegment(
+                            if (self.stderr_color) "\x1b[2m" else "",
+                            text,
+                            if (self.stderr_color) "\x1b[0m" else "",
+                        );
                     },
                     else => {},
                 };
@@ -879,17 +912,14 @@ const App = struct {
             .tool_start => |call| {
                 if (self.mode == .json) try self.json(.{ .type = "tool_execution_start", .id = call.id, .name = call.name });
                 if (self.mode == .interactive) {
-                    try std.Io.File.stderr().writeStreamingAll(self.io, "\n[tool: ");
-                    try tui.writeText(self.io, .stderr(), call.name);
-                    try std.Io.File.stderr().writeStreamingAll(self.io, "]\n");
+                    try self.errSegment("\n[tool: ", call.name, "]\n");
                 }
             },
             .tool_update => |update| {
                 if (self.mode == .json) {
                     try self.json(.{ .type = "tool_execution_update", .id = update.call.id, .name = update.call.name, .result = update.result });
                 } else if (self.mode == .interactive) {
-                    try tui.writeText(self.io, .stderr(), update.result.text);
-                    try std.Io.File.stderr().writeStreamingAll(self.io, "\n");
+                    try self.errSegment("", update.result.text, "\n");
                 }
             },
             .tool_end => |ended| {
@@ -897,23 +927,19 @@ const App = struct {
                     try self.json(.{ .type = "tool_execution_end", .id = ended.call.id, .result = ended.result });
                 } else if (self.mode == .interactive) {
                     if (ended.result.is_error) {
-                        try tui.writeText(self.io, .stderr(), ended.result.text);
-                        try std.Io.File.stderr().writeStreamingAll(self.io, "\n");
+                        try self.errSegment("", ended.result.text, "\n");
                     } else if (ended.result.details) |details_val| {
                         if (details_val == .object) {
                             if (std.mem.eql(u8, ended.call.name, "edit")) {
                                 if (details_val.object.get("diff")) |diff_val| {
                                     if (diff_val == .string and diff_val.string.len > 0) {
-                                        try writeDiffPreview(self.io, diff_val.string);
+                                        try self.writeDiffPreview(diff_val.string);
                                     }
                                 }
                             } else if (std.mem.eql(u8, ended.call.name, "bash")) {
                                 if (details_val.object.get("fullOutputPath")) |path_val| {
                                     if (path_val == .string and path_val.string.len > 0) {
-                                        const stderr = std.Io.File.stderr();
-                                        try stderr.writeStreamingAll(self.io, "[full output: ");
-                                        try tui.writeText(self.io, stderr, path_val.string);
-                                        try stderr.writeStreamingAll(self.io, "]\n");
+                                        try self.errSegment("[full output: ", path_val.string, "]\n");
                                     }
                                 }
                             }
@@ -927,7 +953,7 @@ const App = struct {
                 } else if (self.mode == .interactive) {
                     var msg: [160]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "\n[retrying {d}/{d} in {d}ms: {s}]\n", .{ r.attempt, r.max_attempts, r.delay_ms, r.error_code });
-                    try std.Io.File.stderr().writeStreamingAll(self.io, line);
+                    try self.errSegment(line, "", "");
                 }
             },
             .retry_finished => |r| {
@@ -941,7 +967,7 @@ const App = struct {
                 } else if (self.mode == .interactive) {
                     var msg: [160]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "\n[compacted: {d} tokens before compaction]\n", .{c.tokens_before});
-                    try std.Io.File.stderr().writeStreamingAll(self.io, line);
+                    try self.errSegment(line, "", "");
                 }
             },
             .settled => if (self.mode == .json) {
@@ -949,33 +975,24 @@ const App = struct {
             },
         }
     }
-    fn writeDiffPreview(io: std.Io, diff: []const u8) !void {
-        const stderr = std.Io.File.stderr();
-        const color = stderr.supportsAnsiEscapeCodes(io) catch false;
+    fn writeDiffPreview(self: *App, diff: []const u8) !void {
         var lines = std.mem.splitScalar(u8, diff, '\n');
         var count: usize = 0;
         while (lines.next()) |line| {
             if (count >= 40) {
-                try stderr.writeStreamingAll(io, if (color) "\x1b[2m... (preview truncated)\x1b[0m\n" else "... (preview truncated)\n");
+                try self.errSegment(if (self.stderr_color) "\x1b[2m... (preview truncated)\x1b[0m\n" else "... (preview truncated)\n", "", "");
                 break;
             }
-            if (color) {
-                if (std.mem.startsWith(u8, line, "+")) {
-                    try stderr.writeStreamingAll(io, "\x1b[32m");
-                    try tui.writeText(io, stderr, line);
-                    try stderr.writeStreamingAll(io, "\x1b[0m\n");
-                } else if (std.mem.startsWith(u8, line, "-")) {
-                    try stderr.writeStreamingAll(io, "\x1b[31m");
-                    try tui.writeText(io, stderr, line);
-                    try stderr.writeStreamingAll(io, "\x1b[0m\n");
-                } else {
-                    try stderr.writeStreamingAll(io, "\x1b[2m");
-                    try tui.writeText(io, stderr, line);
-                    try stderr.writeStreamingAll(io, "\x1b[0m\n");
-                }
+            if (self.stderr_color) {
+                const prefix = if (std.mem.startsWith(u8, line, "+"))
+                    "\x1b[32m"
+                else if (std.mem.startsWith(u8, line, "-"))
+                    "\x1b[31m"
+                else
+                    "\x1b[2m";
+                try self.errSegment(prefix, line, "\x1b[0m\n");
             } else {
-                try tui.writeText(io, stderr, line);
-                try stderr.writeStreamingAll(io, "\n");
+                try self.errSegment("", line, "\n");
             }
             count += 1;
         }

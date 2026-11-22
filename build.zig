@@ -204,6 +204,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_tests = b.addTest(.{ .name = "core-tests", .root_module = core });
     const exe_tests = std.Build.Step.Compile.create(b, .{ .name = "cli-tests", .kind = .@"test", .linkage = .dynamic, .root_module = exe.root_module });
+    const tui_tests = b.addTest(.{ .name = "tui-tests", .root_module = tui });
     const prompt_template_tests = b.addTest(.{ .name = "prompt-template-tests", .root_module = prompt_templates });
     const pi_session_tests = b.addTest(.{ .name = "pi-session-tests", .root_module = pi_session });
     const sse_tests = b.addTest(.{ .name = "sse-tests", .root_module = sse });
@@ -387,6 +388,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(anthropic_edge_tests).step);
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tui_tests).step);
     test_step.dependOn(&b.addRunArtifact(sse_tests).step);
     test_step.dependOn(&b.addRunArtifact(http_header_tests).step);
     test_step.dependOn(&b.addRunArtifact(http_transport_tests).step);
@@ -414,6 +416,7 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(anthropic_edge_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(lib_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(exe_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(tui_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(sse_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(http_header_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(http_transport_tests, .{}).step);
