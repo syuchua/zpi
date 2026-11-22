@@ -1531,6 +1531,20 @@ def check_tree_navigation(root, environment, server):
         os.write(master, b'\x1b[A' * 5 + b'\r')
         expect(b'[branched to 4]', start)
         assert server.tree_summary_requests == 0
+        # Fuzzy filter in /tree and prefill a user message into the editor.
+        command(b'/tree', picker_ready)
+        start = len(transcript)
+        os.write(master, b'/destination')
+        expect(b'Filter: \x1b[0mdestination', start)
+        expect(b'4 user  destination request', start)
+        os.write(master, b'\x1b')
+        time.sleep(0.05)
+        start = len(transcript)
+        os.write(master, b'p')
+        expect(b'[branched to 3]', start)
+        p_end = expect(b'\x1b[21C', start)
+        process.send_signal(signal.SIGINT)
+        expect(b'\x1b[?2004h', p_end)
         command(b'/tree 9', b'[branched to 9]')
         switched = session.read_bytes()
         command(b'/tree --summary 4', b'zpi: BranchSummaryFailed')
@@ -1864,6 +1878,37 @@ def check_tui_components(root, environment, server):
             proc2.wait(timeout=5)
         os.close(master2)
 
+    # 4. Verify TERM=dumb falls back to plain-text lists for /model and /tree.
+    dumb_env = dict(env, TERM='dumb')
+    master3, slave3 = pty.openpty()
+    proc3 = subprocess.Popen(args, cwd=comp_dir, env=dumb_env, stdin=slave3, stdout=slave3, stderr=slave3, close_fds=True)
+    os.close(slave3)
+    t3 = bytearray()
+    try:
+        deadline = time.monotonic() + 10
+        while b'> ' not in t3:
+            if select.select([master3], [], [], 0.2)[0]:
+                t3.extend(os.read(master3, 16384))
+            assert time.monotonic() < deadline, bytes(t3)
+        os.write(master3, b'/model\n')
+        while b'Active: comp-fixture/comp-model' not in t3:
+            if select.select([master3], [], [], 0.2)[0]:
+                t3.extend(os.read(master3, 16384))
+            assert time.monotonic() < deadline, bytes(t3)
+        os.write(master3, b'/tree\n')
+        while b'Session tree (active:' not in t3:
+            if select.select([master3], [], [], 0.2)[0]:
+                t3.extend(os.read(master3, 16384))
+            assert time.monotonic() < deadline, bytes(t3)
+        assert b'Type to filter' not in t3 and b'Up/Down move' not in t3, bytes(t3)
+        os.write(master3, b'/exit\n')
+        assert proc3.wait(timeout=5) == 0
+    finally:
+        if proc3.poll() is None:
+            proc3.kill()
+            proc3.wait(timeout=5)
+        os.close(master3)
+
 
 def check_settings_and_model_switch(root, environment, server):
     agent_dir = root / 'settings-agent'
@@ -1953,8 +1998,23 @@ def check_settings_and_model_switch(root, environment, server):
     try:
         p = read_prompt()
         assert b'Ctrl-D exits' not in transcript, bytes(transcript)
-        os.write(master, b'/model\n')
+        os.write(master, b'/model --list\n')
         p = read_prompt(read_until(b'settings-resp/gpt-5', p))
+        # Interactive /model fuzzy SelectList: filter, Esc cancel, then filter + Enter switch.
+        mark = p
+        os.write(master, b'/model\n')
+        read_until(b'Type to filter', mark)
+        os.write(master, b'gpt5')
+        read_until(b'settings-resp/gpt-5', mark)
+        os.write(master, b'\x1b')
+        time.sleep(0.08)
+        os.write(master, b'\x1b')
+        p = read_until(b'\x1b[?2004h', read_prompt(mark)) + len(b'\x1b[?2004h')
+        mark = p
+        os.write(master, b'/model\n')
+        read_until(b'Type to filter', mark)
+        os.write(master, b'gpt5\r')
+        p = read_prompt(read_until(b'[model: settings-resp/gpt-5 (openai_responses), thinking: medium]', mark))
         os.write(master, b'/model settings-resp/gpt-5:high\n')
         p = read_prompt(read_until(b'[model: settings-resp/gpt-5 (openai_responses), thinking: high]', p))
         os.write(master, b'switched-turn\n')

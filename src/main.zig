@@ -229,6 +229,7 @@ fn run(init: std.process.Init) !void {
                 .tree = CliAdapter.treeErased,
                 .tree_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.treeSourceErased,
                 .switch_model = CliAdapter.switchModelErased,
+                .model_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.modelSourceErased,
                 .set_thinking = CliAdapter.setThinkingErased,
                 .status_info = CliAdapter.statusInfoErased,
                 .color_mode = adapter.tui_theme.mode,
@@ -365,6 +366,59 @@ const CliAdapter = struct {
         return self.submit(prompt);
     }
 
+    fn modelSourceErased(context: *anyopaque) anyerror!?tui.ModelSource {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const outcome = try self.harness.?.switchModel("");
+        var listed = switch (outcome) {
+            .listed => |l| l,
+            .switched => unreachable,
+        };
+        errdefer listed.deinit();
+
+        const State = struct {
+            allocator: std.mem.Allocator,
+            listed: harness.ModelList,
+            items: []tui.ModelItem,
+            active: ?usize,
+            fn item(ctx: *anyopaque, idx: usize) tui.ModelItem {
+                const st: *@This() = @ptrCast(@alignCast(ctx));
+                return st.items[idx];
+            }
+            fn deinit(ctx: *anyopaque) void {
+                const st: *@This() = @ptrCast(@alignCast(ctx));
+                const alloc = st.allocator;
+                st.listed.deinit();
+                alloc.destroy(st);
+            }
+        };
+        const list_alloc = listed.arena.allocator();
+        const items = try list_alloc.alloc(tui.ModelItem, listed.choices.len);
+        var active: ?usize = null;
+        for (listed.choices, items, 0..) |choice, *dst, idx| {
+            const is_active = std.mem.eql(u8, choice.provider, listed.active_provider) and std.mem.eql(u8, choice.id, listed.active_model);
+            if (is_active) active = idx;
+            dst.* = .{
+                .ref = try std.fmt.allocPrint(list_alloc, "{s}/{s}", .{ choice.provider, choice.id }),
+                .api = @tagName(choice.api),
+                .is_active = is_active,
+            };
+        }
+        const st = try self.allocator.create(State);
+        st.* = .{
+            .allocator = self.allocator,
+            .listed = listed,
+            .items = items,
+            .active = active,
+        };
+        return .{
+            .context = st,
+            .len = items.len,
+            .active = active,
+            .item = State.item,
+            .deinit = State.deinit,
+        };
+    }
+
     fn switchModelErased(context: *anyopaque, arg: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         var outcome = try self.harness.?.switchModel(arg);
@@ -436,6 +490,9 @@ const CliAdapter = struct {
             .role = view.role,
             .preview = view.preview,
             .depth = view.depth,
+            .is_user_message = view.is_user_message,
+            .parent_id = view.parent_id,
+            .full_text = view.full_text,
         };
     }
 
