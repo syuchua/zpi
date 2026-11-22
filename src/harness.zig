@@ -1111,4 +1111,13 @@ test "harness runs prompt against loopback HTTP server without TTY and tracks st
     try std.testing.expectEqual(@as(usize, 1), stats.user_messages);
     try std.testing.expectEqual(@as(usize, 1), stats.assistant_messages);
     try std.testing.expect(stats.context_tokens_estimate > 0);
+
+    const switched_arg = try a.dupe(u8, "anthropic/claude-sonnet-4-5:medium");
+    _ = try h.switchModel(switched_arg);
+    @memset(switched_arg, 'X');
+    a.free(switched_arg);
+    const after_switch = h.statusSummary();
+    try std.testing.expectEqualStrings("anthropic", after_switch.provider);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", after_switch.model);
+    try std.testing.expectEqual(zpi.model.ThinkingLevel.medium, after_switch.thinking_level);
 }

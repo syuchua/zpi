@@ -1780,7 +1780,8 @@ def check_tui_components(root, environment, server):
         'defaultThinkingLevel': 'medium',
         'quietStartup': True,
     }))
-    env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color')
+    env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color', COLORTERM='truecolor')
+    env.pop('NO_COLOR', None)
     args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(comp_dir)]
 
     master, slave = pty.openpty()

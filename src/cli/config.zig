@@ -136,7 +136,15 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.En
         .openai_responses => "/responses",
         .openai_completions => "/chat/completions",
     };
-    result.endpoint = if (std.mem.endsWith(u8, base, suffix)) base else if (result.api == .anthropic_messages and !std.mem.endsWith(u8, base, "/v1")) try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{base}) else try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
+    result.endpoint = if (std.mem.endsWith(u8, base, suffix))
+        try allocator.dupe(u8, base)
+    else if (result.api == .anthropic_messages and !std.mem.endsWith(u8, base, "/v1"))
+        try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{base})
+    else
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
+    result.provider = try allocator.dupe(u8, result.provider);
+    result.model = try allocator.dupe(u8, result.model);
+    result.api_key = try allocator.dupe(u8, result.api_key);
     return result;
 }
 const ModelRoute = struct { provider: []const u8, model: []const u8 };
