@@ -31,6 +31,7 @@ pub const builtin_commands = [_]BuiltinCommandDesc{
     .{ .name = "/model", .description = "Switch model" },
     .{ .name = "/thinking", .description = "Set thinking level" },
     .{ .name = "/compact", .description = "Compact conversation context" },
+    .{ .name = "/jobs", .description = "List background tasks" },
     .{ .name = "/exit", .description = "Exit zpi" },
     .{ .name = "/quit", .description = "Quit zpi" },
 };

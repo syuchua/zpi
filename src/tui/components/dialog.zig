@@ -33,6 +33,7 @@ pub const hotkeys_lines = [_][]const u8{
     "/thinking   Set thinking level (/thinking [level])",
     "/tree       Branch picker (/ filter, p prefill, s summary, Enter)",
     "/compact    Summarize older context (/compact [focus])",
+    "/jobs       List background tasks (/jobs [id])",
     "/resume     Resume a previous session (/resume [path] | --list)",
     "/session    Session summary  ·  /help  Help  ·  /exit  Exit",
 };

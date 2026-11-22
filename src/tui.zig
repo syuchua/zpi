@@ -101,10 +101,18 @@ const TreeSelection = struct {
     branch_to_parent: bool = false,
 };
 
+pub const BgNotification = struct {
+    task_name: []u8,
+    status: []const u8,
+    text: []u8,
+    trigger: bool,
+};
+
 pub const Submit = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque, []const u8) anyerror!void,
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
+    jobs_info: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     cancel: ?agent.model.Cancel = null,
     reset_cancel: ?*const fn (*anyopaque) void = null,
     trigger_cancel: ?*const fn (*anyopaque) void = null,
@@ -125,6 +133,9 @@ pub const Submit = struct {
     toggle_expand: ?*const fn (*anyopaque) bool = null,
     push_steering: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     drain_steering: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![][]u8 = null,
+    bg_wake: ?agent.model.Cancel = null,
+    reset_bg_wake: ?*const fn (*anyopaque) void = null,
+    pop_bg_notifications: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]BgNotification = null,
     color_mode: ?theme.ColorMode = null,
     quiet_startup: bool = false,
 };
@@ -170,12 +181,21 @@ pub fn run(io: std.Io, submit: Submit) !void {
         for (followups.items) |item| submit.allocator.free(item);
         followups.deinit(submit.allocator);
     }
+    var bg_queue: std.ArrayList([]u8) = .empty;
+    defer {
+        for (bg_queue.items) |item| submit.allocator.free(item);
+        bg_queue.deinit(submit.allocator);
+    }
     var carried_draft: ?[]u8 = null;
     defer if (carried_draft) |draft| submit.allocator.free(draft);
     var pending_dialog: ?DialogKind = null;
 
     while (true) {
         if (submit.reset_cancel) |reset| reset(submit.context);
+        if (followups.items.len == 0 and bg_queue.items.len == 0) {
+            try collectBgNotifications(submit, io, output, &bg_queue, false);
+        }
+        var is_bg_wakeup = false;
         const raw = if (followups.items.len > 0) blk: {
             pending_dialog = null;
             const next = followups.orderedRemove(0);
@@ -184,6 +204,10 @@ pub fn run(io: std.Io, submit: Submit) !void {
             try output.writeStreamingAll(io, echo);
             try output.writeStreamingAll(io, "\n");
             break :blk next;
+        } else if (bg_queue.items.len > 0) blk: {
+            pending_dialog = null;
+            is_bg_wakeup = true;
+            break :blk bg_queue.orderedRemove(0);
         } else blk: {
             const initial = carried_draft;
             carried_draft = null;
@@ -194,7 +218,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
                 const prompt_prefix = if (use_sgr) "\x1b[36m>\x1b[0m " else "> ";
                 try output.writeStreamingAll(io, prompt_prefix);
             }
-            break :blk readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, use_sgr, color, th, initial, dlg) catch |err| switch (err) {
+            const res = readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, &bg_queue, use_sgr, color, th, initial, dlg) catch |err| switch (err) {
                 error.Canceled => {
                     try output.writeStreamingAll(io, "\n");
                     continue;
@@ -205,13 +229,17 @@ pub fn run(io: std.Io, submit: Submit) !void {
                 },
                 else => return err,
             } orelse return;
+            is_bg_wakeup = res.is_bg_wakeup;
+            break :blk res.text;
         };
         defer submit.allocator.free(raw);
 
         const text = std.mem.trim(u8, raw, " \t\r\n");
         if (text.len == 0) continue;
-        try history.push(text);
-        if (std.mem.eql(u8, text, "/exit") or std.mem.eql(u8, text, "/quit")) return;
+        if (!is_bg_wakeup) {
+            try history.push(text);
+            if (std.mem.eql(u8, text, "/exit") or std.mem.eql(u8, text, "/quit")) return;
+        }
         if (std.mem.eql(u8, text, "/help")) {
             if (color) {
                 try eraseSubmittedPromptLine(io, output);
@@ -347,6 +375,19 @@ pub fn run(io: std.Io, submit: Submit) !void {
             if (submit.session_info) |show| try show(submit.context);
             continue;
         }
+        if (std.mem.eql(u8, text, "/jobs") or std.mem.startsWith(u8, text, "/jobs ")) {
+            const arg = if (text.len > "/jobs".len) std.mem.trim(u8, text["/jobs".len..], " \t") else "";
+            if (submit.jobs_info) |show_jobs| {
+                show_jobs(submit.context, arg) catch |err| {
+                    var msg: [256]u8 = undefined;
+                    const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
+                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                };
+            } else {
+                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /jobs unavailable\n");
+            }
+            continue;
+        }
         if (std.mem.eql(u8, text, "/resume") or std.mem.startsWith(u8, text, "/resume ")) {
             const raw_arg = if (text.len > "/resume".len) std.mem.trim(u8, text["/resume".len..], " \t") else "";
             if (submit.resume_session) |run_resume| {
@@ -386,7 +427,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
             continue;
         }
         if (color and submit.set_live_writer != null) {
-            try runTurnWithLiveEditor(io, input.handle, output, &queue, &history, submit, text, &followups, &carried_draft, use_sgr, th);
+            try runTurnWithLiveEditor(io, input.handle, output, &queue, &history, submit, text, &followups, &bg_queue, &carried_draft, use_sgr, th);
         } else {
             submit.run(submit.context, text) catch |err| {
                 var msg: [256]u8 = undefined;
@@ -755,6 +796,19 @@ const EditorState = struct {
         return rule_w;
     }
 
+    fn clearAll(self: *EditorState, io: std.Io, output: std.Io.File, th: theme.Theme) !void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        if (th.mode != .none) try out.appendSlice(self.allocator, renderer.sync_begin);
+        if (self.rendered_cursor_row > 0) {
+            try out.print(self.allocator, "\x1b[{d}A", .{self.rendered_cursor_row});
+        }
+        try out.appendSlice(self.allocator, "\r\x1b[J");
+        if (th.mode != .none) try out.appendSlice(self.allocator, renderer.sync_end);
+        self.rendered_cursor_row = 0;
+        try output.writeStreamingAll(io, out.items);
+    }
+
     fn renderWithOverlay(
         self: *EditorState,
         io: std.Io,
@@ -986,6 +1040,40 @@ fn applyAutocomplete(
     }
 }
 
+const PromptInput = struct {
+    text: []u8,
+    is_bg_wakeup: bool = false,
+};
+
+fn collectBgNotifications(
+    submit: Submit,
+    io: std.Io,
+    output: std.Io.File,
+    bg_queue: *std.ArrayList([]u8),
+    silent: bool,
+) !void {
+    if (submit.reset_bg_wake) |reset| reset(submit.context);
+    const pop_fn = submit.pop_bg_notifications orelse return;
+    const notes = try pop_fn(submit.context, submit.allocator);
+    defer {
+        for (notes) |n| {
+            submit.allocator.free(n.task_name);
+            submit.allocator.free(n.text);
+        }
+        submit.allocator.free(notes);
+    }
+    for (notes) |n| {
+        if (!silent) {
+            var line_buf: [256]u8 = undefined;
+            const notice = std.fmt.bufPrint(&line_buf, "[bg {s}: {s}]\n", .{ n.status, n.task_name }) catch "[bg task updated]\n";
+            output.writeStreamingAll(io, notice) catch {};
+        }
+        if (n.trigger) {
+            try bg_queue.append(submit.allocator, try submit.allocator.dupe(u8, n.text));
+        }
+    }
+}
+
 fn readPromptLine(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -994,12 +1082,13 @@ fn readPromptLine(
     queue: *InputQueue,
     history: *const History,
     submit: Submit,
+    bg_queue: *std.ArrayList([]u8),
     use_sgr: bool,
     term_ansi: bool,
     th: theme.Theme,
     initial: ?[]const u8,
     initial_dialog: ?DialogKind,
-) anyerror!?[]u8 {
+) anyerror!?PromptInput {
     if (submit.cancel) |token| {
         if (token.isCanceled()) return error.Canceled;
     }
@@ -1079,8 +1168,18 @@ fn readPromptLine(
             dialog_on_screen = dialog_slices.len > 0;
             dirty = false;
         }
-        const b_opt = try queue.readByte(input_fd, submit.cancel);
+        const b_opt = try queue.readByteWithCancelAndWake(input_fd, submit.cancel, submit.bg_wake, -1);
         const b = b_opt orelse {
+            if (!queue.eof) {
+                try collectBgNotifications(submit, io, output, bg_queue, true);
+                if (bg_queue.items.len > 0 and editor.buf.items.len == 0 and dialog == null and !popup.isOpen()) {
+                    try editor.clearAll(io, output, th);
+                    try output.writeStreamingAll(io, "[bg task completed]\n");
+                    return .{ .text = bg_queue.orderedRemove(0), .is_bg_wakeup = true };
+                }
+                dirty = true;
+                continue;
+            }
             popup.clear();
             if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                 editor.resetCompletionTrack();
@@ -1091,7 +1190,7 @@ fn readPromptLine(
                 try output.writeStreamingAll(io, "\n");
                 return null;
             }
-            return try editor.buf.toOwnedSlice(allocator);
+            return .{ .text = try editor.buf.toOwnedSlice(allocator) };
         };
 
         if (dialog != null) {
@@ -1161,7 +1260,7 @@ fn readPromptLine(
                     try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false);
                 }
                 try output.writeStreamingAll(io, "\n");
-                return try editor.buf.toOwnedSlice(allocator);
+                return .{ .text = try editor.buf.toOwnedSlice(allocator) };
             },
             0x7f, 0x08 => {
                 editor.backspace();
@@ -1934,8 +2033,9 @@ fn runTurnWithLiveEditor(
     submit: Submit,
     text: []const u8,
     followups: *std.ArrayList([]u8),
+    bg_queue: *std.ArrayList([]u8),
     carried_draft: *?[]u8,
-    color: bool,
+    use_sgr: bool,
     th: theme.Theme,
 ) !void {
     const orig_term = try enterRawMode(input_fd);
@@ -1948,7 +2048,7 @@ fn runTurnWithLiveEditor(
     defer done.deinit(io);
 
     var cols = terminalColumns(io, output);
-    var screen = LiveScreen.init(submit.allocator, io, output, color, th);
+    var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th);
     screen.overlay_cols = cols;
     defer screen.deinit();
 
@@ -2114,7 +2214,7 @@ fn runTurnWithLiveEditor(
             '\t' => {
                 if (!in_paste) {
                     cols = terminalColumns(io, output);
-                    if (try handleTab(&editor, io, submit, cols, color, false)) dirty = true;
+                    if (try handleTab(&editor, io, submit, cols, use_sgr, false)) dirty = true;
                 } else {
                     try editor.insertSlice("\t");
                     dirty = true;
@@ -2304,8 +2404,11 @@ fn runTurnWithLiveEditor(
         const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
         try std.Io.File.stderr().writeStreamingAll(io, line);
         carried_draft.* = try buildCarriedDraft(submit.allocator, followups, editor.buf.items);
-    } else if (editor.buf.items.len > 0) {
-        carried_draft.* = try submit.allocator.dupe(u8, editor.buf.items);
+    } else {
+        try collectBgNotifications(submit, io, output, bg_queue, false);
+        if (editor.buf.items.len > 0) {
+            carried_draft.* = try submit.allocator.dupe(u8, editor.buf.items);
+        }
     }
 }
 

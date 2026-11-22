@@ -120,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == '/settings-switch/v1/chat/completions':
                 tools = {t['function']['name'] for t in request.get('tools', [])}
-                assert tools == {'read', 'edit', 'write', 'grep', 'web_fetch', 'get_content'}, tools
+                assert tools == {'read', 'edit', 'write', 'grep', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}, tools
                 user = [m['content'] for m in request['messages'] if m['role'] == 'user'][-1]
                 if user == 'settings-check':
                     assert request.get('reasoning_effort') == 'medium', request
@@ -423,6 +423,58 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 body = '## Summary\n- Updated `comp.txt` with **new**\n```zig\nconst ok = true;\n```\n'
                 data = ('data: ' + json.dumps(self.text(body)) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if self.path == '/bg-fixture/chat/completions':
+                messages = request['messages']
+                user = [m['content'] for m in messages if m['role'] == 'user'][-1]
+                results = [m for m in messages if m['role'] == 'tool']
+                if user == 'start-bg':
+                    if not any(r.get('tool_call_id') == 'bg-call-1' for r in results):
+                        c = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                            'index': 0, 'id': 'bg-call-1', 'type': 'function',
+                            'function': {'name': 'bg_run', 'arguments': json.dumps({
+                                'name': 'echo job',
+                                'command': "sleep 0.25 && printf 'bg-done-marker\\n'",
+                            })},
+                        }]}, 'finish_reason': 'tool_calls'}]}
+                    else:
+                        c = self.text('bg started')
+                elif '<background-task-notification>' in user:
+                    if not any(r.get('tool_call_id') == 'bg-logs-1' for r in results):
+                        c = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                            'index': 0, 'id': 'bg-logs-1', 'type': 'function',
+                            'function': {'name': 'bg_logs', 'arguments': json.dumps({'taskId': 'bg_1'})},
+                        }]}, 'finish_reason': 'tool_calls'}]}
+                    else:
+                        assert any('bg-done-marker' in r['content'] for r in results if r.get('tool_call_id') == 'bg-logs-1'), results
+                        c = self.text('bg wakeup handled')
+                elif user == 'kill-bg':
+                    if not any(r.get('tool_call_id') == 'bg-call-2' for r in results):
+                        c = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                            'index': 0, 'id': 'bg-call-2', 'type': 'function',
+                            'function': {'name': 'bg_run', 'arguments': json.dumps({
+                                'name': 'sleep job',
+                                'command': 'sleep 30',
+                                'notifyOnCompletion': False,
+                                'triggerOnCompletion': False,
+                            })},
+                        }]}, 'finish_reason': 'tool_calls'}]}
+                    elif not any(r.get('tool_call_id') == 'bg-kill-2' for r in results):
+                        c = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                            'index': 0, 'id': 'bg-kill-2', 'type': 'function',
+                            'function': {'name': 'bg_kill', 'arguments': json.dumps({'taskId': 'bg_2'})},
+                        }]}, 'finish_reason': 'tool_calls'}]}
+                    else:
+                        assert any('Requested termination' in r['content'] for r in results if r.get('tool_call_id') == 'bg-kill-2'), results
+                        c = self.text('bg kill handled')
+                else:
+                    raise AssertionError(f'Unexpected bg prompt: {user}')
+                data = ('data: ' + json.dumps(c) + '\n\ndata: [DONE]\n\n').encode()
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Content-Length', str(len(data)))
@@ -2437,6 +2489,92 @@ def check_resume_picker(root, environment):
     assert list(lazy_dir.glob('*.jsonl')) == [], list(lazy_dir.glob('*.jsonl'))
 
 
+def check_bg_tasks_pty(root, environment, server):
+    bg_dir = root / 'bg-work'
+    bg_dir.mkdir()
+    agent_dir = root / 'bg-agent'
+    agent_dir.mkdir()
+    (agent_dir / 'models.json').write_text(json.dumps({'providers': {'bg-fixture': {
+        'api': 'openai-completions',
+        'baseUrl': f'http://127.0.0.1:{server.server_port}/bg-fixture',
+        'apiKey': 'bg-key',
+        'models': [{'id': 'bg-model', 'contextWindow': 16000}],
+    }}}))
+    (agent_dir / 'settings.json').write_text(json.dumps({
+        'defaultProvider': 'bg-fixture',
+        'defaultModel': 'bg-model',
+        'quietStartup': True,
+    }))
+    env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color')
+    env.pop('NO_COLOR', None)
+    args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(bg_dir)]
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
+    process = subprocess.Popen(args, cwd=bg_dir, env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+    os.close(slave)
+    transcript = bytearray()
+
+    def expect(marker, start=0):
+        deadline = time.monotonic() + 10
+        while transcript.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('bg PTY timed out', marker, bytes(transcript[start:]))
+            if not select.select([master], [], [], remaining)[0]:
+                continue
+            chunk = os.read(master, 16384)
+            assert chunk, bytes(transcript)
+            transcript.extend(chunk)
+        return transcript.find(marker, start)
+
+    try:
+        expect(b'bg-fixture/bg-model')
+        s = len(transcript)
+        os.write(master, b'start-bg\n')
+        expect(b'bg started', s)
+        expect(b'1 bg', s)
+
+        # Idle prompt wakes up automatically when bg_1 completes and processes notification.
+        expect(b'bg wakeup handled', s)
+
+        # /jobs shows completed bg_1.
+        j = len(transcript)
+        os.write(master, b'/jobs\n')
+        expect(b'bg_1', j)
+        expect(b'[completed]', j)
+
+        # bg_run + bg_kill terminates sleep 30 cleanly.
+        k = len(transcript)
+        os.write(master, b'kill-bg\n')
+        expect(b'bg kill handled', k)
+
+        os.write(master, b'/exit\n')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
+        assert process.wait(timeout=5) == 0, bytes(transcript)
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    task_files = list((bg_dir / '.pi' / 'tasks').rglob('bg_1.json'))
+    assert len(task_files) == 1, task_files
+    meta = json.loads(task_files[0].read_text())
+    assert meta['status'] == 'completed' and meta['exit_code'] == 0, meta
+    assert (task_files[0].parent / 'bg_1.output').read_text() == 'bg-done-marker\n'
+
+
 def check_pi_import(root, resume_args, environment, server):
     project = root / 'pi-import-project'
     project.mkdir()
@@ -3392,12 +3530,12 @@ for line in sys.stdin:
                                         input='', text=True, capture_output=True, env=environment, timeout=20)
                 assert result.returncode != 0 and expected in result.stderr, result.stderr
                 assert not rejected_path.exists()
-            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'get_content'}
+            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}
             for index, (flags, expected) in enumerate([
                 (['--tools', 'read,ls'], {'read', 'ls'}),
                 (['-t', 'r*,*sh', '-xt', '*sh'], {'read'}),
-                (['--tools=+write,-write,-bash,-web_fetch,-get_content'], {'read', 'edit'}),
-                ([], {'read', 'write', 'edit', 'bash', 'web_fetch', 'get_content'}),
+                (['--tools=+write,-write,-bash,-web_fetch,-get_content,-bg_run,-bg_status,-bg_logs,-bg_kill'], {'read', 'edit'}),
+                ([], {'read', 'write', 'edit', 'bash', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}),
                 (['-nt', '-t', '+read,+ls', '--exclude-tools=ls'], {'read'}),
                 (['-nbt'], set()), (['--tools', ''], set()),
                 (['--tools', 'unknown'], set()),
@@ -3782,6 +3920,7 @@ for line in sys.stdin:
             check_resume_picker(root, environment)
             check_tree_navigation(root, environment, server)
             check_queued_followup_editing(root, environment, server)
+            check_bg_tasks_pty(root, environment, server)
             check_tui_components(root, environment, server)
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'

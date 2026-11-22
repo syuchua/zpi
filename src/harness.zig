@@ -220,6 +220,7 @@ pub const Harness = struct {
     retained_native_warning: bool = false,
     steering_mutex: std.Io.Mutex = .init,
     steering_queue: std.ArrayList([]u8) = .empty,
+    bg_wake_interrupt: zpi.model.Interrupt,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -228,6 +229,9 @@ pub const Harness = struct {
         options: Options,
         sink: ?Sink,
     ) !*Harness {
+        var bg_wake = try zpi.model.Interrupt.init();
+        errdefer bg_wake.deinit(io);
+
         const self = try gpa.create(Harness);
         errdefer gpa.destroy(self);
 
@@ -265,6 +269,7 @@ pub const Harness = struct {
             .enabled_tools = &.{},
             .runtime = undefined,
             .sink = sink,
+            .bg_wake_interrupt = bg_wake,
         };
         var arena_active = true;
         errdefer if (arena_active) self.arena.deinit();
@@ -420,8 +425,13 @@ pub const Harness = struct {
         self.tool_set = try zpi.tools.ToolSet.initWithOptions(gpa, .{
             .temp_dir = environ.get("TMPDIR") orelse "/tmp",
             .allow_loopback_web_fetch = options.allow_loopback_web_fetch,
+            .io = io,
+            .cwd = cwd,
         });
         errdefer self.tool_set.deinit();
+        if (self.tool_set.bg_manager) |mgr| {
+            mgr.setWakeHook(.{ .context = self, .trigger = bgWakeErased });
+        }
 
         var registered_tools: []const agent.Tool = self.tool_set.tools;
         self.native_modules = try a.alloc(zpi.native_runtime.Module, options.native_plugins.len);
@@ -561,11 +571,40 @@ pub const Harness = struct {
             };
         }
         self.tool_set.deinit();
+        self.bg_wake_interrupt.deinit(self.io);
         skills.freeSkills(self.arena.allocator(), self.discovered_skills);
         for (self.mcp_clients[0..self.mcp_started]) |*client| client.deinit();
         self.store.deinit();
         self.arena.deinit();
         self.gpa.destroy(self);
+    }
+
+    fn bgWakeErased(context: *anyopaque) void {
+        const self: *Harness = @ptrCast(@alignCast(context));
+        self.bg_wake_interrupt.trigger();
+    }
+
+    pub fn bgRunningCount(self: *const Harness) usize {
+        if (self.tool_set.bg_manager) |mgr| return mgr.runningCount();
+        return 0;
+    }
+
+    pub fn bgStatusText(self: *const Harness, allocator: std.mem.Allocator, task_id: ?[]const u8) ![]u8 {
+        if (self.tool_set.bg_manager) |mgr| return try mgr.formatStatusAlloc(allocator, task_id);
+        return try allocator.dupe(u8, "Background tasks unavailable.");
+    }
+
+    pub fn bgWakeCancel(self: *Harness) zpi.model.Cancel {
+        return self.bg_wake_interrupt.cancel();
+    }
+
+    pub fn resetBgWake(self: *Harness) void {
+        self.bg_wake_interrupt.reset();
+    }
+
+    pub fn popBgNotifications(self: *Harness, allocator: std.mem.Allocator) ![]zpi.bg_tasks.Notification {
+        if (self.tool_set.bg_manager) |mgr| return try mgr.popNotifications(allocator);
+        return try allocator.alloc(zpi.bg_tasks.Notification, 0);
     }
 
     pub fn setSink(self: *Harness, sink: ?Sink) void {

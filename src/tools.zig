@@ -5,10 +5,13 @@ const agent = @import("agent");
 const replacements = @import("replacements");
 const search = @import("search");
 const web_fetch = @import("web_fetch");
+const bg_tasks = @import("bg_tasks");
 
 pub const Options = struct {
     temp_dir: []const u8 = "/tmp",
     allow_loopback_web_fetch: bool = false,
+    io: ?std.Io = null,
+    cwd: []const u8 = ".",
 };
 
 pub const ToolSet = struct {
@@ -16,6 +19,7 @@ pub const ToolSet = struct {
     tools: []agent.Tool,
     temp_dir: []const u8,
     web_fetch_store: *web_fetch.Store,
+    bg_manager: ?*bg_tasks.Manager = null,
 
     pub fn init(allocator: std.mem.Allocator) !ToolSet {
         return initWithOptions(allocator, .{});
@@ -38,7 +42,11 @@ pub const ToolSet = struct {
         wf_store.* = web_fetch.Store.init(allocator, opts.allow_loopback_web_fetch);
         errdefer wf_store.deinit();
 
-        const definitions = try a.alloc(agent.Tool, 9);
+        const bg_mgr: ?*bg_tasks.Manager = if (opts.io) |io| try bg_tasks.Manager.init(allocator, io, opts.cwd) else null;
+        errdefer if (bg_mgr) |mgr| mgr.deinit();
+
+        const tool_count: usize = if (bg_mgr != null) 13 else 9;
+        const definitions = try a.alloc(agent.Tool, tool_count);
         definitions[0] = try definition(a, "read", "Read a text file. Output is truncated to 2000 lines or 50 KiB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Maximum number of lines to read\"}},\"required\":[\"path\"],\"additionalProperties\":false}", null, read);
         definitions[1] = try definition(a, "write", "Create or overwrite a text file, creating parent directories.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}", null, write);
         definitions[2] = try definition(a, "edit", "Make precise unique exact replacements. All edits match the original file; overlapping edits, duplicates and no-ops are rejected.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"oldText\",\"newText\"],\"additionalProperties\":false},\"minItems\":1,\"maxItems\":1024}},\"required\":[\"path\"],\"additionalProperties\":false}", null, edit);
@@ -48,10 +56,17 @@ pub const ToolSet = struct {
         definitions[6] = try definition(a, "ls", "List directory entries including dotfiles, sorted by ASCII case-insensitive name; directory names end with a slash.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"additionalProperties\":false}", null, ls);
         definitions[7] = try definition(a, "web_fetch", "Fetch public HTTP(S) web pages with SSRF protection, returning readable text/markdown or raw content plus a cached responseId for pagination via get_content.", "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Public http(s) URL to fetch\"},\"urls\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"maxItems\":10},\"mode\":{\"type\":\"string\",\"enum\":[\"readable\",\"raw\"]},\"redirects\":{\"type\":\"string\",\"enum\":[\"follow\",\"same-origin\"]},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":120}},\"additionalProperties\":false}", wf_store, web_fetch.executeWebFetch);
         definitions[8] = try definition(a, "get_content", "Page through or search stored content returned by web_fetch using responseId.", "{\"type\":\"object\",\"properties\":{\"responseId\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"urlIndex\":{\"type\":\"integer\",\"minimum\":0},\"offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":50000},\"findText\":{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"maxItems\":10}]},\"findMode\":{\"type\":\"string\",\"enum\":[\"exact\",\"case-insensitive\"]}},\"required\":[\"responseId\"],\"additionalProperties\":false}", wf_store, web_fetch.executeGetContent);
-        return .{ .arena = arena, .tools = definitions, .temp_dir = owned_temp, .web_fetch_store = wf_store };
+        if (bg_mgr) |mgr| {
+            definitions[9] = try definition(a, "bg_run", "Start a named long-running shell command in the background and return immediately with a taskId and output path. Terminal completion delivers <background-task-notification> and triggers a follow-up turn by default.", "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"command\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"},\"timeoutSeconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":86400},\"notifyOnCompletion\":{\"type\":\"boolean\"},\"triggerOnCompletion\":{\"type\":\"boolean\"}},\"required\":[\"name\",\"command\"],\"additionalProperties\":false}", mgr, bg_tasks.executeBgRun);
+            definitions[10] = try definition(a, "bg_status", "Inspect point-in-time status for one or all background tasks.", "{\"type\":\"object\",\"properties\":{\"taskId\":{\"type\":\"string\"}},\"additionalProperties\":false}", mgr, bg_tasks.executeBgStatus);
+            definitions[11] = try definition(a, "bg_logs", "Read bounded head or tail output from a background task log file.", "{\"type\":\"object\",\"properties\":{\"taskId\":{\"type\":\"string\"},\"tail\":{\"type\":\"boolean\"},\"maxBytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":51200}},\"required\":[\"taskId\"],\"additionalProperties\":false}", mgr, bg_tasks.executeBgLogs);
+            definitions[12] = try definition(a, "bg_kill", "Terminate a running background task process group by taskId.", "{\"type\":\"object\",\"properties\":{\"taskId\":{\"type\":\"string\"}},\"required\":[\"taskId\"],\"additionalProperties\":false}", mgr, bg_tasks.executeBgKill);
+        }
+        return .{ .arena = arena, .tools = definitions, .temp_dir = owned_temp, .web_fetch_store = wf_store, .bg_manager = bg_mgr };
     }
     pub fn deinit(self: *ToolSet) void {
         const alloc = self.arena.child_allocator;
+        if (self.bg_manager) |mgr| mgr.deinit();
         self.web_fetch_store.deinit();
         alloc.destroy(self.web_fetch_store);
         self.arena.deinit();

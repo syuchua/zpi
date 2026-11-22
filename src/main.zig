@@ -219,6 +219,7 @@ fn run(init: std.process.Init) !void {
                 .context = &adapter,
                 .run = CliAdapter.submitErased,
                 .session_info = CliAdapter.sessionInfoErased,
+                .jobs_info = CliAdapter.jobsErased,
                 .cancel = cancel_token,
                 .reset_cancel = CliAdapter.resetCancelErased,
                 .trigger_cancel = CliAdapter.triggerCancelErased,
@@ -239,6 +240,9 @@ fn run(init: std.process.Init) !void {
                 .toggle_expand = CliAdapter.toggleExpandErased,
                 .push_steering = CliAdapter.pushSteeringErased,
                 .drain_steering = CliAdapter.drainSteeringErased,
+                .bg_wake = h.bgWakeCancel(),
+                .reset_bg_wake = CliAdapter.resetBgWakeErased,
+                .pop_bg_notifications = CliAdapter.popBgNotificationsErased,
                 .color_mode = adapter.tui_theme.mode,
                 .quiet_startup = status.quiet_startup,
             });
@@ -397,6 +401,7 @@ const CliAdapter = struct {
             .context_tokens = tokens,
             .context_window = status.context_window,
             .steering_count = h.steeringCount(),
+            .bg_running_count = h.bgRunningCount(),
             .expanded = expanded,
         };
         info.git_branch_len = tui.components.chrome.detectGitBranch(self.io, status.cwd, &info.git_branch_buf);
@@ -618,6 +623,49 @@ const CliAdapter = struct {
                 try writeSafe(self.io, .stdout(), line);
             },
         }
+    }
+
+    fn jobsErased(context: *anyopaque, arg: []const u8) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness orelse return;
+        const text = try h.bgStatusText(self.allocator, if (arg.len > 0) arg else null);
+        defer self.allocator.free(text);
+        try writeSafe(self.io, .stdout(), text);
+        try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+    }
+
+    fn resetBgWakeErased(context: *anyopaque) void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        if (self.harness) |h| h.resetBgWake();
+    }
+
+    fn popBgNotificationsErased(context: *anyopaque, allocator: std.mem.Allocator) anyerror![]tui.BgNotification {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness orelse return try allocator.alloc(tui.BgNotification, 0);
+        const raw = try h.popBgNotifications(allocator);
+        defer {
+            for (raw) |*n| @constCast(n).deinit(allocator);
+            allocator.free(raw);
+        }
+        const out = try allocator.alloc(tui.BgNotification, raw.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |item| {
+                allocator.free(item.task_name);
+                allocator.free(item.text);
+            }
+            allocator.free(out);
+        }
+        for (raw) |n| {
+            out[built] = .{
+                .task_name = try allocator.dupe(u8, n.task_name),
+                .status = @tagName(n.status),
+                .text = try allocator.dupe(u8, n.text),
+                .trigger = n.trigger,
+            };
+            built += 1;
+        }
+        return out;
     }
 
     fn sessionInfoErased(context: *anyopaque) anyerror!void {

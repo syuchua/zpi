@@ -10,6 +10,7 @@ pub const native_runtime = @import("native_runtime");
 pub const native_tools = @import("native_tools");
 pub const agent = @import("agent");
 pub const tools = @import("tools");
+pub const bg_tasks = @import("bg_tasks");
 pub const session = @import("session");
 pub const mcp = @import("mcp");
 pub const mcp_tools = @import("mcp_tools");

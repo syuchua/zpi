@@ -101,7 +101,7 @@ pub fn select(a: std.mem.Allocator, candidates: []const Candidate, selection: Se
 }
 
 fn isDefaultBuiltin(name: []const u8) bool {
-    inline for (.{ "read", "bash", "edit", "write", "web_fetch", "get_content" }) |default_name| {
+    inline for (.{ "read", "bash", "edit", "write", "web_fetch", "get_content", "bg_run", "bg_status", "bg_logs", "bg_kill" }) |default_name| {
         if (std.mem.eql(u8, name, default_name)) return true;
     }
     return false;
@@ -141,6 +141,10 @@ const fixture = [_]Candidate{
     .{ .name = "ls", .builtin = true },
     .{ .name = "web_fetch", .builtin = true },
     .{ .name = "get_content", .builtin = true },
+    .{ .name = "bg_run", .builtin = true },
+    .{ .name = "bg_status", .builtin = true },
+    .{ .name = "bg_logs", .builtin = true },
+    .{ .name = "bg_kill", .builtin = true },
     .{ .name = "echo_native", .builtin = false },
     .{ .name = "hello", .builtin = false },
 };
@@ -150,25 +154,25 @@ fn expect(selection: Selection, expected: []const usize) !void {
     try std.testing.expectEqualSlices(usize, expected, result);
 }
 test "tool selection applies pi defaults allowlists modifiers and exclusions" {
-    try expect(.{}, &.{ 0, 1, 2, 3, 7, 8, 9, 10 });
+    try expect(.{}, &.{ 0, 1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14 });
     try expect(.{ .no_tools = true }, &.{});
-    try expect(.{ .no_builtin_tools = true }, &.{ 9, 10 });
-    try expect(.{ .tools = " read , echo_*,read,unknown, " }, &.{ 0, 9 });
-    try expect(.{ .tools = "*", .exclude = "w*,g*,hello" }, &.{ 0, 1, 2, 5, 6, 9 });
-    try expect(.{ .tools = "-write,+write,-write,-bash,-web_fetch,-get_content,-hello" }, &.{ 0, 2, 9 });
-    try expect(.{ .no_tools = true, .tools = "+read,+hello" }, &.{ 0, 10 });
+    try expect(.{ .no_builtin_tools = true }, &.{ 13, 14 });
+    try expect(.{ .tools = " read , echo_*,read,unknown, " }, &.{ 0, 13 });
+    try expect(.{ .tools = "*", .exclude = "w*,g*,b*,hello" }, &.{ 0, 2, 5, 6, 13 });
+    try expect(.{ .tools = "-write,+write,-write,-bash,-web_fetch,-get_content,-bg_run,-bg_status,-bg_logs,-bg_kill,-hello" }, &.{ 0, 2, 13 });
+    try expect(.{ .no_tools = true, .tools = "+read,+hello" }, &.{ 0, 14 });
     try expect(.{ .no_tools = true, .tools = "read", .exclude = "read" }, &.{});
-    try expect(.{ .no_builtin_tools = true, .tools = "+read" }, &.{ 0, 9, 10 });
+    try expect(.{ .no_builtin_tools = true, .tools = "+read" }, &.{ 0, 13, 14 });
     try expect(.{ .tools = "read", .no_builtin_tools = true }, &.{0});
     try expect(.{ .tools = "", .no_builtin_tools = true }, &.{});
-    try expect(.{ .exclude = "" }, &.{ 0, 1, 2, 3, 7, 8, 9, 10 });
+    try expect(.{ .exclude = "" }, &.{ 0, 1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14 });
     try std.testing.expectError(error.MixedToolSelection, select(std.testing.allocator, &fixture, .{ .tools = "read,+write" }));
     try std.testing.expectError(error.InvalidToolModifier, select(std.testing.allocator, &fixture, .{ .tools = "+r*" }));
     try std.testing.expectError(error.InvalidToolModifier, select(std.testing.allocator, &fixture, .{ .tools = "-" }));
-    try expect(.{ .exclude = "+read" }, &.{ 0, 1, 2, 3, 7, 8, 9, 10 });
-    try expect(.{ .default_tools = &.{ "-bash", "+grep" } }, &.{ 0, 2, 3, 4, 7, 8, 9, 10 });
-    try expect(.{ .default_tools = &.{ "read", "ls" }, .tools = "+grep" }, &.{ 0, 4, 6, 9, 10 });
-    try expect(.{ .default_tools = &.{} }, &.{ 9, 10 });
+    try expect(.{ .exclude = "+read" }, &.{ 0, 1, 2, 3, 7, 8, 9, 10, 11, 12, 13, 14 });
+    try expect(.{ .default_tools = &.{ "-bash", "+grep" } }, &.{ 0, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14 });
+    try expect(.{ .default_tools = &.{ "read", "ls" }, .tools = "+grep" }, &.{ 0, 4, 6, 13, 14 });
+    try expect(.{ .default_tools = &.{} }, &.{ 13, 14 });
 }
 test "tool selection wildcard matches full names and escapes other punctuation" {
     try std.testing.expect(matches("*", "read"));

@@ -68,6 +68,76 @@ pub const InputQueue = struct {
         return self.readByteTimeout(fd, cancel, -1);
     }
 
+    pub fn readByteWithCancelAndWake(
+        self: *InputQueue,
+        fd: std.posix.fd_t,
+        cancel: ?agent.model.Cancel,
+        wake: ?agent.model.Cancel,
+        timeout_ms: i32,
+    ) !?u8 {
+        if (cancel) |token| if (token.isCanceled()) return error.Canceled;
+        if (wake) |w| if (w.isCanceled()) return null;
+        if (self.start < self.end) {
+            const b = self.buf[self.start];
+            self.start += 1;
+            return b;
+        }
+        if (self.eof) return null;
+
+        var pollfds: [3]std.posix.pollfd = undefined;
+        var nfds: usize = 1;
+        pollfds[0] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+        var cancel_idx: ?usize = null;
+        if (cancel) |token| {
+            if (token.poll_fd) |cancel_fd| {
+                cancel_idx = nfds;
+                pollfds[nfds] = .{ .fd = cancel_fd, .events = std.posix.POLL.IN, .revents = 0 };
+                nfds += 1;
+            }
+        }
+        var wake_idx: ?usize = null;
+        if (wake) |w| {
+            if (w.poll_fd) |wake_fd| {
+                wake_idx = nfds;
+                pollfds[nfds] = .{ .fd = wake_fd, .events = std.posix.POLL.IN, .revents = 0 };
+                nfds += 1;
+            }
+        }
+        while (true) {
+            const ready = std.posix.poll(pollfds[0..nfds], timeout_ms) catch |err| switch (err) {
+                else => return err,
+            };
+            if (cancel) |token| {
+                if (token.isCanceled() or (cancel_idx != null and (pollfds[cancel_idx.?].revents & std.posix.POLL.IN) != 0)) {
+                    return error.Canceled;
+                }
+            }
+            if (wake) |w| {
+                if (w.isCanceled() or (wake_idx != null and (pollfds[wake_idx.?].revents & std.posix.POLL.IN) != 0)) {
+                    return null;
+                }
+            }
+            if (ready == 0) return null;
+            if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
+                const n = std.posix.read(fd, &self.buf) catch |err| switch (err) {
+                    error.WouldBlock => {
+                        for (pollfds[0..nfds]) |*pfd| pfd.revents = 0;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (n == 0) {
+                    self.eof = true;
+                    return null;
+                }
+                self.start = 1;
+                self.end = n;
+                return self.buf[0];
+            }
+            for (pollfds[0..nfds]) |*pfd| pfd.revents = 0;
+        }
+    }
+
     pub fn readByteWithWake(self: *InputQueue, fd: std.posix.fd_t, wake: agent.model.Cancel, timeout_ms: i32) !?u8 {
         if (wake.isCanceled()) return null;
         if (self.start < self.end) {
