@@ -3,6 +3,10 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const TuiMode = enum { native, none };
+    const tui_mode = b.option(TuiMode, "tui", "Terminal UI frontend: native (default) or none (headless)") orelse .native;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_tui", tui_mode == .native);
     const http_headers = b.addModule("http_headers", .{
         .root_source_file = b.path("src/http_headers.zig"),
         .target = target,
@@ -162,21 +166,47 @@ pub fn build(b: *std.Build) void {
     });
     const skills = b.createModule(.{ .root_source_file = b.path("src/cli/skills.zig"), .target = target, .optimize = optimize });
     const prompt_templates = b.createModule(.{ .root_source_file = b.path("src/cli/prompt_templates.zig"), .target = target, .optimize = optimize });
+    const tool_selection = b.createModule(.{ .root_source_file = b.path("src/cli/tool_selection.zig"), .target = target, .optimize = optimize });
+    const harness = b.addModule("harness", .{
+        .root_source_file = b.path("src/harness.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zpi", .module = core },
+            .{ .name = "http_headers", .module = http_headers },
+            .{ .name = "skills", .module = skills },
+            .{ .name = "prompt_templates", .module = prompt_templates },
+            .{ .name = "tool_selection", .module = tool_selection },
+        },
+    });
     const pi_session = b.createModule(.{
         .root_source_file = b.path("src/pi_session.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "session", .module = session } },
     });
+    const exe_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = if (tui_mode == .native) &.{
+            .{ .name = "zpi", .module = core },
+            .{ .name = "harness", .module = harness },
+            .{ .name = "tui", .module = tui },
+            .{ .name = "tool_selection", .module = tool_selection },
+            .{ .name = "pi_session", .module = pi_session },
+        } else &.{
+            .{ .name = "zpi", .module = core },
+            .{ .name = "harness", .module = harness },
+            .{ .name = "tool_selection", .module = tool_selection },
+            .{ .name = "pi_session", .module = pi_session },
+        },
+    });
+    exe_module.addOptions("build_options", build_options);
     const exe = b.addExecutable(.{
         .name = "zpi",
         .linkage = .dynamic,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "tui", .module = tui }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "skills", .module = skills }, .{ .name = "prompt_templates", .module = prompt_templates }, .{ .name = "pi_session", .module = pi_session } },
-        }),
+        .root_module = exe_module,
     });
     b.installArtifact(exe);
     b.installFile("scripts/ts-host.mjs", "share/zpi/ts-host.mjs");
@@ -204,6 +234,9 @@ pub fn build(b: *std.Build) void {
 
     const lib_tests = b.addTest(.{ .name = "core-tests", .root_module = core });
     const exe_tests = std.Build.Step.Compile.create(b, .{ .name = "cli-tests", .kind = .@"test", .linkage = .dynamic, .root_module = exe.root_module });
+    const harness_tests = b.addTest(.{ .name = "harness-tests", .root_module = harness });
+    const skills_tests = b.addTest(.{ .name = "skills-tests", .root_module = skills });
+    const tool_selection_tests = b.addTest(.{ .name = "tool-selection-tests", .root_module = tool_selection });
     const tui_tests = b.addTest(.{ .name = "tui-tests", .root_module = tui });
     const prompt_template_tests = b.addTest(.{ .name = "prompt-template-tests", .root_module = prompt_templates });
     const pi_session_tests = b.addTest(.{ .name = "pi-session-tests", .root_module = pi_session });
@@ -388,7 +421,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(anthropic_edge_tests).step);
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
-    test_step.dependOn(&b.addRunArtifact(tui_tests).step);
+    test_step.dependOn(&b.addRunArtifact(harness_tests).step);
+    test_step.dependOn(&b.addRunArtifact(skills_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tool_selection_tests).step);
+    if (tui_mode == .native) test_step.dependOn(&b.addRunArtifact(tui_tests).step);
     test_step.dependOn(&b.addRunArtifact(sse_tests).step);
     test_step.dependOn(&b.addRunArtifact(http_header_tests).step);
     test_step.dependOn(&b.addRunArtifact(http_transport_tests).step);
@@ -416,7 +452,10 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(anthropic_edge_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(lib_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(exe_tests, .{}).step);
-    test_binaries.dependOn(&b.addInstallArtifact(tui_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(harness_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(skills_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(tool_selection_tests, .{}).step);
+    if (tui_mode == .native) test_binaries.dependOn(&b.addInstallArtifact(tui_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(sse_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(http_header_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(http_transport_tests, .{}).step);

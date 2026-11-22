@@ -1,6 +1,6 @@
 const std = @import("std");
 const zpi = @import("zpi");
-const tool_selection = @import("tool_selection.zig");
+const tool_selection = @import("tool_selection");
 
 pub const OutputMode = enum { auto, interactive, print, json };
 pub const Mode = enum { tui, print, json };
