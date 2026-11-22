@@ -216,6 +216,22 @@ fn renderStartupBanner(io: std.Io, output: std.Io.File, submit: Submit, th: them
     try out.append(a, '\n');
     lines += 1;
 
+    const logo = [_][]const u8{
+        " ____  ____  ___",
+        "|__ / |  _ \\|_ _|",
+        " / /  | |_) || |",
+        "/___| |  __/|___|",
+        "      |_|",
+    };
+    const logo_width = 16;
+    if (sz.col > logo_width and sz.row >= 20) {
+        for (logo) |row| {
+            try th.paint(&out, a, theme.Theme.accent, row);
+            try out.append(a, '\n');
+        }
+        lines += logo.len;
+    }
+
     try th.appendOpen(&out, a, theme.Theme.accent);
     try out.appendSlice(a, "zpi");
     try th.appendClose(&out, a);

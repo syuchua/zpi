@@ -2379,6 +2379,7 @@ def check_resume_picker(root, environment):
 
     try:
         expect(b'v0.1.0-dev')
+        expect(b'|__ / |  _ \\|_ _|')
         expect(b'[Tools]')
         expect(b'first task alpha')
         expect(b'alpha answer')

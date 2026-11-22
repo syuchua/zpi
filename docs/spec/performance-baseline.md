@@ -13,6 +13,24 @@ python3 scripts/bench-cli.py /absolute/path/to/zpi \
 
 The harness records raw elapsed-time, per-child peak-RSS and CPU samples; p50/p95; OS, architecture, version and binary SHA-256; and session fixture sizes. It starts a fresh Zpi process for each sample with an isolated temporary home and uses a loopback provider. It requires Python 3.9+ and POSIX `wait4` and `SIGALRM`. Zpi receives only `HOME` and `PATH`. Samples use the operating system's normal filesystem caching.
 
+## CLI Startup Comparison
+
+A local comparison was run on macOS 27.2.0 arm64 with 20 fresh processes per executable. Both commands used the same Python `subprocess.Popen` + `os.wait4` harness, temporary `HOME`, environment limited to `PATH` and `HOME`, and `--version` command. The wall time includes Python launch overhead, process creation, executable/runtime startup and command completion. Peak RSS is the maximum per-child `ru_maxrss` observed across those samples.
+
+| Executable | Version | Binary SHA-256 | `--version` p50/p95 | Maximum sampled peak RSS |
+| --- | --- | --- | --- | --- |
+| Zpi (`zig-out/bin/zpi`, default build) | `0.1.0-dev` | `4d6f64846cfef64cb0b2e65e451693c39f27717c6ee8ff2df300b4865815266b` | 3.25/3.39 ms | 3.44 MiB |
+| pi (`@earendil-works/pi-coding-agent` bundled CLI) | `1.6.0` | `e79626f2dd6f94aa45d30f3fa63cd84319a6eefcd150b353cfaf274366926774` | 104.53/106.70 ms | 114.68 MiB |
+
+Reproduce from the repository root after building Zpi and installing pi:
+
+```sh
+zig build
+python3 scripts/bench-startup.py --zpi ./zig-out/bin/zpi --pi "$(command -v pi)" --samples 20
+```
+
+This comparison is an indicative local CLI startup snapshot, not an apples-to-apples interactive readiness or steady-state memory benchmark. The Zpi binary is the repository's default build and pi uses its bundled Node CLI, so runtime and packaging differ by design. The maximum RSS is sampled peak process RSS for this short command, not a measurement of idle TUI memory. Results vary by machine, OS, filesystem cache, Zig build mode, Node version and launcher. Do not extrapolate this result to provider requests or end-to-end agent turns. Additional optimized-build, interactive-ready, idle process-tree, and same-host cross-platform samples are needed before making broader performance claims.
+
 ## Observed Samples
 
 | Runtime | Binary SHA-256 | `--version` p50/p95, peak RSS | 128 messages (~31 kB), import and resume p50/p95 | 8,192 messages (~2.04 MB), import and resume p50/p95 |

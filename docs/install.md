@@ -56,7 +56,7 @@ ZPI_TEST_BINARY="$zpi_prefix/bin/zpi" python3 scripts/test-cli.py
 
 For an archive install, set `zpi_prefix` to the directory where you extracted it. `python3 scripts/test-package-release.py` separately checks deterministic archive creation from fixed inputs.
 
-Add the selected build's `bin` directory to `PATH` in your shell startup file, before other Zpi installation paths. Keep `bin/zpi` and `share/zpi` in the same prefix so Zpi can find the TypeScript host. A working models configuration and credentials are needed for live requests. [Usage and configuration](../README.md#build-and-use)
+Add the selected build's `bin` directory to `PATH` in your shell startup file, before other Zpi installation paths. Keep `bin/zpi` and `share/zpi` in the same prefix so Zpi can find the TypeScript host. A working models configuration and credentials are needed for live requests. [Build and run](../README.md#build-and-run)
 
 ```sh
 export PATH="$HOME/.local/opt/zpi/local-1/bin:$PATH"
@@ -68,4 +68,4 @@ Verify the new archive checksum and install it under a new prefix, or build a ne
 
 ## Uninstall
 
-Remove the selected prefix from your shell startup file, then delete the dedicated install directory you created for that build. Start a new shell to pick up the updated `PATH`. This removes the executable, host scripts, and ABI headers in that prefix. Configuration and sessions live separately, by default under `~/.zpi/agent`. See the README for the flags and environment variables that can redirect them. [Usage and configuration](../README.md#build-and-use)
+Remove the selected prefix from your shell startup file, then delete the dedicated install directory you created for that build. Start a new shell to pick up the updated `PATH`. This removes the executable, host scripts, and ABI headers in that prefix. Configuration and sessions live separately, by default under `~/.zpi/agent`. See the README for the flags and environment variables that can redirect them. [Build and run](../README.md#build-and-run)
