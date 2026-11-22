@@ -24,6 +24,7 @@ pub const hotkeys_lines = [_][]const u8{
     "Up/Down     Navigate history or lines",
     "Left/Right  Move cursor (Ctrl-A/E home/end, Ctrl-W/U/K delete)",
     "Tab         Complete /command or @path",
+    "Shift+Tab   Cycle thinking level (off -> minimal -> ... -> max)",
     "Alt+Enter   Insert newline (or trailing \\)",
     "Alt+Up      Edit queued follow-up messages",
     "Esc         Clear draft while busy / dismiss overlay",

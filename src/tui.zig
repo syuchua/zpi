@@ -102,6 +102,7 @@ pub const Submit = struct {
     switch_model: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     model_source: ?*const fn (*anyopaque) anyerror!?ModelSource = null,
     set_thinking: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    cycle_thinking: ?*const fn (*anyopaque) void = null,
     status_info: ?*const fn (*anyopaque) components.chrome.FooterInfo = null,
     toggle_expand: ?*const fn (*anyopaque) bool = null,
     color_mode: ?theme.ColorMode = null,
@@ -1120,11 +1121,22 @@ fn readPromptLine(
                                 editor.moveEnd();
                                 dirty = true;
                             },
+                            'Z' => {
+                                if (submit.cycle_thinking) |cycle| {
+                                    cycle(submit.context);
+                                    dirty = true;
+                                }
+                            },
                             'u' => {
-                                // Kitty CSI-u Shift+Enter -> insert newline.
+                                // Kitty CSI-u Shift+Enter -> insert newline; Shift+Tab -> cycle thinking.
                                 if (std.mem.eql(u8, params, "13;2")) {
                                     try editor.insertSlice("\n");
                                     dirty = true;
+                                } else if (std.mem.eql(u8, params, "9;2")) {
+                                    if (submit.cycle_thinking) |cycle| {
+                                        cycle(submit.context);
+                                        dirty = true;
+                                    }
                                 }
                             },
                             '~' => {
@@ -1337,8 +1349,11 @@ const LiveScreen = struct {
             if (had_pending) try full_line.appendSlice(self.allocator, self.pending_line.items);
             try full_line.appendSlice(self.allocator, seg);
 
-            if (self.th.mode != .none and (self.md.in_code_fence or components.markdown.MarkdownStyler.hasSyntax(full_line.items))) {
-                const styled = try self.md.styleLine(self.allocator, self.th, full_line.items);
+            const wrap_cols = @max(16, self.overlay_cols -| 1);
+            const needs_style = self.th.mode != .none and (self.md.in_code_fence or components.markdown.MarkdownStyler.hasSyntax(full_line.items));
+            const needs_wrap = self.color and terminal.visibleWidth(full_line.items) > wrap_cols;
+            if (needs_style or needs_wrap) {
+                const styled = try self.md.styleWrappedLineAlloc(self.allocator, self.th, full_line.items, wrap_cols);
                 defer self.allocator.free(styled);
                 if (had_pending) {
                     const p_rows = pendingLineRows(self.pending_line.items, self.overlay_cols);
@@ -1648,7 +1663,9 @@ fn runTurnWithLiveEditor(
     var done = try agent.model.Interrupt.init();
     defer done.deinit(io);
 
+    var cols = terminalColumns(io, output);
     var screen = LiveScreen.init(submit.allocator, io, output, color, th);
+    screen.overlay_cols = cols;
     defer screen.deinit();
 
     submit.set_live_writer.?(submit.context, screen.writer());
@@ -1683,7 +1700,6 @@ fn runTurnWithLiveEditor(
     };
 
     var in_paste = false;
-    var cols = terminalColumns(io, output);
     var dirty = followups.items.len > 0 or editor.buf.items.len > 0;
     const wake = done.cancel();
     var last_tick_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();

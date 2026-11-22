@@ -619,6 +619,13 @@ pub const Harness = struct {
         return level;
     }
 
+    pub fn cycleThinking(self: *Harness) zpi.model.ThinkingLevel {
+        self.thinking_level = self.thinking_level.next();
+        self.explicit_thinking = true;
+        self.syncClients();
+        return self.thinking_level;
+    }
+
     pub fn compact(self: *Harness, focus: []const u8) !bool {
         const compacted = try self.runCompaction(if (focus.len > 0) focus else null, false, true);
         if (!compacted) try self.emitEvent(.compaction_empty);
@@ -1106,6 +1113,10 @@ test "harness runs prompt against loopback HTTP server without TTY and tracks st
     try std.testing.expectEqual(@as(usize, 1), cap.settled);
 
     try std.testing.expectEqual(zpi.model.ThinkingLevel.high, try h.setThinking("high"));
+    try std.testing.expectEqual(zpi.model.ThinkingLevel.xhigh, h.cycleThinking());
+    try std.testing.expectEqual(zpi.model.ThinkingLevel.max, h.cycleThinking());
+    try std.testing.expectEqual(zpi.model.ThinkingLevel.off, h.cycleThinking());
+    _ = try h.setThinking("high");
     const stats = try h.sessionStats();
     try std.testing.expectEqual(@as(usize, 2), stats.total_messages);
     try std.testing.expectEqual(@as(usize, 1), stats.user_messages);

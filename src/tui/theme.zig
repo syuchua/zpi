@@ -31,6 +31,7 @@ pub const Theme = struct {
     pub const user_badge = ColorSpec{ .ansi16_fg = 36, .ansi256 = 117, .rgb = .{ .r = 132, .g = 204, .b = 248 }, .bold = true };
     pub const thinking = ColorSpec{ .ansi16_fg = 90, .ansi256 = 246, .rgb = .{ .r = 156, .g = 163, .b = 175 }, .dim = true, .italic = true };
     pub const tool_header = ColorSpec{ .ansi16_fg = 33, .ansi256 = 180, .rgb = .{ .r = 229, .g = 192, .b = 123 }, .bold = true };
+    pub const warn = ColorSpec{ .ansi16_fg = 33, .ansi256 = 214, .rgb = .{ .r = 229, .g = 192, .b = 123 } };
     pub const tool_ok = ColorSpec{ .ansi16_fg = 32, .ansi256 = 114, .rgb = .{ .r = 152, .g = 195, .b = 121 } };
     pub const tool_err = ColorSpec{ .ansi16_fg = 31, .ansi256 = 203, .rgb = .{ .r = 224, .g = 108, .b = 117 } };
     pub const diff_add = ColorSpec{ .ansi16_fg = 32, .ansi256 = 114, .rgb = .{ .r = 152, .g = 195, .b = 121 } };

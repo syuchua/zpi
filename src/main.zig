@@ -231,6 +231,7 @@ fn run(init: std.process.Init) !void {
                 .switch_model = CliAdapter.switchModelErased,
                 .model_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.modelSourceErased,
                 .set_thinking = CliAdapter.setThinkingErased,
+                .cycle_thinking = CliAdapter.cycleThinkingErased,
                 .status_info = CliAdapter.statusInfoErased,
                 .toggle_expand = CliAdapter.toggleExpandErased,
                 .color_mode = adapter.tui_theme.mode,
@@ -258,6 +259,7 @@ const CliAdapter = struct {
     live_tool_lines: usize = 0,
     live_tool_truncated: bool = false,
     expanded_details: bool = false,
+    has_live_usage: bool = false,
     status_mutex: std.Io.Mutex = .init,
     cached_tokens: u64 = 0,
     harness: ?*harness.Harness = null,
@@ -319,7 +321,21 @@ const CliAdapter = struct {
         const stats = h.sessionStats() catch return;
         self.status_mutex.lockUncancelable(self.io);
         defer self.status_mutex.unlock(self.io);
-        self.cached_tokens = stats.context_tokens_estimate;
+        if (!self.has_live_usage) self.cached_tokens = stats.context_tokens_estimate;
+    }
+
+    fn resetLiveUsageAndRefresh(self: *CliAdapter) void {
+        self.status_mutex.lockUncancelable(self.io);
+        self.has_live_usage = false;
+        self.status_mutex.unlock(self.io);
+        self.refreshCachedStats();
+    }
+
+    fn cycleThinkingErased(context: *anyopaque) void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        if (self.harness) |h| {
+            _ = h.cycleThinking();
+        }
     }
 
     fn isExpanded(self: *CliAdapter) bool {
@@ -374,6 +390,9 @@ const CliAdapter = struct {
 
     fn submit(self: *CliAdapter, prompt: []const u8) !void {
         self.in_thinking = false;
+        self.status_mutex.lockUncancelable(self.io);
+        self.has_live_usage = false;
+        self.status_mutex.unlock(self.io);
         const result = try self.harness.?.submit(prompt);
         if (result.handled) return;
         if (self.in_thinking) {
@@ -507,7 +526,7 @@ const CliAdapter = struct {
     fn compactErased(context: *anyopaque, focus: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         _ = try self.harness.?.compact(focus);
-        self.refreshCachedStats();
+        self.resetLiveUsageAndRefresh();
     }
 
     fn treeSourceErased(context: *anyopaque) tui.TreeSource {
@@ -560,7 +579,7 @@ const CliAdapter = struct {
             },
             .already_active => try std.Io.File.stdout().writeStreamingAll(self.io, "[already at this entry]\n"),
             .branched => |b| {
-                self.refreshCachedStats();
+                self.resetLiveUsageAndRefresh();
                 const line = try std.fmt.allocPrint(self.allocator, "[branched to {s}{s}]\n", .{ b.target, if (b.summarized) " with summary" else "" });
                 defer self.allocator.free(line);
                 try writeSafe(self.io, .stdout(), line);
@@ -670,6 +689,15 @@ const CliAdapter = struct {
                                     text,
                                     if (self.stderr_color) "\x1b[0m" else "",
                                 );
+                            }
+                        },
+                        .usage => |u| {
+                            const live_tokens = if (u.total_tokens > 0) u.total_tokens else (u.input_tokens +| u.output_tokens);
+                            if (live_tokens > 0) {
+                                self.status_mutex.lockUncancelable(self.io);
+                                self.cached_tokens = live_tokens;
+                                self.has_live_usage = true;
+                                self.status_mutex.unlock(self.io);
                             }
                         },
                         else => {},

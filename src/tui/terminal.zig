@@ -394,6 +394,110 @@ pub fn appendTruncatedAnsi(
     return cols;
 }
 
+/// Word/column-wrap a single ANSI-styled line to `max_cols` visible columns,
+/// closing and re-opening active SGR sequences across line breaks.
+pub fn wrapAnsiAlloc(allocator: std.mem.Allocator, text: []const u8, max_cols_raw: usize) ![]u8 {
+    const max_cols = @max(1, max_cols_raw);
+    if (visibleWidth(text) <= max_cols) return try allocator.dupe(u8, text);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var active_sgr: std.ArrayList(u8) = .empty;
+    defer active_sgr.deinit(allocator);
+    var break_sgr: std.ArrayList(u8) = .empty;
+    defer break_sgr.deinit(allocator);
+
+    var line_cols: usize = 0;
+    var line_start_out: usize = 0;
+    var break_out_idx: ?usize = null;
+    var break_in_idx: ?usize = null;
+
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\x1b') {
+            const next = skipEscapeSequence(text, i);
+            const seq = text[i..next];
+            try out.appendSlice(allocator, seq);
+            if (seq.len >= 3 and seq[1] == '[' and seq[seq.len - 1] == 'm') {
+                if (std.mem.eql(u8, seq, "\x1b[0m") or std.mem.eql(u8, seq, "\x1b[m")) {
+                    active_sgr.clearRetainingCapacity();
+                } else {
+                    active_sgr.clearRetainingCapacity();
+                    try active_sgr.appendSlice(allocator, seq);
+                }
+            }
+            i = next;
+            continue;
+        }
+        if (text[i] == '\r') {
+            i += 1;
+            continue;
+        }
+        if (text[i] == '\n') {
+            if (active_sgr.items.len > 0) try out.appendSlice(allocator, "\x1b[0m");
+            try out.append(allocator, '\n');
+            if (active_sgr.items.len > 0) try out.appendSlice(allocator, active_sgr.items);
+            line_cols = 0;
+            line_start_out = out.items.len;
+            break_out_idx = null;
+            break_in_idx = null;
+            i += 1;
+            continue;
+        }
+        const length = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const step = @min(length, text.len - i);
+        const decoded = std.unicode.utf8Decode(text[i .. i + step]) catch 0xfffd;
+        const cp = if (decoded < 0x20 or (decoded >= 0x7f and decoded <= 0x9f)) '?' else decoded;
+        const w: usize = if (text[i] == '\t') 4 else codepointWidth(cp);
+
+        if (line_cols > 0 and line_cols + w > max_cols) {
+            if (break_out_idx) |bo| {
+                if (bo > line_start_out and break_in_idx != null) {
+                    out.items.len = bo;
+                    if (break_sgr.items.len > 0) try out.appendSlice(allocator, "\x1b[0m");
+                    try out.append(allocator, '\n');
+                    if (break_sgr.items.len > 0) try out.appendSlice(allocator, break_sgr.items);
+                    active_sgr.clearRetainingCapacity();
+                    try active_sgr.appendSlice(allocator, break_sgr.items);
+                    i = break_in_idx.?;
+                    line_cols = 0;
+                    line_start_out = out.items.len;
+                    break_out_idx = null;
+                    break_in_idx = null;
+                    continue;
+                }
+            }
+            if (active_sgr.items.len > 0) try out.appendSlice(allocator, "\x1b[0m");
+            try out.append(allocator, '\n');
+            if (active_sgr.items.len > 0) try out.appendSlice(allocator, active_sgr.items);
+            line_cols = 0;
+            line_start_out = out.items.len;
+            break_out_idx = null;
+            break_in_idx = null;
+            continue;
+        }
+
+        if (text[i] == ' ' and step == 1) {
+            break_out_idx = out.items.len;
+            break_in_idx = i + 1;
+            break_sgr.clearRetainingCapacity();
+            try break_sgr.appendSlice(allocator, active_sgr.items);
+        }
+
+        if (text[i] == '\t') {
+            try out.appendSlice(allocator, "    ");
+        } else if (cp == '?' and decoded != '?') {
+            try out.append(allocator, '?');
+        } else {
+            try out.appendSlice(allocator, text[i .. i + step]);
+        }
+        line_cols += w;
+        i += step;
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
 pub fn advanceByColumns(line: []const u8, target_cols: usize) usize {
     var cols: usize = 0;
     var i: usize = 0;
@@ -522,4 +626,15 @@ test "computeLayout tracks wide characters newlines and wrapping" {
     const l2 = computeLayout("abcdef", 6, 6, 2);
     try std.testing.expectEqual(@as(usize, 1), l2.cursor_row);
     try std.testing.expectEqual(@as(usize, 2), l2.cursor_col);
+}
+
+test "wrapAnsiAlloc wraps on word boundaries and preserves active SGR across lines" {
+    const a = std.testing.allocator;
+    const wrapped = try wrapAnsiAlloc(a, "alpha \x1b[33mbeta gammas\x1b[0m", 10);
+    defer a.free(wrapped);
+    try std.testing.expectEqualStrings("alpha\n\x1b[33mbeta\x1b[0m\n\x1b[33mgammas\x1b[0m", wrapped);
+
+    const cjk = try wrapAnsiAlloc(a, "中文日本語", 4);
+    defer a.free(cjk);
+    try std.testing.expectEqualStrings("中文\n日本\n語", cjk);
 }

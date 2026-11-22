@@ -78,6 +78,18 @@ pub const MarkdownStyler = struct {
         try appendInlineStyled(&out, allocator, th, line);
         return try out.toOwnedSlice(allocator);
     }
+
+    pub fn styleWrappedLineAlloc(
+        self: *MarkdownStyler,
+        allocator: std.mem.Allocator,
+        th: theme.Theme,
+        raw_line: []const u8,
+        max_cols: usize,
+    ) ![]u8 {
+        const styled = try self.styleLine(allocator, th, raw_line);
+        defer allocator.free(styled);
+        return try terminal.wrapAnsiAlloc(allocator, styled, max_cols);
+    }
 };
 
 fn headingLevel(trimmed: []const u8) ?usize {
@@ -159,4 +171,14 @@ test "MarkdownStyler styles headings, fences, inline code, bold, and blockquotes
     const plain_styler_out = try (&styler).styleLine(a, theme.Theme.init(.none), "## Plain");
     defer a.free(plain_styler_out);
     try std.testing.expectEqualStrings("## Plain", plain_styler_out);
+
+    const wrapped = try styler.styleWrappedLineAlloc(a, th, "- First item with **bold words** inside", 16);
+    defer a.free(wrapped);
+    var lines_it = std.mem.splitScalar(u8, wrapped, '\n');
+    var count: usize = 0;
+    while (lines_it.next()) |seg| {
+        try std.testing.expect(terminal.visibleWidth(seg) <= 16);
+        count += 1;
+    }
+    try std.testing.expect(count >= 2);
 }

@@ -307,6 +307,18 @@ pub const ThinkingLevel = enum {
         }
         return null;
     }
+
+    pub fn next(self: ThinkingLevel) ThinkingLevel {
+        return switch (self) {
+            .off => .minimal,
+            .minimal => .low,
+            .low => .medium,
+            .medium => .high,
+            .high => .xhigh,
+            .xhigh => .max,
+            .max => .off,
+        };
+    }
 };
 
 pub const ThinkingBudgets = struct {

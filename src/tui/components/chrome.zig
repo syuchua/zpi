@@ -108,7 +108,21 @@ pub const Footer = struct {
         }
         if (info.context_window > 0) {
             const pct = @min(@as(u64, 100), (info.context_tokens *| 100) / info.context_window);
-            try raw.print(allocator, " · {d}% ctx", .{pct});
+            if (pct >= 90) {
+                try th.appendClose(&raw, allocator);
+                try th.appendOpen(&raw, allocator, theme.Theme.tool_err);
+                try raw.print(allocator, " · {d}% ctx", .{pct});
+                try th.appendClose(&raw, allocator);
+                try th.appendOpen(&raw, allocator, theme.Theme.muted);
+            } else if (pct >= 70) {
+                try th.appendClose(&raw, allocator);
+                try th.appendOpen(&raw, allocator, theme.Theme.warn);
+                try raw.print(allocator, " · {d}% ctx", .{pct});
+                try th.appendClose(&raw, allocator);
+                try th.appendOpen(&raw, allocator, theme.Theme.muted);
+            } else {
+                try raw.print(allocator, " · {d}% ctx", .{pct});
+            }
         } else if (info.context_tokens > 0) {
             try raw.print(allocator, " · ~{d} tok", .{info.context_tokens});
         }
@@ -181,4 +195,22 @@ test "Loader and Footer clip to width and format model, thinking, context, and q
     }, 18);
     defer a.free(f_narrow);
     try std.testing.expect(terminal.visibleWidth(f_narrow) <= 18);
+
+    const f_warn = try Footer.renderLineAlloc(a, theme.Theme.init(.truecolor), .{
+        .provider = "openai",
+        .model = "gpt-5",
+        .context_tokens = 75000,
+        .context_window = 100000,
+    }, 80);
+    defer a.free(f_warn);
+    try std.testing.expect(std.mem.indexOf(u8, f_warn, "\x1b[38;2;229;192;123m · 75% ctx\x1b[0m") != null);
+
+    const f_crit = try Footer.renderLineAlloc(a, theme.Theme.init(.truecolor), .{
+        .provider = "openai",
+        .model = "gpt-5",
+        .context_tokens = 95000,
+        .context_window = 100000,
+    }, 80);
+    defer a.free(f_crit);
+    try std.testing.expect(std.mem.indexOf(u8, f_crit, "\x1b[38;2;224;108;117m · 95% ctx\x1b[0m") != null);
 }

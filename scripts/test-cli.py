@@ -352,6 +352,24 @@ class Handler(BaseHTTPRequestHandler):
                 messages = request['messages']
                 user_msg = [m['content'] for m in messages if m['role'] == 'user'][-1]
                 results = [m for m in messages if m['role'] == 'tool']
+                if user_msg == 'wrap-and-usage':
+                    assert request.get('reasoning_effort') == 'high', request
+                    long_md = '- ' + ' '.join(f'word{i}' for i in range(1, 22)) + ' **wrapend**\n'
+                    c_text = self.text(long_md)
+                    c_usage = {
+                        'choices': [],
+                        'usage': {'prompt_tokens': 7500, 'completion_tokens': 500, 'total_tokens': 8000},
+                    }
+                    data = (
+                        'data: ' + json.dumps(c_text) + '\n\n' +
+                        'data: ' + json.dumps(c_usage) + '\n\ndata: [DONE]\n\n'
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if user_msg == 'stream-bash':
                     bash_turns = sum(1 for m in messages if m['role'] == 'user' and m['content'] == 'stream-bash')
                     bash_results = sum(1 for r in results if r.get('tool_call_id', '').startswith('comp-bash-'))
@@ -1884,6 +1902,16 @@ def check_tui_components(root, environment, server):
         assert b'Ctrl+O to expand' not in transcript[start:], transcript[start:]
         os.write(master, b'\x0f')
         time.sleep(0.08)
+
+        # 2c. Shift+Tab cycles thinking_level (medium -> high), Markdown wraps at 80 cols, and live usage updates Footer warning color.
+        shift_mark = len(transcript)
+        os.write(master, b'\x1b[Z')
+        expect(b'comp-fixture/comp-model (high)', shift_mark)
+        wrap_mark = len(transcript)
+        os.write(master, b'wrap-and-usage\n')
+        wrap_end = expect(b'wrapend', wrap_mark)
+        assert b'\nword' in transcript[wrap_mark:wrap_end + 16] or b'\r\nword' in transcript[wrap_mark:wrap_end + 16], transcript[wrap_mark:wrap_end + 16]
+        expect(b'\x1b[38;2;229;192;123m \xc2\xb7 80% ctx\x1b[0m', wrap_mark)
 
         os.write(master, b'/exit\n')
         while True:
