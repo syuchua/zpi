@@ -236,6 +236,8 @@ fn run(init: std.process.Init) !void {
                 .session_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.sessionSourceErased,
                 .status_info = CliAdapter.statusInfoErased,
                 .toggle_expand = CliAdapter.toggleExpandErased,
+                .push_steering = CliAdapter.pushSteeringErased,
+                .drain_steering = CliAdapter.drainSteeringErased,
                 .color_mode = adapter.tui_theme.mode,
                 .quiet_startup = status.quiet_startup,
             });
@@ -256,6 +258,7 @@ const CliAdapter = struct {
     live_writer: if (build_options.enable_tui) ?tui.LiveWriter else ?void = null,
     tui_theme: if (build_options.enable_tui) tui.theme.Theme else void = if (build_options.enable_tui) .{} else {},
     in_thinking: bool = false,
+    turn_user_committed: bool = false,
     live_thinking_bytes: usize = 0,
     live_thinking_truncated: bool = false,
     live_tool_lines: usize = 0,
@@ -354,6 +357,17 @@ const CliAdapter = struct {
         return self.expanded_details;
     }
 
+    fn pushSteeringErased(context: *anyopaque, text: []const u8) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        if (self.harness) |h| try h.pushSteering(text);
+    }
+
+    fn drainSteeringErased(context: *anyopaque, allocator: std.mem.Allocator) anyerror![][]u8 {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        if (self.harness) |h| return try h.drainSteering(allocator);
+        return try allocator.alloc([]u8, 0);
+    }
+
     fn statusInfoErased(context: *anyopaque) tui.components.chrome.FooterInfo {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         const h = self.harness orelse return .{};
@@ -369,6 +383,7 @@ const CliAdapter = struct {
             .cwd = status.cwd,
             .context_tokens = tokens,
             .context_window = status.context_window,
+            .steering_count = h.steeringCount(),
             .expanded = expanded,
         };
     }
@@ -392,6 +407,7 @@ const CliAdapter = struct {
 
     fn submit(self: *CliAdapter, prompt: []const u8) !void {
         self.in_thinking = false;
+        self.turn_user_committed = false;
         self.status_mutex.lockUncancelable(self.io);
         self.has_live_usage = false;
         self.status_mutex.unlock(self.io);
@@ -722,6 +738,22 @@ const CliAdapter = struct {
             .agent => |agent_event| switch (agent_event) {
                 .message_appended => |message| {
                     if (self.mode == .json) try self.json(.{ .type = "message_end", .message = message });
+                    if (self.mode == .interactive and message.role == .user) {
+                        if (!self.turn_user_committed) {
+                            self.turn_user_committed = true;
+                        } else if (comptime build_options.enable_tui) {
+                            for (message.content) |part| switch (part) {
+                                .text => |txt| {
+                                    const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt);
+                                    defer self.allocator.free(echo);
+                                    try self.outSegment("\n", "", "");
+                                    try self.outSegment(echo, "", "\n");
+                                    break;
+                                },
+                                else => {},
+                            };
+                        }
+                    }
                     self.refreshCachedStats();
                 },
                 .provider => |provider_event| {

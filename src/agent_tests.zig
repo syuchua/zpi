@@ -383,3 +383,79 @@ test "agent retries transient errors with backoff respects partial-output safety
     try std.testing.expectEqual(@as(usize, 1), cap4.scheduled);
     try std.testing.expectEqual(@as(usize, 1), cap4.finished_fail);
 }
+
+test "agent mid-turn steering skips remaining tools and injects next user turn" {
+    const State = struct {
+        executed_first: usize = 0,
+        executed_second: usize = 0,
+        steering_queued: bool = false,
+        provider_turns: usize = 0,
+    };
+    var st = State{};
+
+    const FirstTool = struct {
+        fn exec(ctx: ?*anyopaque, _: agent.ToolContext, _: std.json.Value) anyerror!agent.ToolResult {
+            const s: *State = @ptrCast(@alignCast(ctx.?));
+            s.executed_first += 1;
+            s.steering_queued = true;
+            return .{ .text = "first ok" };
+        }
+    };
+    const SecondTool = struct {
+        fn exec(ctx: ?*anyopaque, _: agent.ToolContext, _: std.json.Value) anyerror!agent.ToolResult {
+            const s: *State = @ptrCast(@alignCast(ctx.?));
+            s.executed_second += 1;
+            return .{ .text = "second unexpected" };
+        }
+    };
+    const SteerHook = struct {
+        fn pop(ctx: *anyopaque, a: std.mem.Allocator) anyerror!?[]u8 {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            if (!s.steering_queued) return null;
+            s.steering_queued = false;
+            return try a.dupe(u8, "steer now");
+        }
+    };
+    const SteerProvider = struct {
+        fn run(ctx: *anyopaque, a: std.mem.Allocator, messages: []const model.Message, _: []const model.ToolDefinition, sink: model.EventSink) anyerror!void {
+            const s: *State = @ptrCast(@alignCast(ctx));
+            s.provider_turns += 1;
+            try sink.emit(sink.context, .start);
+            if (s.provider_turns == 1) {
+                const args = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+                defer args.deinit();
+                try sink.emit(sink.context, .{ .tool_call_end = .{ .index = 0, .call = .{ .id = "t1", .name = "first", .arguments = args.value } } });
+                try sink.emit(sink.context, .{ .tool_call_end = .{ .index = 1, .call = .{ .id = "t2", .name = "second", .arguments = args.value } } });
+                try sink.emit(sink.context, .{ .done = .tool_use });
+                return;
+            }
+            const last = messages[messages.len - 1];
+            try std.testing.expectEqual(model.Role.user, last.role);
+            try std.testing.expectEqualStrings("steer now", last.content[0].text);
+            try sink.emit(sink.context, .{ .text_delta = "steered reply" });
+            try sink.emit(sink.context, .{ .done = .stop });
+        }
+    };
+
+    const tools = [_]agent.Tool{
+        .{ .definition = .{ .name = "first", .description = "first", .parameters = .null }, .context = &st, .execute = FirstTool.exec },
+        .{ .definition = .{ .name = "second", .description = "second", .parameters = .null }, .context = &st, .execute = SecondTool.exec },
+    };
+    var rt = agent.Agent.init(std.testing.allocator, std.testing.io, .{ .context = &st, .run_fn = SteerProvider.run }, &tools, "/tmp");
+    defer rt.deinit();
+    rt.steering_hook = .{ .context = &st, .pop_steering = SteerHook.pop };
+    var events = Events{};
+    try rt.prompt("initial", .{ .context = &events, .emit = Events.emit });
+
+    try std.testing.expectEqual(@as(usize, 1), st.executed_first);
+    try std.testing.expectEqual(@as(usize, 0), st.executed_second);
+    try std.testing.expectEqual(@as(usize, 2), st.provider_turns);
+    try std.testing.expectEqual(@as(usize, 1), events.settled);
+    try std.testing.expect(!rt.unresolved_tools);
+    try std.testing.expectEqualStrings("first ok", rt.messages.items[2].content[0].text);
+    try std.testing.expect(!rt.messages.items[2].is_error);
+    try std.testing.expectEqualStrings("Skipped due to queued user message.", rt.messages.items[3].content[0].text);
+    try std.testing.expect(rt.messages.items[3].is_error);
+    try std.testing.expectEqualStrings("steer now", rt.messages.items[4].content[0].text);
+    try std.testing.expectEqualStrings("steered reply", rt.messages.items[5].content[0].text);
+}

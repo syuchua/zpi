@@ -414,8 +414,34 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
             if self.path == '/queue-fixture/chat/completions':
-                user = [m['content'] for m in request['messages'] if m['role'] == 'user'][-1]
+                messages = request['messages']
+                user = [m['content'] for m in messages if m['role'] == 'user'][-1]
                 self.server.queue_requests.append(user)
+                if user == 'steer-batch':
+                    c = {'choices': [{'index': 0, 'delta': {'tool_calls': [
+                        {'index': 0, 'id': 'steer-bash', 'type': 'function',
+                         'function': {'name': 'bash', 'arguments': json.dumps({'command': "printf 'steer-step1\\n'; sleep 0.35", 'timeout': 5})}},
+                        {'index': 1, 'id': 'steer-write', 'type': 'function',
+                         'function': {'name': 'write', 'arguments': json.dumps({'path': 'steer-skipped.txt', 'content': 'must not run'})}},
+                    ]}, 'finish_reason': 'tool_calls'}]}
+                    data = ('data: ' + json.dumps(c) + '\n\ndata: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if user == 'steer redirect':
+                    tool_msgs = [m['content'] for m in messages if m['role'] == 'tool']
+                    assert any('steer-step1' in t for t in tool_msgs), tool_msgs
+                    assert any('Skipped due to queued user message.' in t for t in tool_msgs), tool_msgs
+                    data = ('data: ' + json.dumps(self.text('steered ok')) + '\n\ndata: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if user == 'queue-slow':
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/event-stream')
@@ -1784,11 +1810,31 @@ def check_queued_followup_editing(root, environment, server):
             'queue-slow', 'queued-edited', 'queued-beta', 'unsubmitted draft', 'queue-cancel-stream',
         ], server.queue_requests
 
-        # Discard restored draft with Ctrl-C, then exit cleanly.
+        # Discard restored draft with Ctrl-C, then verify mid-turn Ctrl+S steering skips remaining tool calls.
         start = len(transcript)
         os.write(master, b'\x03')
         expect(prompt_ready, start)
+        start = len(transcript)
+        os.write(master, b'steer-batch\n')
+        expect(b'steer-step1', start)
+        os.write(master, b'steer redirect\x13')
+        expect(b'steered ok', start)
+        expect(prompt_ready, start)
+        assert not (root / 'steer-skipped.txt').exists(), 'second tool call was not skipped by steering'
+
         os.write(master, b'/exit\n')
+        while True:
+            if not select.select([master], [], [], 5)[0]:
+                break
+            try:
+                chunk = os.read(master, 16384)
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            transcript.extend(chunk)
         assert process.wait(timeout=5) == 0, bytes(transcript)
         term_after = termios.tcgetattr(master)
         term_after[3] &= ~getattr(termios, 'PENDIN', 0)

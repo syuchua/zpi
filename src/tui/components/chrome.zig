@@ -85,6 +85,7 @@ pub const FooterInfo = struct {
     context_tokens: u64 = 0,
     context_window: u32 = 0,
     queued_count: usize = 0,
+    steering_count: usize = 0,
     expanded: bool = false,
 };
 
@@ -128,6 +129,9 @@ pub const Footer = struct {
         }
         if (info.queued_count > 0) {
             try raw.print(allocator, " · {d} queued", .{info.queued_count});
+        }
+        if (info.steering_count > 0) {
+            try raw.print(allocator, " · {d} steer", .{info.steering_count});
         }
         if (info.expanded) {
             try raw.appendSlice(allocator, " · expanded");

@@ -122,6 +122,8 @@ pub const Submit = struct {
     session_source: ?*const fn (*anyopaque) anyerror!?SessionSource = null,
     status_info: ?*const fn (*anyopaque) components.chrome.FooterInfo = null,
     toggle_expand: ?*const fn (*anyopaque) bool = null,
+    push_steering: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    drain_steering: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![][]u8 = null,
     color_mode: ?theme.ColorMode = null,
     quiet_startup: bool = false,
 };
@@ -1906,6 +1908,22 @@ fn runTurnWithLiveEditor(
                     dirty = true;
                 }
             },
+            0x13 => {
+                const trimmed = std.mem.trim(u8, editor.buf.items, " \t\r\n");
+                if (trimmed.len > 0) {
+                    if (submit.push_steering) |steer| {
+                        try history.push(trimmed);
+                        try steer(submit.context, trimmed);
+                        try editor.replaceBuffer("");
+                        editor.history_idx = null;
+                        if (editor.draft) |d| {
+                            submit.allocator.free(d);
+                            editor.draft = null;
+                        }
+                        dirty = true;
+                    }
+                }
+            },
             0x15 => {
                 editor.killToLineStart();
                 dirty = true;
@@ -2093,6 +2111,18 @@ fn runTurnWithLiveEditor(
     thread.join();
     joined = true;
     try screen.clearOverlay();
+
+    if (submit.drain_steering) |drain| {
+        const leftover = drain(submit.context, submit.allocator) catch &.{};
+        if (leftover.len > 0) {
+            errdefer {
+                for (leftover) |item| submit.allocator.free(item);
+                submit.allocator.free(leftover);
+            }
+            try followups.insertSlice(submit.allocator, 0, leftover);
+            submit.allocator.free(leftover);
+        }
+    }
 
     if (worker.err) |err| {
         var msg: [256]u8 = undefined;

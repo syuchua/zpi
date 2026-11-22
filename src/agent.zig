@@ -32,6 +32,11 @@ pub const CompactionHook = struct {
     recover_overflow: ?*const fn (*anyopaque) anyerror!bool = null,
 };
 
+pub const SteeringHook = struct {
+    context: *anyopaque,
+    pop_steering: *const fn (*anyopaque, std.mem.Allocator) anyerror!?[]u8,
+};
+
 pub const Event = union(enum) {
     provider: model.Event,
     tool_start: model.ToolCall,
@@ -61,6 +66,7 @@ pub const Agent = struct {
     cancel: ?model.Cancel = null,
     retry: RetryPolicy = .{},
     compaction_hook: ?CompactionHook = null,
+    steering_hook: ?SteeringHook = null,
     max_turns: usize = 32,
     running: bool = false,
     /// An interrupted tool batch requires reconciliation before another prompt.
@@ -138,8 +144,18 @@ pub const Agent = struct {
         defer self.allocator.free(definitions);
         for (self.tools, definitions) |tool, *definition| definition.* = tool.definition;
         var overflow_recovered = false;
+        var pending_steering: ?[]u8 = null;
+        defer if (pending_steering) |s| self.allocator.free(s);
         for (0..self.max_turns) |_| {
             if (self.cancel) |cancel| if (cancel.isCanceled()) return error.Canceled;
+            if (pending_steering) |steering| {
+                defer {
+                    self.allocator.free(steering);
+                    pending_steering = null;
+                }
+                try self.append(.{ .role = .user, .content = &.{.{ .text = steering }} });
+                try self.notifyCommit(sink);
+            }
             if (self.compaction_hook) |hook| {
                 if (hook.before_turn) |prepare| try prepare(hook.context);
             }
@@ -183,13 +199,29 @@ pub const Agent = struct {
             if (reason == .tool_use) self.unresolved_tools = true;
             try self.notifyCommit(sink);
             if (reason == .stop) {
+                if (pending_steering == null) {
+                    if (self.steering_hook) |hook| {
+                        pending_steering = try hook.pop_steering(hook.context, self.allocator);
+                    }
+                }
+                if (pending_steering != null) continue;
                 try sink.emit(sink.context, .settled);
                 return;
             }
+            var steered = false;
             for (collected.calls.items) |call| {
                 if (self.cancel) |cancel| if (cancel.isCanceled()) return error.Canceled;
+                if (!steered) {
+                    if (self.steering_hook) |hook| {
+                        pending_steering = try hook.pop_steering(hook.context, self.allocator);
+                        if (pending_steering != null) steered = true;
+                    }
+                }
                 try sink.emit(sink.context, .{ .tool_start = call });
-                const result = try self.executeTool(call, turn_alloc, sink);
+                const result: ToolResult = if (steered)
+                    .{ .text = "Skipped due to queued user message.", .is_error = true }
+                else
+                    try self.executeTool(call, turn_alloc, sink);
                 try self.append(.{
                     .role = .tool_result,
                     .content = &.{.{ .text = result.text }},
@@ -202,6 +234,11 @@ pub const Agent = struct {
                 try sink.emit(sink.context, .{ .tool_end = .{ .call = call, .result = result } });
             }
             self.unresolved_tools = false;
+            if (pending_steering == null) {
+                if (self.steering_hook) |hook| {
+                    pending_steering = try hook.pop_steering(hook.context, self.allocator);
+                }
+            }
         }
         return error.TurnLimitExceeded;
     }

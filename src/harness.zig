@@ -217,6 +217,8 @@ pub const Harness = struct {
     runtime: agent.Agent,
     sink: ?Sink = null,
     retained_native_warning: bool = false,
+    steering_mutex: std.Io.Mutex = .init,
+    steering_queue: std.ArrayList([]u8) = .empty,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -512,6 +514,10 @@ pub const Harness = struct {
             .before_turn = beforeTurnCompactErased,
             .recover_overflow = recoverOverflowErased,
         };
+        self.runtime.steering_hook = .{
+            .context = self,
+            .pop_steering = popSteeringErased,
+        };
         errdefer self.runtime.deinit();
 
         if (self.extension_host) |*host| {
@@ -538,6 +544,8 @@ pub const Harness = struct {
     }
 
     pub fn deinit(self: *Harness) void {
+        for (self.steering_queue.items) |msg| self.gpa.free(msg);
+        self.steering_queue.deinit(self.gpa);
         self.runtime.deinit();
         if (self.extension_host) |*host| {
             host.shutdown() catch {};
@@ -688,6 +696,7 @@ pub const Harness = struct {
         staged.cancel = self.runtime.cancel;
         staged.retry = self.runtime.retry;
         staged.compaction_hook = self.runtime.compaction_hook;
+        staged.steering_hook = self.runtime.steering_hook;
 
         for (projected) |entry| try staged.append(entry.message);
         if (staged.messages.items.len == 0) {
@@ -947,6 +956,61 @@ pub const Harness = struct {
         };
         self.provider = next_provider;
         self.runtime.provider = next_provider;
+    }
+
+    pub fn pushSteering(self: *Harness, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        self.steering_mutex.lockUncancelable(self.io);
+        defer self.steering_mutex.unlock(self.io);
+        if (self.steering_queue.items.len >= 32) return error.SteeringQueueFull;
+        try self.steering_queue.append(self.gpa, try self.gpa.dupe(u8, trimmed));
+    }
+
+    pub fn steeringCount(self: *Harness) usize {
+        self.steering_mutex.lockUncancelable(self.io);
+        defer self.steering_mutex.unlock(self.io);
+        return self.steering_queue.items.len;
+    }
+
+    pub fn drainSteering(self: *Harness, allocator: std.mem.Allocator) ![][]u8 {
+        self.steering_mutex.lockUncancelable(self.io);
+        defer self.steering_mutex.unlock(self.io);
+        const out = try allocator.alloc([]u8, self.steering_queue.items.len);
+        var built: usize = 0;
+        errdefer {
+            for (out[0..built]) |item| allocator.free(item);
+            allocator.free(out);
+        }
+        for (self.steering_queue.items) |item| {
+            out[built] = try allocator.dupe(u8, item);
+            built += 1;
+        }
+        for (self.steering_queue.items) |item| self.gpa.free(item);
+        self.steering_queue.clearRetainingCapacity();
+        return out;
+    }
+
+    fn popSteeringErased(context: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8 {
+        const self: *Harness = @ptrCast(@alignCast(context));
+        const raw: []u8 = blk: {
+            self.steering_mutex.lockUncancelable(self.io);
+            defer self.steering_mutex.unlock(self.io);
+            if (self.steering_queue.items.len == 0) return null;
+            break :blk self.steering_queue.orderedRemove(0);
+        };
+        defer self.gpa.free(raw);
+
+        var effective: []const u8 = raw;
+        const expanded_skill = try skills.expandCommand(self.gpa, self.io, effective, self.discovered_skills);
+        defer if (expanded_skill) |text| self.gpa.free(text);
+        if (expanded_skill) |text| effective = text;
+
+        const expanded_template = try prompt_templates.expand(self.gpa, effective, self.discovered_templates);
+        defer if (expanded_template) |text| self.gpa.free(text);
+        if (expanded_template) |text| effective = text;
+
+        return try allocator.dupe(u8, effective);
     }
 
     fn emitEvent(self: *Harness, event: Event) !void {
@@ -1269,4 +1333,23 @@ test "harness lists and resumes sessions in session_dir without mutating state o
     const stats2 = try h.sessionStats();
     try std.testing.expectEqualStrings(s2_path, stats2.file_path.?);
     try std.testing.expectEqual(@as(usize, 1), stats2.total_messages);
+
+    // Steering queue push/drain/pop preserve FIFO order and trimming.
+    try h.pushSteering("   ");
+    try std.testing.expectEqual(@as(usize, 0), h.steeringCount());
+    try h.pushSteering("  first steer  ");
+    try h.pushSteering("second steer");
+    try std.testing.expectEqual(@as(usize, 2), h.steeringCount());
+    const popped = (try Harness.popSteeringErased(h, a)).?;
+    defer a.free(popped);
+    try std.testing.expectEqualStrings("first steer", popped);
+    try std.testing.expectEqual(@as(usize, 1), h.steeringCount());
+    const drained = try h.drainSteering(a);
+    defer {
+        for (drained) |item| a.free(item);
+        a.free(drained);
+    }
+    try std.testing.expectEqual(@as(usize, 1), drained.len);
+    try std.testing.expectEqualStrings("second steer", drained[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.steeringCount());
 }
