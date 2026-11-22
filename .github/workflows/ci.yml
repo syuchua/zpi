@@ -96,7 +96,7 @@ jobs:
 
       - name: Check formatting and scripts
         run: |
-          zig fmt --check build.zig build.zig.zon src/*.zig src/cli/*.zig
+          zig fmt --check build.zig build.zig.zon src
           python3 -m py_compile scripts/*.py
           for script in scripts/*.sh; do sh -n "$script"; done
           node --check scripts/ts-host.mjs

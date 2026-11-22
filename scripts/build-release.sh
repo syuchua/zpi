@@ -32,7 +32,7 @@ if [ "$version" != 0.17.0 ]; then
     printf 'Release builds require Zig 0.17.0 (found %s).\n' "$version" >&2
     exit 1
 fi
-zig fmt --check build.zig build.zig.zon src/*.zig src/cli/*.zig
+zig fmt --check build.zig build.zig.zon src
 python3 scripts/test-package-release.py
 zig build -Doptimize=ReleaseSafe --prefix "$stage/prefix" --summary all
 cp LICENSE "$stage/prefix/LICENSE"

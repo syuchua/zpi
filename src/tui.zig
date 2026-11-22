@@ -4,6 +4,23 @@
 //! and restores termios attributes before every command turn or exit.
 const std = @import("std");
 const agent = @import("agent");
+pub const terminal = @import("tui/terminal.zig");
+pub const theme = @import("tui/theme.zig");
+pub const renderer = @import("tui/renderer.zig");
+
+const InputQueue = terminal.InputQueue;
+const enterRawMode = terminal.enterRawMode;
+const terminalSize = terminal.terminalSize;
+const terminalColumns = terminal.terminalColumns;
+const appendSafeTerminalBytes = terminal.appendSafeTerminalBytes;
+const utf8Columns = terminal.utf8Columns;
+const codepointWidth = terminal.codepointWidth;
+const advanceByColumns = terminal.advanceByColumns;
+const computeLayout = terminal.computeLayout;
+const pendingLineRows = terminal.pendingLineRows;
+const appendSanitizedText = terminal.appendSanitizedText;
+const appendTreeText = terminal.appendClippedText;
+pub const writeText = terminal.writeSafeText;
 
 pub const max_prompt_bytes: usize = 64 * 1024;
 const max_history_entries: usize = 200;
@@ -50,123 +67,6 @@ pub const Submit = struct {
     switch_model: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     set_thinking: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     quiet_startup: bool = false,
-};
-
-const InputQueue = struct {
-    buf: [4096]u8 = undefined,
-    start: usize = 0,
-    end: usize = 0,
-    eof: bool = false,
-
-    fn hasBuffered(self: *const InputQueue) bool {
-        return self.start < self.end;
-    }
-
-    fn readByteTimeout(self: *InputQueue, fd: std.posix.fd_t, cancel: ?agent.model.Cancel, timeout_ms: i32) !?u8 {
-        if (cancel) |token| {
-            if (token.isCanceled()) return error.Canceled;
-        }
-        if (self.start < self.end) {
-            const b = self.buf[self.start];
-            self.start += 1;
-            return b;
-        }
-        if (self.eof) return null;
-        var pollfds: [2]std.posix.pollfd = undefined;
-        var nfds: usize = 1;
-        pollfds[0] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
-        if (cancel) |token| {
-            if (token.poll_fd) |cancel_fd| {
-                pollfds[1] = .{ .fd = cancel_fd, .events = std.posix.POLL.IN, .revents = 0 };
-                nfds = 2;
-            }
-        }
-        while (true) {
-            const ready = std.posix.poll(pollfds[0..nfds], timeout_ms) catch |err| switch (err) {
-                else => return err,
-            };
-            if (cancel) |token| {
-                if (token.isCanceled() or (nfds == 2 and (pollfds[1].revents & std.posix.POLL.IN) != 0)) {
-                    return error.Canceled;
-                }
-            }
-            if (ready == 0) return null;
-            if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
-                const n = std.posix.read(fd, &self.buf) catch |err| switch (err) {
-                    error.WouldBlock => {
-                        pollfds[0].revents = 0;
-                        if (nfds == 2) pollfds[1].revents = 0;
-                        continue;
-                    },
-                    else => return err,
-                };
-                if (n == 0) {
-                    self.eof = true;
-                    return null;
-                }
-                self.start = 1;
-                self.end = n;
-                return self.buf[0];
-            }
-            pollfds[0].revents = 0;
-            if (nfds == 2) pollfds[1].revents = 0;
-        }
-    }
-
-    fn readByte(self: *InputQueue, fd: std.posix.fd_t, cancel: ?agent.model.Cancel) !?u8 {
-        return self.readByteTimeout(fd, cancel, -1);
-    }
-
-    fn readByteWithWake(self: *InputQueue, fd: std.posix.fd_t, wake: agent.model.Cancel, timeout_ms: i32) !?u8 {
-        if (wake.isCanceled()) return null;
-        if (self.start < self.end) {
-            const b = self.buf[self.start];
-            self.start += 1;
-            return b;
-        }
-        if (self.eof) {
-            if (wake.poll_fd) |wake_fd| {
-                var fds = [_]std.posix.pollfd{.{ .fd = wake_fd, .events = std.posix.POLL.IN, .revents = 0 }};
-                _ = std.posix.poll(&fds, timeout_ms) catch {};
-            }
-            return null;
-        }
-        var pollfds: [2]std.posix.pollfd = undefined;
-        var nfds: usize = 1;
-        pollfds[0] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
-        if (wake.poll_fd) |wake_fd| {
-            pollfds[1] = .{ .fd = wake_fd, .events = std.posix.POLL.IN, .revents = 0 };
-            nfds = 2;
-        }
-        while (true) {
-            const ready = std.posix.poll(pollfds[0..nfds], timeout_ms) catch |err| switch (err) {
-                else => return err,
-            };
-            if (wake.isCanceled() or (nfds == 2 and (pollfds[1].revents & std.posix.POLL.IN) != 0)) {
-                return null;
-            }
-            if (ready == 0) return null;
-            if ((pollfds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0) {
-                const n = std.posix.read(fd, &self.buf) catch |err| switch (err) {
-                    error.WouldBlock => {
-                        pollfds[0].revents = 0;
-                        if (nfds == 2) pollfds[1].revents = 0;
-                        continue;
-                    },
-                    else => return err,
-                };
-                if (n == 0) {
-                    self.eof = true;
-                    return null;
-                }
-                self.start = 1;
-                self.end = n;
-                return self.buf[0];
-            }
-            pollfds[0].revents = 0;
-            if (nfds == 2) pollfds[1].revents = 0;
-        }
-    }
 };
 
 const History = struct {
@@ -338,20 +238,6 @@ pub fn run(io: std.Io, submit: Submit) !void {
             };
         }
     }
-}
-
-/// Terminal-facing output escapes control sequences in untrusted content;
-/// preserve newlines/tabs and UTF-8 bytes. JSON mode uses a JSON encoder instead.
-pub fn writeText(io: std.Io, file: std.Io.File, text: []const u8) !void {
-    var start: usize = 0;
-    for (text, 0..) |byte, i| {
-        if ((byte < 0x20 and byte != '\n' and byte != '\t') or byte == 0x7f) {
-            try file.writeStreamingAll(io, text[start..i]);
-            try file.writeStreamingAll(io, "?");
-            start = i + 1;
-        }
-    }
-    try file.writeStreamingAll(io, text[start..]);
 }
 
 fn selectTree(
@@ -541,42 +427,6 @@ fn renderTree(
             _ = try appendTreeText(out, allocator, shortcuts, width);
         }
     }
-}
-
-fn appendTreeText(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, max_cols: usize) !usize {
-    var index: usize = 0;
-    var columns: usize = 0;
-    while (index < text.len and columns < max_cols) {
-        if (text[index] == '\r' or text[index] == '\n' or text[index] == '\t') break;
-        const length = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
-        const step = @min(length, text.len - index);
-        const decoded = std.unicode.utf8Decode(text[index .. index + step]) catch 0xfffd;
-        const cp = if (decoded < 0x20 or (decoded >= 0x7f and decoded <= 0x9f)) '?' else decoded;
-        const width = codepointWidth(cp);
-        if (columns + width > max_cols) break;
-        var encoded: [4]u8 = undefined;
-        const len = std.unicode.utf8Encode(cp, &encoded) catch unreachable;
-        try out.appendSlice(allocator, encoded[0..len]);
-        columns += width;
-        index += step;
-    }
-    return columns;
-}
-
-fn terminalSize(io: std.Io, output: std.Io.File) std.posix.winsize {
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const rc = io.operate(.{ .device_io_control = .{
-        .file = output,
-        .code = std.posix.T.IOCGWINSZ,
-        .arg = &ws,
-    } }) catch return .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
-    if (rc.device_io_control < 0 or ws.col == 0) ws.col = 80;
-    if (rc.device_io_control < 0 or ws.row == 0) ws.row = 24;
-    return ws;
-}
-
-fn terminalColumns(io: std.Io, output: std.Io.File) usize {
-    return terminalSize(io, output).col;
 }
 
 const EditorState = struct {
@@ -775,109 +625,6 @@ const EditorState = struct {
     }
 };
 
-fn appendSafeTerminalBytes(out: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) !void {
-    for (text) |byte| {
-        if (byte == '\n') {
-            try out.appendSlice(a, "\n  ");
-        } else if ((byte < 0x20 and byte != '\t') or byte == 0x7f) {
-            try out.append(a, '?');
-        } else {
-            try out.append(a, byte);
-        }
-    }
-}
-
-fn utf8Columns(text: []const u8) usize {
-    var cols: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        const step = @min(len, text.len - i);
-        const cp = std.unicode.utf8Decode(text[i .. i + step]) catch 0xFFFD;
-        cols += codepointWidth(cp);
-        i += step;
-    }
-    return cols;
-}
-
-fn codepointWidth(cp: u21) usize {
-    if (cp == 0) return 0;
-    if ((cp >= 0x1100 and cp <= 0x115F) or
-        cp == 0x2329 or cp == 0x232A or
-        (cp >= 0x2E80 and cp <= 0xA4CF and cp != 0x303F) or
-        (cp >= 0xAC00 and cp <= 0xD7A3) or
-        (cp >= 0xF900 and cp <= 0xFAFF) or
-        (cp >= 0xFE10 and cp <= 0xFE19) or
-        (cp >= 0xFE30 and cp <= 0xFE6F) or
-        (cp >= 0xFF00 and cp <= 0xFF60) or
-        (cp >= 0xFFE0 and cp <= 0xFFE6) or
-        (cp >= 0x1F300 and cp <= 0x1FAFF) or
-        (cp >= 0x20000 and cp <= 0x3FFFD))
-    {
-        return 2;
-    }
-    return 1;
-}
-
-fn advanceByColumns(line: []const u8, target_cols: usize) usize {
-    var cols: usize = 0;
-    var i: usize = 0;
-    while (i < line.len and cols < target_cols) {
-        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-        const step = @min(len, line.len - i);
-        const cp = std.unicode.utf8Decode(line[i .. i + step]) catch 0xFFFD;
-        const w = codepointWidth(cp);
-        if (cols + w > target_cols) break;
-        cols += w;
-        i += step;
-    }
-    return i;
-}
-
-const Layout = struct {
-    cursor_row: usize,
-    cursor_col: usize,
-    end_row: usize,
-    end_col: usize,
-};
-
-fn computeLayout(text: []const u8, cursor: usize, cols_raw: usize, prompt_cols: usize) Layout {
-    const cols = @max(cols_raw, 4);
-    var row: usize = 0;
-    var col: usize = prompt_cols;
-    var cursor_row: usize = 0;
-    var cursor_col: usize = prompt_cols;
-    var i: usize = 0;
-    while (i <= text.len) {
-        if (i == cursor) {
-            cursor_row = row;
-            cursor_col = col;
-        }
-        if (i == text.len) break;
-        if (text[i] == '\n') {
-            row += 1;
-            col = 2; // continuation indent matches "\n  "
-            i += 1;
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        const step = @min(len, text.len - i);
-        const cp = std.unicode.utf8Decode(text[i .. i + step]) catch 0xFFFD;
-        const w: usize = if (text[i] == '\t') 4 else codepointWidth(cp);
-        if (col + w > cols) {
-            row += 1;
-            col = 0;
-        }
-        col += w;
-        if (col >= cols) {
-            row += 1;
-            col = 0;
-        }
-        i += step;
-    }
-    return .{ .cursor_row = cursor_row, .cursor_col = cursor_col, .end_row = row, .end_col = col };
-}
-
 const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
 fn handleTab(editor: *EditorState, io: std.Io, output: std.Io.File, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
@@ -995,20 +742,6 @@ fn commonPrefixLen(items: []const []u8) usize {
         len = i;
     }
     return len;
-}
-
-fn enterRawMode(fd: std.posix.fd_t) !std.posix.termios {
-    const original = try std.posix.tcgetattr(fd);
-    var raw = original;
-    raw.lflag.ICANON = false;
-    raw.lflag.ECHO = false;
-    raw.lflag.IEXTEN = false;
-    raw.iflag.ICRNL = false;
-    raw.iflag.IXON = false;
-    raw.cc[@backingInt(std.posix.V.MIN)] = 1;
-    raw.cc[@backingInt(std.posix.V.TIME)] = 0;
-    try std.posix.tcsetattr(fd, .NOW, raw);
-    return original;
 }
 
 fn readPromptLine(
@@ -1281,6 +1014,12 @@ fn readPromptLine(
     }
 }
 
+test {
+    _ = terminal;
+    _ = theme;
+    _ = renderer;
+}
+
 test "editor UTF-8 insertion cursor movement deletion and history navigation" {
     const a = std.testing.allocator;
     var history = History{ .allocator = a };
@@ -1310,24 +1049,6 @@ test "editor UTF-8 insertion cursor movement deletion and history navigation" {
     try std.testing.expectEqualStrings("second", editor.buf.items);
     try editor.moveDownLineOrHistory(&history);
     try std.testing.expectEqualStrings("!", editor.buf.items);
-}
-
-test "computeLayout tracks wide characters newlines and wrapping" {
-    const l1 = computeLayout("你好\nab", 6, 10, 2);
-    // "你好" (6 bytes, 4 cols) ends at row 0 col 6 (after 2-col "> "), "\n" moves to row 1 col 2, "ab" adds 2 cols -> col 4.
-    try std.testing.expectEqual(@as(usize, 0), l1.cursor_row);
-    try std.testing.expectEqual(@as(usize, 6), l1.cursor_col);
-    try std.testing.expectEqual(@as(usize, 1), l1.end_row);
-    try std.testing.expectEqual(@as(usize, 4), l1.end_col);
-
-    const l1_after = computeLayout("你好\nab", 7, 10, 2);
-    try std.testing.expectEqual(@as(usize, 1), l1_after.cursor_row);
-    try std.testing.expectEqual(@as(usize, 2), l1_after.cursor_col);
-
-    const l2 = computeLayout("abcdef", 6, 6, 2);
-    // 2 + 4 = 6 wraps at col 6 onto row 1, then "ef" lands at col 2.
-    try std.testing.expectEqual(@as(usize, 1), l2.cursor_row);
-    try std.testing.expectEqual(@as(usize, 2), l2.cursor_col);
 }
 
 const LiveScreen = struct {
@@ -1438,18 +1159,6 @@ const LiveScreen = struct {
     }
 };
 
-fn appendSanitizedText(out: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) !void {
-    var start: usize = 0;
-    for (text, 0..) |byte, i| {
-        if ((byte < 0x20 and byte != '\n' and byte != '\t') or byte == 0x7f) {
-            try out.appendSlice(a, text[start..i]);
-            try out.append(a, '?');
-            start = i + 1;
-        }
-    }
-    try out.appendSlice(a, text[start..]);
-}
-
 fn updatePendingLine(pending: *std.ArrayList(u8), a: std.mem.Allocator, chunk: []const u8) !void {
     if (chunk.len == 0) return;
     if (std.mem.lastIndexOfScalar(u8, chunk, '\n')) |nl| {
@@ -1463,38 +1172,6 @@ fn updatePendingLine(pending: *std.ArrayList(u8), a: std.mem.Allocator, chunk: [
         return;
     }
     try pending.appendSlice(a, chunk);
-}
-
-fn pendingLineRows(line: []const u8, cols_raw: usize) usize {
-    const cols = @max(cols_raw, 4);
-    var row: usize = 0;
-    var col: usize = 0;
-    var i: usize = 0;
-    while (i < line.len) {
-        if (line[i] == '\x1b' and i + 1 < line.len and line[i + 1] == '[') {
-            var j = i + 2;
-            while (j < line.len and !(line[j] >= 0x40 and line[j] <= 0x7e)) : (j += 1) {}
-            i = if (j < line.len) j + 1 else line.len;
-            continue;
-        }
-        if (line[i] == '\r') {
-            col = 0;
-            i += 1;
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
-        const step = @min(len, line.len - i);
-        const cp = std.unicode.utf8Decode(line[i .. i + step]) catch 0xFFFD;
-        const w: usize = if (line[i] == '\t') 4 else codepointWidth(cp);
-        if (col + w > cols) {
-            row += 1;
-            col = w;
-        } else {
-            col += w;
-        }
-        i += step;
-    }
-    return row;
 }
 
 fn renderLiveOverlayFrame(

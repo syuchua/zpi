@@ -39,7 +39,7 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin"
 uname -sm
 getconf GNU_LIBC_VERSION
 printf 'Zig version: '; zig version
-zig fmt --check build.zig src/*.zig src/cli/*.zig
+zig fmt --check build.zig src
 zig build install test-binaries -j2 --summary all
 cp scripts/test-cli.py scripts/test-context-budget.py zig-out/
 ldd zig-out/bin/zpi

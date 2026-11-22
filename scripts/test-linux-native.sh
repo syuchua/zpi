@@ -33,7 +33,7 @@ cd /workspace
 printf "Zig version: "; zig version
 printf "Guest: "; uname -sm
 printf "Compiler: "; cc --version | head -n 1
-zig fmt --check build.zig src/*.zig src/cli/*.zig
+zig fmt --check build.zig src
 python3 -m py_compile scripts/test-cli.py scripts/test-context-budget.py
 zig build install test-binaries --summary all
 cp scripts/test-cli.py scripts/test-context-budget.py zig-out/
