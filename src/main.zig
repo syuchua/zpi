@@ -267,6 +267,10 @@ const CliAdapter = struct {
     has_live_usage: bool = false,
     status_mutex: std.Io.Mutex = .init,
     cached_tokens: u64 = 0,
+    committed_in_tokens: u64 = 0,
+    committed_out_tokens: u64 = 0,
+    req_in_tokens: u64 = 0,
+    req_out_tokens: u64 = 0,
     harness: ?*harness.Harness = null,
 
     fn writeSafe(io: std.Io, file: std.Io.File, text: []const u8) !void {
@@ -332,6 +336,10 @@ const CliAdapter = struct {
     fn resetLiveUsageAndRefresh(self: *CliAdapter) void {
         self.status_mutex.lockUncancelable(self.io);
         self.has_live_usage = false;
+        self.committed_in_tokens = 0;
+        self.committed_out_tokens = 0;
+        self.req_in_tokens = 0;
+        self.req_out_tokens = 0;
         self.status_mutex.unlock(self.io);
         self.refreshCachedStats();
     }
@@ -374,18 +382,24 @@ const CliAdapter = struct {
         const status = h.statusSummary();
         self.status_mutex.lockUncancelable(self.io);
         const tokens = self.cached_tokens;
+        const in_tok = self.committed_in_tokens +| self.req_in_tokens;
+        const out_tok = self.committed_out_tokens +| self.req_out_tokens;
         const expanded = self.expanded_details;
         self.status_mutex.unlock(self.io);
-        return .{
+        var info = tui.components.chrome.FooterInfo{
             .provider = status.provider,
             .model = status.model,
             .thinking_level = @tagName(status.thinking_level),
             .cwd = status.cwd,
+            .input_tokens = in_tok,
+            .output_tokens = out_tok,
             .context_tokens = tokens,
             .context_window = status.context_window,
             .steering_count = h.steeringCount(),
             .expanded = expanded,
         };
+        info.git_branch_len = tui.components.chrome.detectGitBranch(self.io, status.cwd, &info.git_branch_buf);
+        return info;
     }
 
     fn extractToolArgSummary(call: zpi.model.ToolCall) []const u8 {
@@ -823,14 +837,24 @@ const CliAdapter = struct {
                                 );
                             }
                         },
+                        .start => {
+                            self.status_mutex.lockUncancelable(self.io);
+                            self.committed_in_tokens +|= self.req_in_tokens;
+                            self.committed_out_tokens +|= self.req_out_tokens;
+                            self.req_in_tokens = 0;
+                            self.req_out_tokens = 0;
+                            self.status_mutex.unlock(self.io);
+                        },
                         .usage => |u| {
                             const live_tokens = if (u.total_tokens > 0) u.total_tokens else (u.input_tokens +| u.output_tokens);
+                            self.status_mutex.lockUncancelable(self.io);
                             if (live_tokens > 0) {
-                                self.status_mutex.lockUncancelable(self.io);
                                 self.cached_tokens = live_tokens;
                                 self.has_live_usage = true;
-                                self.status_mutex.unlock(self.io);
                             }
+                            self.req_in_tokens = u.input_tokens;
+                            self.req_out_tokens = u.output_tokens;
+                            self.status_mutex.unlock(self.io);
                         },
                         else => {},
                     };

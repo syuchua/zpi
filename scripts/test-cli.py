@@ -1853,6 +1853,8 @@ def check_queued_followup_editing(root, environment, server):
 def check_tui_components(root, environment, server):
     comp_dir = root / 'comp-work'
     comp_dir.mkdir()
+    (comp_dir / '.git').mkdir()
+    (comp_dir / '.git' / 'HEAD').write_text('ref: refs/heads/feat/tui-test\n')
     (comp_dir / 'comp.txt').write_text('line1\nold\nline3\n')
     agent_dir = root / 'comp-agent'
     agent_dir.mkdir()
@@ -1905,9 +1907,11 @@ def check_tui_components(root, environment, server):
         return transcript.find(marker, start)
 
     try:
-        # 1. Idle footer shows provider/model, thinking level, context %, and shortened cwd.
+        # 1. Idle double-rule editor + 2-line Footer shows cwd (branch), provider/model, thinking level, and context window.
+        expect('─'.encode('utf-8') * 16)
+        expect(b'comp-work (feat/tui-test)')
         expect(b'comp-fixture/comp-model (medium)')
-        expect(b'% ctx')
+        expect(b'/10k (')
 
         # 2. Submit turn: Loader, ThinkingBlock, ToolCard (+ arg header) + DiffView, MarkdownStyler, and updated Footer render.
         start = len(transcript)
@@ -1957,7 +1961,15 @@ def check_tui_components(root, environment, server):
         os.write(master, b'wrap-and-usage\n')
         wrap_end = expect(b'wrapend', wrap_mark)
         assert b'\nword' in transcript[wrap_mark:wrap_end + 16] or b'\r\nword' in transcript[wrap_mark:wrap_end + 16], transcript[wrap_mark:wrap_end + 16]
-        expect(b'\x1b[38;2;229;192;123m \xc2\xb7 80% ctx\x1b[0m', wrap_mark)
+        expect(b'\xe2\x86\x917.5k \xe2\x86\x93500', wrap_mark)
+        expect(b'\x1b[38;2;229;192;123m8k/10k (80%)\x1b[0m', wrap_mark)
+
+        # Resize PTY to 60 cols and type a key to verify clean rule/footer adaptation.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 60, 0, 0))
+        resize_mark = len(transcript)
+        os.write(master, b'x\x7f')
+        expect('─'.encode('utf-8') * 59, resize_mark)
+        assert ('─'.encode('utf-8') * 60) not in transcript[resize_mark:], transcript[resize_mark:]
 
         os.write(master, b'/exit\n')
         while True:

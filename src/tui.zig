@@ -741,7 +741,17 @@ const EditorState = struct {
     }
 
     fn renderWithFooter(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize, color: bool, footer_line: ?[]const u8) !void {
-        return self.renderWithOverlay(io, output, cols, color, theme.Theme.init(if (color) .ansi16 else .none), &.{}, footer_line);
+        const lines: []const []const u8 = if (footer_line) |fl| &.{fl} else &.{};
+        return self.renderWithOverlay(io, output, cols, color, theme.Theme.init(if (color) .ansi16 else .none), &.{}, lines, false);
+    }
+
+    fn appendRuleLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, th: theme.Theme, cols: usize) !usize {
+        const rule_w = @max(@as(usize, 4), cols -| 1);
+        try th.appendOpen(out, allocator, theme.Theme.border);
+        var i: usize = 0;
+        while (i < rule_w) : (i += 1) try out.appendSlice(allocator, "─");
+        try th.appendClose(out, allocator);
+        return rule_w;
     }
 
     fn renderWithOverlay(
@@ -752,7 +762,8 @@ const EditorState = struct {
         use_sgr: bool,
         th: theme.Theme,
         dialog_lines: []const []const u8,
-        footer_line: ?[]const u8,
+        footer_lines: []const []const u8,
+        show_rules: bool,
     ) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
@@ -766,7 +777,13 @@ const EditorState = struct {
             try out.appendSlice(self.allocator, dline);
             try out.appendSlice(self.allocator, "\r\n");
         }
-        const rows_above = dialog_lines.len;
+        var rows_above = dialog_lines.len;
+
+        if (show_rules) {
+            _ = try appendRuleLine(&out, self.allocator, th, cols);
+            try out.appendSlice(self.allocator, "\r\n");
+            rows_above += 1;
+        }
 
         try out.appendSlice(self.allocator, if (use_sgr) "\x1b[36m>\x1b[0m " else "> ");
 
@@ -776,6 +793,12 @@ const EditorState = struct {
 
         var total_end_row = layout.end_row;
         var total_end_col = layout.end_col;
+        if (show_rules) {
+            try out.appendSlice(self.allocator, "\r\n");
+            const rule_w = try appendRuleLine(&out, self.allocator, th, cols);
+            total_end_row += 1;
+            total_end_col = rule_w;
+        }
         if (self.completion_hint) |hint| {
             if (hint.len > 0) {
                 try out.appendSlice(self.allocator, "\r\n");
@@ -787,7 +810,7 @@ const EditorState = struct {
                 total_end_col = terminal.visibleWidth(hint);
             }
         }
-        if (footer_line) |fl| {
+        for (footer_lines) |fl| {
             if (fl.len > 0) {
                 try out.appendSlice(self.allocator, "\r\n");
                 try out.appendSlice(self.allocator, fl);
@@ -808,19 +831,6 @@ const EditorState = struct {
         }
         if (use_sgr or th.mode != .none) try out.appendSlice(self.allocator, renderer.sync_end);
         self.rendered_cursor_row = rows_above + layout.cursor_row;
-        try output.writeStreamingAll(io, out.items);
-    }
-
-    fn clearFooterOnly(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize) !void {
-        const layout = computeLayout(self.buf.items, self.cursor, cols, 2);
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(self.allocator);
-        if (layout.end_row > layout.cursor_row) {
-            try out.print(self.allocator, "\x1b[{d}B", .{layout.end_row - layout.cursor_row});
-        }
-        try out.appendSlice(self.allocator, "\r\n\x1b[J");
-        try out.print(self.allocator, "\x1b[1A\r", .{});
-        if (layout.end_col > 0) try out.print(self.allocator, "\x1b[{d}C", .{layout.end_col});
         try output.writeStreamingAll(io, out.items);
     }
 };
@@ -981,12 +991,17 @@ fn readPromptLine(
     while (true) {
         if ((dirty and !queue.hasBuffered()) or (dialog != null and !dialog_on_screen)) {
             cols = terminalColumns(io, output);
-            const footer_line = if (has_footer) blk: {
+            var footer_buf: ?[2][]u8 = null;
+            if (has_footer) {
                 var info = submit.status_info.?(submit.context);
                 info.queued_count = 0;
-                break :blk try components.chrome.Footer.renderLineAlloc(allocator, th, info, @max(1, cols -| 1));
-            } else null;
-            defer if (footer_line) |fl| allocator.free(fl);
+                footer_buf = try components.chrome.Footer.renderLinesAlloc(allocator, th, info, @max(1, cols -| 1));
+            }
+            defer if (footer_buf) |fb| {
+                allocator.free(fb[0]);
+                allocator.free(fb[1]);
+            };
+            const footer_slices: []const []const u8 = if (footer_buf) |*fb| fb else &.{};
 
             const dialog_lines: [][]u8 = if (dialog) |dk| blk: {
                 const spec: components.dialog.DialogSpec = switch (dk) {
@@ -1003,18 +1018,16 @@ fn readPromptLine(
             defer allocator.free(dialog_slices);
             for (dialog_lines, dialog_slices) |dl, *s| s.* = dl;
 
-            try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, footer_line);
+            try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, footer_slices, th.mode != .none);
             dialog_on_screen = dialog_slices.len > 0;
             dirty = false;
         }
         const b_opt = try queue.readByte(input_fd, submit.cancel);
         const b = b_opt orelse {
-            if (dialog_on_screen or editor.completion_hint != null) {
+            if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                 editor.resetCompletionTrack();
-                editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null) catch {};
+                editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false) catch {};
                 dialog_on_screen = false;
-            } else if (has_footer) {
-                editor.clearFooterOnly(io, output, cols) catch {};
             }
             if (editor.buf.items.len == 0) {
                 try output.writeStreamingAll(io, "\n");
@@ -1037,23 +1050,19 @@ fn readPromptLine(
 
         switch (b) {
             0x03 => {
-                if (dialog_on_screen or editor.completion_hint != null) {
+                if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                     editor.resetCompletionTrack();
-                    editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null) catch {};
+                    editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false) catch {};
                     dialog_on_screen = false;
-                } else if (has_footer) {
-                    editor.clearFooterOnly(io, output, cols) catch {};
                 }
                 return error.Canceled;
             },
             0x04 => {
                 if (editor.buf.items.len == 0) {
-                    if (dialog_on_screen or editor.completion_hint != null) {
+                    if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                         editor.resetCompletionTrack();
-                        editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null) catch {};
+                        editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false) catch {};
                         dialog_on_screen = false;
-                    } else if (has_footer) {
-                        editor.clearFooterOnly(io, output, cols) catch {};
                     }
                     try output.writeStreamingAll(io, "\n");
                     return null;
@@ -1076,11 +1085,9 @@ fn readPromptLine(
                 }
                 const had_hint = editor.completion_hint != null;
                 editor.resetCompletionTrack();
-                if (dirty or had_hint) {
+                if (dirty or had_hint or has_footer or th.mode != .none) {
                     cols = terminalColumns(io, output);
-                    try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, null);
-                } else if (has_footer) {
-                    try editor.clearFooterOnly(io, output, cols);
+                    try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, false);
                 }
                 try output.writeStreamingAll(io, "\n");
                 return try editor.buf.toOwnedSlice(allocator);
@@ -1518,9 +1525,12 @@ const LiveScreen = struct {
                 if (submit.status_info) |get_info| {
                     var info = get_info(submit.context);
                     info.queued_count = followups.len;
-                    const footer_line = try components.chrome.Footer.renderLineAlloc(self.allocator, self.th, info, max_cols);
-                    defer self.allocator.free(footer_line);
-                    status_buf = try std.fmt.allocPrint(self.allocator, "{s}\r\n{s}", .{ loader_line, footer_line });
+                    const footer_lines = try components.chrome.Footer.renderLinesAlloc(self.allocator, self.th, info, max_cols);
+                    defer {
+                        self.allocator.free(footer_lines[0]);
+                        self.allocator.free(footer_lines[1]);
+                    }
+                    status_buf = try std.fmt.allocPrint(self.allocator, "{s}\r\n{s}\r\n{s}", .{ loader_line, footer_lines[0], footer_lines[1] });
                 } else {
                     status_buf = try self.allocator.dupe(u8, loader_line);
                 }
@@ -1679,11 +1689,27 @@ fn renderLiveOverlayFrameWithChrome(
     }
 
     if (editor.buf.items.len > 0) {
+        const rule_w = @max(@as(usize, 4), cols -| 1);
+        if (color) {
+            try out.appendSlice(allocator, "\x1b[2m");
+            var ri: usize = 0;
+            while (ri < rule_w) : (ri += 1) try out.appendSlice(allocator, "─");
+            try out.appendSlice(allocator, "\x1b[0m\r\n");
+            rows_above += 1;
+        }
         try out.appendSlice(allocator, if (color) "\x1b[36m>\x1b[0m " else "> ");
         const layout = computeLayout(editor.buf.items, editor.cursor, cols, 2);
         try appendSafeTerminalBytes(&out, allocator, editor.buf.items);
         var bottom_row = layout.end_row;
         var bottom_col = layout.end_col;
+        if (color) {
+            try out.appendSlice(allocator, "\r\n\x1b[2m");
+            var ri: usize = 0;
+            while (ri < rule_w) : (ri += 1) try out.appendSlice(allocator, "─");
+            try out.appendSlice(allocator, "\x1b[0m");
+            bottom_row += 1;
+            bottom_col = rule_w;
+        }
         if (chrome_block) |cb| {
             if (cb.len > 0) {
                 try out.appendSlice(allocator, "\r\n");
@@ -2195,4 +2221,9 @@ test "renderLiveOverlayFrame clips queued previews and tracks multiline draft cu
     defer a.free(with_draft.bytes);
     try std.testing.expect(std.mem.indexOf(u8, with_draft.bytes, "> line1\n  line2") != null);
     try std.testing.expectEqual(@as(usize, 6), with_draft.cursor_row);
+
+    const with_rules = try renderLiveOverlayFrame(a, &editor, &.{}, 20, true);
+    defer a.free(with_rules.bytes);
+    try std.testing.expect(std.mem.indexOf(u8, with_rules.bytes, "───────────────────") != null);
+    try std.testing.expectEqual(@as(usize, 2), with_rules.cursor_row);
 }
