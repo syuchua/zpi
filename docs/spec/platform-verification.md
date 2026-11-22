@@ -304,6 +304,49 @@ Verification run `baf964300` (`.pi/tasks/01a1d9a6-2322-729e-9a34-0a4df7c3b930-47
 | `scripts/test-cli.py` | `f356e4f19ebf574c2db971b4489032ba55792af9f6f86bcef199b7caaecde4fc` |
 | `README.md` | `f642fa273a9e8c831859ba0412a5144a04d875ec629f4765fa3acea6a5dc313a` |
 
+#### Lazy sessions, double-rule editor/Footer, `/` & `@` autocomplete, `web_fetch`, and `bg_run` (`ALL_PHASE2_MATRIX_PASSED`)
+
+Verification run `pi-bash-c5b676dee76e45ce.log` (exit 0) verified:
+1. **Lazy session persistence**: `session.Store.deferred` and `Harness.init` avoid creating empty `.jsonl` files until the first non-system conversation record is appended (`session-tests` **14/14**, `harness-tests` **30/30**, PTY check proving `/exit` creates no `.jsonl`), and `recent_session.list` filters out empty system-only sessions in `/resume`.
+2. **Pi-style double-rule editor & 2-line Footer**: `EditorState` renders upper/lower `─` rule lines (`tui-tests` **20/20**), `chrome.detectGitBranch` detects `.git/HEAD` branches hermetically, `CliAdapter` tracks live session `↑in ↓out` tokens, and `Footer.renderLinesAlloc` renders `cwd (branch)` + `queued`/`steer`/`bg`/`expanded` badges on line 1 and `↑in ↓out` + `used/window (pct%)` 70%/90% warning colors + `provider/model (thinking)` on line 2 across resize (`80` -> `60` cols).
+3. **Automatic `/` and `@` autocomplete popup**: `src/tui/components/autocomplete.zig` (`AutocompletePopup`) opens automatically below the editor on `/` (prefix-first + fuzzy fallback across built-ins, skills, templates) and `@` (fuzzy file/directory completion with `@dir/` drill-down), supporting `Up/Down`/`Tab`/`Enter`/`Esc` and `TERM=dumb` fallback while preserving scrollback.
+4. **Native `web_fetch` & `get_content`**: `src/web_fetch.zig` (`web-fetch-tests` **3/3**) enforces fail-closed SSRF checks across literal IPs, DNS resolution, redirects, and connected socket peers (blocking loopback/private/link-local/metadata addresses unless explicitly tested via `--allow-loopback-web-fetch`), extracts `readable`/`raw` HTML content, and caches `responseId` entries for `get_content` offset/limit paging and `findText` search (`tool-selection-tests` **2/2**).
+5. **Native `bg_run`, `bg_status`, `bg_logs`, `bg_kill`, `/jobs`, & wakeups**: `src/bg_tasks.zig` (`bg-tasks-tests` **1/1**) persists `.pi/tasks/` output logs and atomic JSON metadata, manages child process groups cleanly, exposes `/jobs` and Footer `N bg` badges, and fires event-driven `bg_wake` completion notifications that wake idle or busy agent turns.
+- **macOS arm64**: passed `zig fmt --check build.zig build.zig.zon src`, `py_compile`, `sh -n`, `node --check`, **139/139** build steps (`zig build test install test-binaries --summary all` with `pi 1.6.0` SDK; `extension-tests` **4/4**), `zig build -Dtui=none test` + `install` + `--help` smoke, `scripts/test-cli.py` (with `pi 1.6.0` SDK, `ZPI_PI_SESSION_SDK`, C/Zig `.dylib` fixtures, SSRF/loopback `web_fetch`, and `bg_run` PTY wakeup), `scripts/test-ts-host.py`, `scripts/test-context-budget.py` (**84** checks), and `scripts/test-package-release.py`.
+- **Linux 7-target matrix**: Alpine arm64 native (**104/104** build steps) and all four cross-built musl container runs (`aarch64-linux-musl` and translated `x86_64-linux-musl` under Apple Container and Colima) each recorded **198 passed, 3 SDK skips, 0 failures**; Ubuntu 24.04 arm64/glibc 2.39 native (**104/104** steps) and cross-built each recorded **196 passed, 5 skips (3 SDK, 2 search), 0 failures**. Every Linux target passed `scripts/test-cli.py` (including all new PTY tests and C/Zig `.so` plugins) and **84** context-budget checks.
+
+Exact SHA-256 hashes recorded at the start of the passing verification run:
+
+| File | SHA-256 |
+| --- | --- |
+| `build.zig` | `d1e26809923274a7289139e91e60f03573ddfcea5aa0fa5434e647e89f3ad2a8` |
+| `README.md` | `d1b80ac5e5f8b3a87d471eb4d098a98b77a8561490d0d7c3500c59b44eee3000` |
+| `docs/spec/compatibility-matrix.md` | `e71892f63cbffe939909407ec0171595ef82bc0a5d1205a8aac0ffd00d39f9cd` |
+| `scripts/test-cli.py` | `6e0a34bfc5de336e746c9a42390655ed994ed89420b4c8f646b2439fdabe0e72` |
+| `scripts/test-linux-artifacts.sh` | `3d5e3b8107f71099d17343a97afc0eb69799cc39c3ba18a65b791d1bf3f1759b` |
+| `src/root.zig` | `5fd1d2afb24a78219bcdb2662527dac4198eb16f4af67e8665aad9b307466cb2` |
+| `src/session.zig` | `4ea61cc9f8805d5af36cfacc9c7e5350d03f5e9f7e6fb1026781ab91d961722b` |
+| `src/session_tests.zig` | `3b55c515ca5e886184c93d89a77b2082034d2d6640511f8a796dc97f7c238129` |
+| `src/harness.zig` | `86c771781cc9196e8d4c3003a54bfaca2c68a0cbcbfb155b3b4efefce292bf59` |
+| `src/cli/recent_session.zig` | `0c8e06a9bb7ae09cafeb5abb57f23caadc76baa74ec54153505de817a1d73a7d` |
+| `src/cli/tool_selection.zig` | `ec1a8d738b8e7181711171e918bb6a095d77b4e89d9f8284f7249dd52a6b1bfa` |
+| `src/cli/args.zig` | `e06a0271fe748830e9987e918ef5a5de6ffa88b3ff78b778e8003841a915759` |
+| `src/tools.zig` | `d0ec3e2956888e70db2763f0dfa98d5266dfd3fed107471bca1dc61ae7937afa` |
+| `src/web_fetch.zig` | `e7287986ded99e4c1a18c6bc6af059b272f95fdfe2a622e949c43d2ec5c81917` |
+| `src/bg_tasks.zig` | `7e5741780c9ceb0663008fc71b1811710ebf730d10009bf3f9acde48348c3719` |
+| `src/main.zig` | `1e1c30dc9303b1862de8bb9e98c1dfe7e9b427183612867e1f27967cba7e4378` |
+| `src/tui.zig` | `ba619d3b10356762d0eb5337f5e9f55df6ffc265fe421072b205959e8cca2ad0` |
+| `src/tui/renderer.zig` | `8231f3dd6870166b88e6fed8b779a4e55c7bdd561497f751c08e8a013e3c7424` |
+| `src/tui/terminal.zig` | `8242e6cbc74f63a9b6ee3d42454e8e9a0800a321a1875fb0f4b7d896d596654a` |
+| `src/tui/theme.zig` | `997944baca80a0b9be7ee8d522c8efe4a8ab78cab5db2ee019971844112477e` |
+| `src/tui/components/autocomplete.zig` | `196f3188e91bd31261baf259ba836071aabce3b90fe008e97dd19f6e2f642fda` |
+| `src/tui/components/chrome.zig` | `257731661db0c2d98d3264579d991d714a7f545c1f8383857f98b4e672a8b07c` |
+| `src/tui/components/dialog.zig` | `ad44942341a98e15cd76268067a72ae1e1b65cc377e0f24f85e3b9e500fa5f51` |
+| `src/tui/components/markdown.zig` | `012d7e5c5f8d24a0134df1a2f4007628087572b77579638664e8eaeae12ccf7a` |
+| `src/tui/components/message.zig` | `18e2e089a5a528866a683938ab78a63875a0a80334bf1574619dbc88501285dc` |
+| `src/tui/components/select_list.zig` | `adbcb1d4476c3cf2c2a0256e3d0ce289fb5c4baef745960bcd22e9101a6023df` |
+| `src/tui/components/tool_card.zig` | `725940b3ca3491eff848f0df5b36f281b1ce1ccd8146744d293a9ade1cd19792` |
+
 ## Further acceptance
 
 - Extend the same build-installed test executables as real core behavior lands; preserve failures and distinguish compilation from execution.

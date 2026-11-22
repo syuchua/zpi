@@ -414,10 +414,18 @@ test "Loader and Footer clip to width and format model, thinking, git branch, us
     }
     try std.testing.expect(std.mem.indexOf(u8, f_crit[1], "\x1b[38;2;224;108;117m95k/100k (95%)\x1b[0m") != null);
 
-    // Git branch detection in the current repo succeeds.
-    var br_buf: [96]u8 = undefined;
+    // Hermetic Git branch detection works inside parent directories without depending on repo .git.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "repo/.git");
+    try tmp.dir.createDirPath(std.testing.io, "repo/nested/sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "repo/.git/HEAD", .data = "ref: refs/heads/feat/hermetic-branch\n" });
+
     const cwd = try std.process.currentPathAlloc(std.testing.io, a);
     defer a.free(cwd);
-    const blen = detectGitBranch(std.testing.io, cwd, &br_buf);
-    try std.testing.expect(blen > 0);
+    const nested = try std.fs.path.resolveAlloc(a, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "repo/nested/sub" });
+    defer a.free(nested);
+    var br_buf: [96]u8 = undefined;
+    const blen = detectGitBranch(std.testing.io, nested, &br_buf);
+    try std.testing.expectEqualStrings("feat/hermetic-branch", br_buf[0..blen]);
 }
