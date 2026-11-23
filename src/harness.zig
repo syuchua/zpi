@@ -991,29 +991,37 @@ pub const Harness = struct {
     }
 
     pub fn submit(self: *Harness, prompt: []const u8) !SubmitResult {
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const effective = try self.preparePrompt(scratch.allocator(), prompt, "interactive") orelse return .{ .handled = true };
+        return self.submitPrepared(effective);
+    }
+
+    /// Returns null when an extension handles the prompt. The returned text
+    /// borrows either the original prompt or the caller's scratch arena.
+    pub fn preparePrompt(self: *Harness, scratch: std.mem.Allocator, prompt: []const u8, source: []const u8) !?[]const u8 {
         var extension_input: ?zpi.extensions.Response = null;
         defer if (extension_input) |*response| response.deinit();
         var effective = prompt;
         if (self.extension_host) |*host| {
-            extension_input = try host.sendInput(prompt, "interactive");
+            extension_input = try host.sendInput(prompt, source);
             const result = extension_input.?.value();
             if (result != .object) return error.InvalidExtensionInput;
             const action = result.object.get("action") orelse return error.InvalidExtensionInput;
             if (action != .string) return error.InvalidExtensionInput;
-            if (std.mem.eql(u8, action.string, "handled")) return .{ .handled = true };
+            if (std.mem.eql(u8, action.string, "handled")) return null;
             if (std.mem.eql(u8, action.string, "transform")) {
                 const text = result.object.get("text") orelse return error.InvalidExtensionInput;
                 if (text != .string or result.object.get("images") != null) return error.UnsupportedExtensionInput;
-                effective = text.string;
+                effective = try scratch.dupe(u8, text.string);
             } else if (!std.mem.eql(u8, action.string, "continue")) return error.InvalidExtensionInput;
         }
-        const expanded_skill = try skills.expandCommand(self.gpa, self.io, effective, self.discovered_skills);
-        defer if (expanded_skill) |text| self.gpa.free(text);
-        if (expanded_skill) |text| effective = text;
-        const expanded_template = try prompt_templates.expand(self.gpa, effective, self.discovered_templates);
-        defer if (expanded_template) |text| self.gpa.free(text);
-        if (expanded_template) |text| effective = text;
+        if (try skills.expandCommand(scratch, self.io, effective, self.discovered_skills)) |text| effective = text;
+        if (try prompt_templates.expand(scratch, effective, self.discovered_templates)) |text| effective = text;
+        return effective;
+    }
 
+    pub fn submitPrepared(self: *Harness, effective: []const u8) !SubmitResult {
         self.runtime.prompt(effective, .{ .context = self, .emit = agentEmitErased }) catch |err| {
             try self.runtime.reconcile(.{ .context = self, .emit = agentEmitErased });
             try self.emitEvent(.{ .turn_error = err });

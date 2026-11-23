@@ -359,6 +359,22 @@ Exact SHA-256 hashes recorded at the start of the passing verification run:
 
 The two ReleaseSafe CLI runs skipped SDK and native-plugin CLI fixtures. The CLI test script used in both runs had SHA-256 `404b5b052955d415c3e148574e550000f6cc72ac6ca7e253a2b96e060746b12c`. GitHub-hosted verification of the fix is pending.
 
+#### Experimental RPC
+
+Native macOS arm64 verification used Zig 0.17.0. Run `b1b4503e7` passed the Zig suites, full CLI integration with pi 1.6.0 SDK and C/Zig plugin fixtures, TS host fixtures, 84 context-budget checks, and headless RPC integration. Run `b116397b7` repeated Debug tests and headless build/tests plus RPC integration after the final progress-limit adjustment.
+
+The ReleaseSafe archive run `b2aea8a86` passed packaging fixtures, build, unpacked CLI integration including RPC, and checksum verification. Its archive SHA-256 was `c167d2f80e0bd181ac112245c264955bb3150000c3892becdfdf3399a0e8d0fa`. The archive CLI run skipped SDK and native-plugin fixtures.
+
+Run `b164aba7f` cross-built `x86_64-linux-gnu.2.39` ReleaseSafe on macOS and executed full CLI integration in an Ubuntu 24.04 amd64 container under translation in Colima's arm64 VM. RPC and PTY cases passed with glibc 2.39, `rg` and `fdfind`. SDK and native-plugin CLI fixtures were skipped. The executable SHA-256 was `9cc6c800d1759a291cdcd9178f7bc4d9c4f9fd843a33652e42ac81994fa57739`.
+
+RPC fixtures cover request IDs, malformed/oversized and CRLF framing, Unicode separators in strings, state queries during streaming, busy rejection, abort followed by reuse, provider failure and EOF shutdown.
+
+| Source | SHA-256 |
+| --- | --- |
+| `src/rpc.zig` | `4bf1f7d708e139f10a47b12d2e2b3962caea1c40ae016a4b716d1e11f9e267eb` |
+| `src/harness.zig` | `c2865357e9dd6beafc209859ec1f3816888d540fb1bdc5deb147c7983c29fd3d` |
+| `scripts/test-cli.py` | `2ff6751222845c376b19070f3ffb294cfbd31bb34a46fcb021fd685336ca0a80` |
+
 ## Further acceptance
 
 - Extend the same build-installed test executables as real core behavior lands; preserve failures and distinguish compilation from execution.

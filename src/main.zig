@@ -4,6 +4,7 @@ const zpi = @import("zpi");
 const harness = @import("harness");
 const args_module = @import("cli/args.zig");
 const initial_prompt = @import("cli/initial_prompt.zig");
+const rpc = @import("rpc.zig");
 const pi_session = @import("pi_session");
 const tui = if (build_options.enable_tui) @import("tui") else struct {};
 const agent = zpi.agent;
@@ -18,6 +19,7 @@ const help =
     \\  -p, --print            Print final response and exit
     \\  --mode text            Text output; print when stdin/stdout is redirected
     \\  --mode json            Write Zpi JSONL events and exit
+    \\  --mode rpc             Serve experimental JSONL commands over stdin/stdout
     \\  --provider ID          Provider from models.json, openai, or anthropic
     \\  --model ID             Exact ID or known PROVIDER/ID[:THINKING] (without --provider)
     \\  --thinking LEVEL       Reasoning level: off, minimal, low, medium, high, xhigh, max
@@ -103,7 +105,7 @@ fn run(init: std.process.Init) !void {
     }
     if (options.mode == .interactive and !build_options.enable_tui) return error.TuiDisabled;
 
-    const piped_input = if (input_tty) "" else blk: {
+    const piped_input = if (input_tty or options.mode == .rpc) "" else blk: {
         var input_buffer: [8192]u8 = undefined;
         var stdin_reader = std.Io.File.stdin().readerStreaming(init.io, &input_buffer);
         const piped = stdin_reader.interface.allocRemaining(a, .limited(1024 * 1024 + 1)) catch |err| switch (err) {
@@ -115,10 +117,10 @@ fn run(init: std.process.Init) !void {
         break :blk std.mem.trim(u8, piped, " \t\r\n");
     };
     const host_cwd = try std.process.currentPathAlloc(init.io, a);
-    const prompt = try initial_prompt.build(a, init.io, host_cwd, init.environ_map.get("HOME"), piped_input, options.include_files.items, options.prompt.items);
-    if (prompt.len == 0 and options.mode != .interactive) return error.EmptyPrompt;
+    const prompt = if (options.mode == .rpc) "" else try initial_prompt.build(a, init.io, host_cwd, init.environ_map.get("HOME"), piped_input, options.include_files.items, options.prompt.items);
+    if (prompt.len == 0 and options.mode != .interactive and options.mode != .rpc) return error.EmptyPrompt;
 
-    var interrupt: ?zpi.model.Interrupt = if (options.mode == .interactive) try zpi.model.Interrupt.init() else null;
+    var interrupt: ?zpi.model.Interrupt = if (options.mode == .interactive or options.mode == .rpc) try zpi.model.Interrupt.init() else null;
     var old_sigint: ?std.posix.Sigaction = null;
     defer {
         if (old_sigint) |*old| {
@@ -189,7 +191,7 @@ fn run(init: std.process.Init) !void {
         .no_tools = options.no_tools,
         .allow_loopback_web_fetch = options.allow_loopback_web_fetch,
         .cancel_token = cancel_token,
-    }, .{ .context = &adapter, .emit = CliAdapter.emit });
+    }, if (options.mode == .rpc) null else .{ .context = &adapter, .emit = CliAdapter.emit });
     defer {
         const retained = h.retained_native_warning;
         h.deinit();
@@ -197,6 +199,7 @@ fn run(init: std.process.Init) !void {
             std.Io.File.stderr().writeStreamingAll(init.io, "zpi: native plugin retained with undrained work\n") catch {};
         }
     }
+    if (options.mode == .rpc) return rpc.run(h, &interrupt.?);
     adapter.harness = h;
     if (comptime build_options.enable_tui) {
         const out_color = std.Io.File.stdout().supportsAnsiEscapeCodes(init.io) catch false;
@@ -1270,5 +1273,6 @@ const CliAdapter = struct {
 test {
     _ = args_module;
     _ = initial_prompt;
+    _ = rpc;
     _ = pi_session;
 }

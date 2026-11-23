@@ -72,6 +72,34 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['stream'] is True
+            if self.path == '/rpc-fixture/chat/completions':
+                users = [m['content'] for m in request['messages'] if m['role'] == 'user']
+                assert not request.get('tools'), request
+                if users[-1] == 'rpc stall':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.end_headers()
+                    partial = {'choices': [{'index': 0, 'delta': {'content': 'rpc partial'}}]}
+                    self.wfile.write(('data: ' + json.dumps(partial) + '\n\n').encode())
+                    self.wfile.flush()
+                    self.server.rpc_release.wait(timeout=10)
+                    return
+                if users[-1] == 'rpc recovery\u2028text\u2029':
+                    assert users == ['rpc stall', 'rpc failure', 'rpc recovery\u2028text\u2029'], users
+                    assert not any(m['role'] == 'assistant' for m in request['messages']), request
+                    response = self.text('rpc recovered')
+                elif users[-1] == 'rpc failure':
+                    self.send_error(400)
+                    return
+                else:
+                    raise AssertionError(f'Unexpected RPC fixture prompt: {users[-1]!r}')
+                data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/tree-fixture/chat/completions':
                 messages = request['messages']
                 assert not request.get('tools')
@@ -2824,6 +2852,101 @@ def check_pi_import(root, resume_args, environment, server):
     compare_with_pi(bad_source, absent)
 
 
+def check_rpc(root, environment, server):
+    session = root / 'rpc.jsonl'
+    args = [str(BINARY), '--mode', 'rpc', '--no-tools', '--no-proxy', '--cwd', str(root),
+            '--endpoint', f'http://127.0.0.1:{server.server_port}/rpc-fixture',
+            '--api-key', 'rpc-test-key', '--model', 'rpc-test-model', '--session', str(session)]
+    for invalid in ('hello', '@missing.txt'):
+        rejected = subprocess.run(args + [invalid], input=b'', capture_output=True, env=environment, timeout=10)
+        assert rejected.returncode == 1 and rejected.stdout == b'', rejected
+        assert b'RpcPromptArguments' in rejected.stderr, rejected
+    with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          env=environment, bufsize=0) as process:
+        pending = bytearray()
+
+        def receive():
+            deadline = time.monotonic() + 8
+            while (end := pending.find(b'\n')) < 0:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0 and select.select([process.stdout], [], [], remaining)[0], ('RPC timeout', pending)
+                chunk = os.read(process.stdout.fileno(), 16384)
+                assert chunk, ('Unexpected RPC EOF', pending, process.poll())
+                pending.extend(chunk)
+            record = json.loads(pending[:end])
+            del pending[:end + 1]
+            return record
+
+        def send(value, ending=b'\n'):
+            data = memoryview(json.dumps(value, ensure_ascii=False).encode() + ending)
+            while data:
+                data = data[os.write(process.stdin.fileno(), data):]
+
+        def until(predicate):
+            for _ in range(100):
+                record = receive()
+                if predicate(record):
+                    return record
+            raise AssertionError('RPC event not received')
+
+        try:
+            process.stdin.write(b'{bad json}\n')
+            assert receive()['command'] == 'parse'
+            oversized = memoryview(b' ' * (1024 * 1024 + 4) + b'\n')
+            while oversized:
+                oversized = oversized[os.write(process.stdin.fileno(), oversized):]
+            assert receive()['success'] is False
+            send({'id': 'unknown', 'type': 'no_such_command'})
+            assert receive() == {'id': 'unknown', 'type': 'response', 'command': 'no_such_command',
+                                 'success': False, 'error': 'Unsupported RPC command'}
+            send({'id': 'idle', 'type': 'get_state'}, ending=b'\r\n')
+            idle = receive()
+            assert idle['id'] == 'idle' and idle['data']['isStreaming'] is False, idle
+            assert idle['data']['model']['id'] == 'rpc-test-model', idle
+            assert idle['data']['sessionFile'] == str(session), idle
+            assert not session.exists()
+            send({'id': 'stall', 'type': 'prompt', 'message': 'rpc stall'})
+            assert receive() == {'id': 'stall', 'type': 'response', 'command': 'prompt',
+                                 'success': True, 'data': {'disposition': 'started'}}
+            until(lambda record: record.get('event') == {'text_delta': 'rpc partial'})
+            send({'id': 'busy', 'type': 'get_state'})
+            busy = receive()
+            assert busy['id'] == 'busy' and busy['data']['isStreaming'] is True, busy
+            send({'id': 'overlap', 'type': 'prompt', 'message': 'must not run'})
+            overlap = receive()
+            assert overlap['id'] == 'overlap' and overlap['success'] is False, overlap
+            send({'id': 'abort', 'type': 'abort'})
+            assert receive() == {'type': 'error', 'error_code': 'Canceled'}
+            assert receive() == {'type': 'agent_settled', 'aborted': True}
+            assert receive() == {'id': 'abort', 'type': 'response', 'command': 'abort', 'success': True}
+            server.rpc_release.set()
+            send({'id': 'fail', 'type': 'prompt', 'message': 'rpc failure'})
+            assert receive()['id'] == 'fail'
+            assert until(lambda record: record['type'] == 'error')['error_code'] == 'HttpRequestFailed'
+            assert receive() == {'type': 'agent_settled', 'aborted': False}
+            # EOF during an accepted turn waits for that turn and closes the process.
+            send({'id': 'recovery', 'type': 'prompt', 'message': 'rpc recovery\u2028text\u2029'})
+            assert receive()['id'] == 'recovery'
+            process.stdin.close()
+            until(lambda record: record.get('event') == {'text_delta': 'rpc recovered'})
+            assert until(lambda record: record['type'] == 'agent_settled')['aborted'] is False
+            assert process.wait(timeout=8) == 0, process.stderr.read()
+            assert not pending and process.stdout.read() == b'' and process.stderr.read() == b''
+        finally:
+            server.rpc_release.set()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+    records = [json.loads(line) for line in session.read_bytes().split(b'\n') if line]
+    messages = [record['message'] for record in records if record.get('type') == 'message']
+    assert [m['content'] for m in messages if m['role'] == 'assistant'] == [[{'text': 'rpc recovered'}]], messages
+    incomplete = subprocess.run(args, input=b'{"type":"get_state"}', capture_output=True,
+                                env=environment, timeout=10)
+    assert incomplete.returncode == 0, incomplete.stderr
+    assert json.loads(incomplete.stdout)['error'] == 'Unterminated RPC record', incomplete.stdout
+
+
 def main():
     server = Server(('127.0.0.1', 0), Handler)
     server.failures = []
@@ -2837,6 +2960,7 @@ def main():
     server.retry_request_count = 0
     server.responses_retry_count = 0
     server.cancel_stream_release = threading.Event()
+    server.rpc_release = threading.Event()
     server.queue_requests = []
     server.queue_stream_mid = threading.Event()
     server.queue_stream_release = threading.Event()
@@ -2869,6 +2993,11 @@ def main():
             environment['ZPI_TEST_HEADER_TOKEN'] = 'header-secret'
             environment['ZPI_TEST_KEY_PART'] = 'key'
             environment['ZPI_EMPTY_HEADER'] = ''
+            check_rpc(root, environment, server)
+            assert not server.failures, server.failures
+            if sys.argv[1:] == ['--rpc-only']:
+                print('RPC integration passed')
+                return
             check_pi_import(root, common[:-4], environment, server)
             credential_session = root / 'invalid-credential.jsonl'
             credential_args = common[:-1] + [str(credential_session), '--no-tools', '-p', 'Reject credential']
@@ -3948,7 +4077,7 @@ for line in sys.stdin:
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'
             native_coverage = f', {sum(bool(p) for p in native_plugins)} native library CLI workflows' if any(native_plugins) else ' (native CLI skipped: ZPI_TEST_NATIVE_PLUGINS unset)'
-            print(f'CLI integration passed: {tools}, OpenAI + Anthropic tool loops, session reload and pi v3 import, stdin and @file text inputs, print stdout, JSONL, PTY help/prompt/exit and terminal restoration, Skills, prompt templates and MCP stdio{extensions}{native_coverage}')
+            print(f'CLI integration passed: {tools}, OpenAI + Anthropic tool loops, session reload and pi v3 import, stdin and @file text inputs, print stdout, JSONL RPC and events, PTY help/prompt/exit and terminal restoration, Skills, prompt templates and MCP stdio{extensions}{native_coverage}')
     finally:
         server.shutdown()
         server.server_close()

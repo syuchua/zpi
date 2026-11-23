@@ -2,7 +2,7 @@ const std = @import("std");
 const zpi = @import("zpi");
 const tool_selection = @import("tool_selection");
 
-pub const OutputMode = enum { auto, interactive, print, json };
+pub const OutputMode = enum { auto, interactive, print, json, rpc };
 pub const Mode = enum { tui, print, json };
 pub const McpServer = struct { name: []const u8, argv: []const [:0]const u8 };
 
@@ -183,7 +183,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
         }
         if (!positional_only and (std.mem.eql(u8, arg, "--mode") or std.mem.startsWith(u8, arg, "--mode="))) {
             const value = if (std.mem.eql(u8, arg, "--mode")) try takeValue(args, &i) else arg[7..];
-            const mode: OutputMode = if (std.mem.eql(u8, value, "text")) .auto else if (std.mem.eql(u8, value, "json")) .json else if (std.mem.eql(u8, value, "print")) .print else return error.InvalidMode;
+            const mode: OutputMode = if (std.mem.eql(u8, value, "text")) .auto else if (std.mem.eql(u8, value, "json")) .json else if (std.mem.eql(u8, value, "print")) .print else if (std.mem.eql(u8, value, "rpc")) .rpc else return error.InvalidMode;
             if (selected_mode) |prior| {
                 if (prior == .print and mode == .auto) continue;
                 if (prior != mode and !(prior == .auto and mode == .print)) return error.ConflictingMode;
@@ -238,9 +238,10 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
     if (result.append_system_prompt.items.len > 64) return error.TooManyPromptAdditions;
     if (result.skills.items.len > 64) return error.TooManySkills;
     try tool_selection.validate(.{ .tools = result.tools, .no_tools = result.no_tools, .no_builtin_tools = result.no_builtin_tools });
+    if (result.mode == .rpc and (result.prompt.items.len != 0 or result.include_files.items.len != 0)) return error.RpcPromptArguments;
     // Redirected stdin may supply the entire prompt. Validate emptiness after
     // reading it, before configuration, sessions, or executable resources load.
-    if (result.prompt.items.len == 0 and result.include_files.items.len == 0 and result.mode != .interactive and stdin_is_tty) return error.EmptyPrompt;
+    if (result.prompt.items.len == 0 and result.include_files.items.len == 0 and result.mode != .interactive and result.mode != .rpc and stdin_is_tty) return error.EmptyPrompt;
     return result;
 }
 fn sameMcpNamespace(left: []const u8, right: []const u8) bool {
@@ -299,6 +300,11 @@ test "CLI parses modes, overrides, positionals and conflicts" {
     var json_mode = try parse(std.testing.allocator, &b, false, false);
     defer json_mode.prompt.deinit(std.testing.allocator);
     try std.testing.expectEqual(OutputMode.json, json_mode.mode);
+    const rpc_mode = try parse(std.testing.allocator, &.{ "--mode", "rpc" }, false, false);
+    try std.testing.expectEqual(OutputMode.rpc, rpc_mode.mode);
+    try std.testing.expectError(error.RpcPromptArguments, parse(std.testing.allocator, &.{ "--mode=rpc", "hello" }, false, false));
+    try std.testing.expectError(error.RpcPromptArguments, parse(std.testing.allocator, &.{ "--mode=rpc", "@input.txt" }, false, false));
+    try std.testing.expectError(error.ConflictingMode, parse(std.testing.allocator, &.{ "--mode=rpc", "-p" }, false, false));
     var text_auto = try parse(std.testing.allocator, &.{"--mode=text"}, false, false);
     defer text_auto.prompt.deinit(std.testing.allocator);
     try std.testing.expectEqual(OutputMode.print, text_auto.mode);
