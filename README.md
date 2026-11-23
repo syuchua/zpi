@@ -46,13 +46,23 @@ Interactive commands include `/help`, `/hotkeys`, `/model`, `/thinking`, `/resum
 
 Experimental `--mode rpc` accepts newline-delimited JSON commands on stdin and writes responses and events to stdout. It supports `prompt`, `get_state`, and `abort`. Commands accept an optional string `id`, and each accepted prompt emits `agent_settled` after completion or failure. Events currently use Zpi's JSON event shapes. Pi RPC commands, message formats, and event compatibility remain partial. RPC also works with `-Dtui=none`.
 
+## Native Subagents
+
+Enable `subagent` with `--tools +subagent`. The tool accepts a self-contained `task`, or a `tasks` array with up to four named tasks to run concurrently. Children use the current model, system instructions and eligible parent-enabled native tools. Each child starts with a fresh in-memory conversation and its own model client and tool state. Children share the working directory and filesystem permissions with the parent.
+
+```json
+{"tasks":[{"name":"review","task":"Review src/agent.zig and summarize cancellation handling"},{"name":"tests","task":"Read scripts/test-cli.py and summarize the existing regression coverage"}],"timeoutSeconds":120,"maxTurns":8}
+```
+
+The parent receives live progress and bounded results in task order, including individual errors and truncation flags. Parent cancellation stops the batch. `timeoutSeconds` defaults to 300 and applies to the whole batch, and `maxTurns` defaults to 16 per child. Child results contain up to 8 KiB of text each. Cancellation and deadlines are cooperative, and cleanup waits for child tools to return. File and search operations retain their existing per-tool bounds. Child tools are drawn from the parent's enabled, unwrapped native file, shell, search and web tools. Extensions, MCP tools, background task tools and recursive delegation remain outside this initial child tool set. Parallel workers can modify the same files, so assign disjoint files when delegating edits.
+
 ## Current Status
 
 Zpi is a tested, useful subset and is **not production-ready or broadly pi-compatible**. Current strengths include:
 
 - Fast native CLI startup and low measured process memory for the `--version` command; see the caveats and reproducible results above.
 - Native Zig terminal UI, streaming text/tool output, Markdown rendering, session history display and resume, compaction, and branch navigation.
-- Built-in file/shell tools, URL fetching and cached content search, plus persistent background task management (`bg_run` and companions).
+- Built-in file/shell tools, URL fetching and cached content search, persistent background task management (`bg_run` and companions), and opt-in native single/parallel subagents.
 - OpenAI and Anthropic text/tool workflows, optional MCP stdio servers, and experimental native C/Zig plugins.
 - Offline import of a limited subset of pi v3 session history and an opt-in host for a limited set of existing pi TypeScript extensions.
 
@@ -63,7 +73,7 @@ Important gaps include `web_search`, broad provider and OAuth support, images, p
 Priorities are subject to change; this is a project direction, not a release promise.
 
 1. **Compatibility and daily-use reliability**: broaden provider/auth and session compatibility, improve project trust and tool approval controls, and keep native macOS/Linux verification current.
-2. **Search and orchestration**: evaluate a first-party `web_search` integration and improve orchestration.
+2. **Search and orchestration**: evaluate a first-party `web_search` integration and extend native subagents with additional model selection, persistent child sessions and background orchestration.
 3. **Integration surface**: extend the experimental RPC command and event subset, then strengthen plugin lifecycle/ABI guarantees and Rust interoperability.
 4. **Product maturity**: assess package/resource management, settings parity, fullscreen TUI behavior, and release provenance/signing based on user needs and maintenance capacity.
 

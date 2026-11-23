@@ -5,6 +5,7 @@ Zpi runs with the permissions of the account that launches it. `--cwd` sets the 
 ## Select the resources and executables you trust
 
 - Start with `--no-tools` when reviewing unfamiliar or imported conversation history. A restrictive selection such as `--tools read` allows file reads. `--tools` can enable tools even when `--no-tools` is present.
+- The `subagent` tool shares the parent working directory and OS permissions. Children can use eligible native tools selected for the parent. Use `--tools subagent,read` for file-reading delegation, or `--exclude-tools subagent` to disable delegation in a wildcard tool selection.
 - Project skill and prompt-template discovery require separate opt-ins. Review their contents before enabling them because they can affect instructions sent to the model. Inspect `--system-prompt`, `--append-system-prompt`, and `@file` inputs for the same reason.
 - `--extension`, `--native-plugin`, and `--mcp-stdio` authorize executable code. TypeScript extensions and MCP servers run in child processes. Native libraries run inside Zpi and can affect its memory and stability. Explicitly selected modules and servers still load when tools are disabled. Use trusted executable paths, SDK installations, and `PATH` entries.
 

@@ -11,6 +11,7 @@ const recent_session = @import("cli/recent_session.zig");
 const skills = @import("skills");
 const prompt_templates = @import("prompt_templates");
 const agent = zpi.agent;
+const subagent = @import("subagent.zig");
 
 pub const Api = config.Api;
 pub const ModelChoice = config.ModelChoice;
@@ -457,7 +458,12 @@ pub const Harness = struct {
             mgr.setWakeHook(.{ .context = self, .trigger = bgWakeErased });
         }
 
-        var registered_tools: []const agent.Tool = self.tool_set.tools;
+        const delegation = try a.create(subagent.Context);
+        delegation.* = .{ .parent = self, .run_child = runChildErased };
+        const builtins = try a.alloc(agent.Tool, self.tool_set.tools.len + 1);
+        @memcpy(builtins[0..self.tool_set.tools.len], self.tool_set.tools);
+        builtins[self.tool_set.tools.len] = try subagent.definition(a, delegation);
+        var registered_tools: []const agent.Tool = builtins;
         self.native_modules = try a.alloc(zpi.native_runtime.Module, options.native_plugins.len);
         errdefer for (self.native_modules[0..self.native_loaded]) |*module| {
             module.close() catch {};
@@ -990,6 +996,55 @@ pub const Harness = struct {
         };
     }
 
+    fn runChildErased(parent: *anyopaque, ctx: agent.ToolContext, request: subagent.Request, sink: agent.Sink) anyerror![]const u8 {
+        const self: *Harness = @ptrCast(@alignCast(parent));
+        var tools = try zpi.tools.ToolSet.initWithOptions(ctx.allocator, .{
+            .temp_dir = self.tool_set.temp_dir,
+            .allow_loopback_web_fetch = self.tool_set.web_fetch_store.allow_loopback,
+        });
+        defer tools.deinit();
+        var enabled: std.ArrayList(agent.Tool) = .empty;
+        defer enabled.deinit(ctx.allocator);
+        // Only ordinary, enabled native tools are delegated. Matching executor
+        // pointers also preserves extension gates and replacements on the parent.
+        for (tools.tools) |tool| {
+            for (self.enabled_tools) |parent_tool| {
+                if (parent_tool.execute == tool.execute and std.mem.eql(u8, parent_tool.definition.name, tool.definition.name)) {
+                    try enabled.append(ctx.allocator, tool);
+                    break;
+                }
+            }
+        }
+        var chat = self.openai_client;
+        var responses = self.responses_client;
+        var anthropic = self.anthropic_client;
+        chat.cancel = ctx.cancel;
+        responses.cancel = ctx.cancel;
+        anthropic.cancel = ctx.cancel;
+        const provider = switch (self.selection.api) {
+            .openai_completions => chat.provider(),
+            .openai_responses => responses.provider(),
+            .anthropic_messages => anthropic.provider(),
+        };
+        var child = agent.Agent.init(ctx.allocator, ctx.io, provider, enabled.items, ctx.cwd);
+        defer child.deinit();
+        child.cancel = ctx.cancel;
+        child.retry = self.runtime.retry;
+        child.max_turns = request.max_turns;
+        for (self.runtime.messages.items) |message| {
+            if (message.role == .system) try child.append(message);
+        }
+        try child.prompt(request.task, sink);
+        const last = child.messages.items[child.messages.items.len - 1];
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(ctx.allocator);
+        for (last.content) |part| switch (part) {
+            .text => |value| try text.appendSlice(ctx.allocator, value),
+            else => {},
+        };
+        return ctx.allocator.dupe(u8, text.items);
+    }
+
     pub fn submit(self: *Harness, prompt: []const u8) !SubmitResult {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
@@ -1276,6 +1331,7 @@ pub const Harness = struct {
 };
 
 test {
+    _ = subagent;
     _ = config;
     _ = settings_mod;
     _ = tool_selection;

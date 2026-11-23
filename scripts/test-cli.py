@@ -72,6 +72,107 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['stream'] is True
+            if self.path == '/subagent-fixture/chat/completions':
+                messages = request['messages']
+                user = next(m['content'] for m in messages if m['role'] == 'user')
+                tools = {t['function']['name'] for t in request.get('tools', [])}
+                results = [m for m in messages if m['role'] == 'tool']
+
+                def call(name, arguments):
+                    return {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'native-child-call', 'type': 'function',
+                        'function': {'name': name, 'arguments': json.dumps(arguments)},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+
+                if user.startswith('delegate-'):
+                    assert 'subagent' in tools, tools
+                    if not results:
+                        arguments = {
+                            'delegate-single': {'task': 'child-write', 'name': 'writer'},
+                            'delegate-parallel': {'tasks': [{'task': 'child-parallel-a', 'name': 'a'},
+                                                           {'task': 'child-parallel-b', 'name': 'b'}]},
+                            'delegate-parallel-timeout': {'tasks': [{'task': 'child-stall'}, {'task': 'child-stall'}], 'timeoutSeconds': 1},
+                            'delegate-truncation': {'task': 'child-long'},
+                            'delegate-mixed': {'tasks': [{'task': 'child-long'}, {'task': 'child-failure'}]},
+                            'delegate-failure': {'task': 'child-failure'},
+                            'delegate-timeout': {'task': 'child-stall', 'timeoutSeconds': 1},
+                            'delegate-limit': {'task': 'child-loop', 'maxTurns': 1},
+                            'delegate-cancel': {'task': 'child-stall'},
+                            'delegate-readonly': {'task': 'child-readonly'},
+                            'delegate-invalid': {'task': 'child-write', 'tasks': []},
+                        }[user]
+                        response = call('subagent', arguments)
+                    else:
+                        assert len(results) == 1, results
+                        text = results[0]['content']
+                        if user == 'delegate-invalid':
+                            assert 'ConflictingSubagentTasks' in text, text
+                        else:
+                            result = json.loads(text)
+                            entries = result['results']
+                            if user == 'delegate-single':
+                                assert entries[0]['text'] == 'child wrote file' and entries[0]['status'] == 'completed', entries
+                            elif user == 'delegate-parallel':
+                                assert [(e['name'], e['text']) for e in entries] == [('a', 'parallel a'), ('b', 'parallel b')], entries
+                            elif user in ('delegate-truncation', 'delegate-mixed'):
+                                assert entries[0]['truncated'] and len(entries[0]['text'].encode()) <= 8192, entries
+                                assert entries[0]['text'].startswith('中文'), entries
+                                if user == 'delegate-mixed':
+                                    assert entries[1]['status'] == 'failed' and entries[1]['error_code'] == 'HttpRequestFailed', entries
+                            elif user == 'delegate-parallel-timeout':
+                                assert result['timedOut'] and all(e['error_code'] == 'SubagentTimeout' for e in entries), result
+                            elif user == 'delegate-readonly':
+                                assert entries[0]['text'] == 'child read file', entries
+                            elif user == 'delegate-failure':
+                                assert entries[0]['error_code'] == 'HttpRequestFailed', entries
+                            elif user == 'delegate-timeout':
+                                assert result['timedOut'] and entries[0]['error_code'] == 'SubagentTimeout', result
+                            elif user == 'delegate-limit':
+                                assert entries[0]['error_code'] == 'TurnLimitExceeded', entries
+                            else:
+                                raise AssertionError('Canceled child returned to provider')
+                        response = self.text(user + ' complete')
+                else:
+                    assert 'subagent' not in tools and not any(t.startswith('bg_') for t in tools), tools
+                    assert not any(m['role'] == 'assistant' and 'delegate-' in str(m) for m in messages), messages
+                    if user == 'child-write':
+                        assert tools == {'read', 'write'}, tools
+                        response = self.text('child wrote file') if results else call('write', {'path': 'child-result.txt', 'content': 'native child output\n'})
+                    elif user.startswith('child-parallel-'):
+                        self.server.subagent_barrier.wait(timeout=8)
+                        response = self.text('parallel ' + user[-1])
+                    elif user == 'child-readonly':
+                        assert tools == {'read'}, tools
+                        if results:
+                            assert results[0]['content'] == 'native child output\n', results
+                            response = self.text('child read file')
+                        else:
+                            response = call('read', {'path': 'child-result.txt'})
+                    elif user == 'child-long':
+                        response = self.text('中文' * 2000)
+                    elif user == 'child-failure':
+                        self.send_error(400)
+                        return
+                    elif user == 'child-loop':
+                        response = call('read', {'path': 'child-result.txt'})
+                    elif user == 'child-stall':
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/event-stream')
+                        self.end_headers()
+                        partial = {'choices': [{'index': 0, 'delta': {'content': 'child is running'}}]}
+                        self.wfile.write(('data: ' + json.dumps(partial) + '\n\n').encode())
+                        self.wfile.flush()
+                        self.server.subagent_release.wait(timeout=10)
+                        return
+                    else:
+                        raise AssertionError(f'Unexpected native child task: {user!r}')
+                data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/rpc-fixture/chat/completions':
                 users = [m['content'] for m in request['messages'] if m['role'] == 'user']
                 assert not request.get('tools'), request
@@ -2852,6 +2953,70 @@ def check_pi_import(root, resume_args, environment, server):
     compare_with_pi(bad_source, absent)
 
 
+def check_subagent(root, environment, server):
+    args = [str(BINARY), '--no-proxy', '--cwd', str(root),
+            '--endpoint', f'http://127.0.0.1:{server.server_port}/subagent-fixture',
+            '--api-key', 'child-test-key', '--model', 'child-model']
+    for scenario in ('single', 'parallel', 'failure', 'timeout', 'limit', 'readonly', 'invalid',
+                     'truncation', 'mixed', 'parallel-timeout'):
+        session = root / f'subagent-{scenario}.jsonl'
+        tool_names = 'subagent,read' if scenario == 'readonly' else 'subagent,read,write'
+        result = subprocess.run(args + ['--tools', tool_names, '--session', str(session), '-p', 'delegate-' + scenario],
+                                input=b'', capture_output=True, env=environment, timeout=20)
+        assert result.returncode == 0, (scenario, result.stderr, server.failures)
+        assert result.stdout == f'delegate-{scenario} complete\n'.encode(), (scenario, result)
+        records = [json.loads(line) for line in session.read_bytes().split(b'\n') if line]
+        users = [r['message']['content'] for r in records if r.get('type') == 'message' and r['message']['role'] == 'user']
+        assert users == [[{'text': 'delegate-' + scenario}]], users
+        tool_results = [r['message'] for r in records if r.get('type') == 'message' and r['message']['role'] == 'tool_result']
+        assert len(tool_results) == 1 and tool_results[0]['tool_name'] == 'subagent', tool_results
+        assert tool_results[0].get('is_error', False) == (scenario in ('failure', 'timeout', 'limit', 'invalid', 'mixed', 'parallel-timeout')), tool_results
+    server.subagent_release.set()
+    assert (root / 'child-result.txt').read_text() == 'native child output\n'
+
+    # Cancel a live child through the normal RPC frontend, then ensure the
+    # parent reconciles the pending tool batch and acknowledges the abort.
+    server.subagent_release.clear()
+    process = subprocess.Popen(args + ['--mode', 'rpc', '--tools', 'subagent,read', '--no-session'],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=environment, bufsize=0)
+    pending = bytearray()
+
+    def record():
+        deadline = time.monotonic() + 10
+        while (end := pending.find(b'\n')) < 0:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and select.select([process.stdout], [], [], remaining)[0], ('child cancel timeout', pending)
+            data = os.read(process.stdout.fileno(), 16384)
+            assert data, (pending, process.poll())
+            pending.extend(data)
+        value = json.loads(pending[:end])
+        del pending[:end + 1]
+        return value
+
+    try:
+        process.stdin.write(b'{"id":"child","type":"prompt","message":"delegate-cancel"}\n')
+        assert record()['id'] == 'child'
+        while True:
+            value = record()
+            if value['type'] == 'tool_execution_update' and 'child is running' in value['result']['text']:
+                break
+        process.stdin.write(b'{"id":"cancel","type":"abort"}\n')
+        while (value := record())['type'] != 'agent_settled':
+            pass
+        assert value['aborted'], value
+        assert record() == {'id': 'cancel', 'type': 'response', 'command': 'abort', 'success': True}
+        process.stdin.close()
+        assert process.wait(timeout=8) == 0, process.stderr.read()
+    finally:
+        server.subagent_release.set()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+
 def check_rpc(root, environment, server):
     session = root / 'rpc.jsonl'
     args = [str(BINARY), '--mode', 'rpc', '--no-tools', '--no-proxy', '--cwd', str(root),
@@ -2961,6 +3126,8 @@ def main():
     server.responses_retry_count = 0
     server.cancel_stream_release = threading.Event()
     server.rpc_release = threading.Event()
+    server.subagent_release = threading.Event()
+    server.subagent_barrier = threading.Barrier(2)
     server.queue_requests = []
     server.queue_stream_mid = threading.Event()
     server.queue_stream_release = threading.Event()
@@ -2993,11 +3160,17 @@ def main():
             environment['ZPI_TEST_HEADER_TOKEN'] = 'header-secret'
             environment['ZPI_TEST_KEY_PART'] = 'key'
             environment['ZPI_EMPTY_HEADER'] = ''
+            if sys.argv[1:] == ['--subagent-only']:
+                check_subagent(root, environment, server)
+                assert not server.failures, server.failures
+                print('Native subagent integration passed')
+                return
             check_rpc(root, environment, server)
             assert not server.failures, server.failures
             if sys.argv[1:] == ['--rpc-only']:
                 print('RPC integration passed')
                 return
+            check_subagent(root, environment, server)
             check_pi_import(root, common[:-4], environment, server)
             credential_session = root / 'invalid-credential.jsonl'
             credential_args = common[:-1] + [str(credential_session), '--no-tools', '-p', 'Reject credential']
@@ -3681,7 +3854,7 @@ for line in sys.stdin:
                                         input='', text=True, capture_output=True, env=environment, timeout=20)
                 assert result.returncode != 0 and expected in result.stderr, result.stderr
                 assert not rejected_path.exists()
-            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}
+            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill', 'subagent'}
             for index, (flags, expected) in enumerate([
                 (['--tools', 'read,ls'], {'read', 'ls'}),
                 (['-t', 'r*,*sh', '-xt', '*sh'], {'read'}),
