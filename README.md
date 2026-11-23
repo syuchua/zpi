@@ -84,6 +84,7 @@ Priorities are subject to change; this is a project direction, not a release pro
 - [Platform verification](docs/spec/platform-verification.md)
 - [Security notes](docs/security.md)
 - [Install, upgrade and remove](docs/install.md)
+- [v0.1.0 release notes](docs/releases/v0.1.0.md)
 - [Native plugin ABI](docs/spec/native-plugin-abi.md) and [runtime](docs/spec/native-plugin-runtime.md)
 - [TypeScript extension host](docs/spec/typescript-extension-host.md)
 - [Implementation specification](docs/spec/implementation-spec.md)
