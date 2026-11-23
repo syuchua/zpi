@@ -20,7 +20,7 @@ FILES = {
 }
 
 
-def package(prefix, output):
+def package(prefix, output, root_name='zpi'):
     # Publish the complete archive without replacing a previous build.
     with tempfile.NamedTemporaryFile(dir=output.parent, prefix='.zpi-package-') as staging:
         with gzip.GzipFile(filename='', fileobj=staging, mode='wb', mtime=0) as compressed:
@@ -32,7 +32,7 @@ def package(prefix, output):
                         metadata = os.fstat(source.fileno())
                         if not stat.S_ISREG(metadata.st_mode):
                             raise ValueError(f'Expected a regular installed file: {name}')
-                        entry = tarfile.TarInfo(f'zpi/{name}')
+                        entry = tarfile.TarInfo(f'{root_name}/{name}')
                         entry.size = metadata.st_size
                         entry.mode = mode
                         archive.addfile(entry, source)
@@ -50,11 +50,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('prefix', type=Path, help='Prefix populated by zig build install')
     parser.add_argument('output', type=Path, help='New .tar.gz archive in an existing directory')
+    parser.add_argument('--root-name', default='zpi', help='Top-level archive directory')
     args = parser.parse_args()
     if not args.output.name.endswith('.tar.gz') or any(c.isspace() or c == '\\' for c in args.output.name):
         parser.error('Use a .tar.gz filename without whitespace or backslashes')
+    if not args.root_name or args.root_name in ('.', '..') or any(c in args.root_name for c in '/\\') or any(c.isspace() for c in args.root_name):
+        parser.error('Root name must be one safe path component without whitespace')
     try:
-        checksum = package(args.prefix, args.output)
+        checksum = package(args.prefix, args.output, args.root_name)
     except (OSError, ValueError, tarfile.TarError) as error:
         parser.exit(1, f'zpi package: {error}\n')
     print(f'{checksum}  {args.output.name}')

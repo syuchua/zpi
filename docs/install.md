@@ -6,7 +6,7 @@ Install `rg` and `fd` (or `fdfind`) separately if you use the corresponding sear
 
 ## Install a release archive
 
-GitHub release archives cover Linux x64, Linux arm64, macOS x64 and macOS arm64. Each `.tar.gz` has a matching `.sha256` file. The binaries target baseline CPU features. The Linux archives are built and tested on Ubuntu 24.04 with glibc 2.39. Verify the checksum before extraction.
+GitHub release archives cover Linux x64 and arm64 with separate glibc and musl builds, plus macOS x64 and arm64. Each versioned `.tar.gz` has a matching `.sha256` file and extracts to a version/platform-named directory containing `bin/`, `include/` and `share/`. Linux glibc archives target glibc 2.17 and run offline CLI smoke tests in manylinux2014 containers. The search-tool scenarios run in the standard Linux CI matrix, which installs `rg` and `fd`. Musl archives are tested on Alpine 3.24. The macOS x64 binary declares a Catalina 10.15 deployment target; Apple Silicon declares a Big Sur 11.0 target. CI checks these load-command minimums and runs the binaries on current macOS runners, not on macOS 10.15/11 systems. All binaries target baseline CPU features. Verify the checksum before extraction.
 
 You can also build a local archive for the machine running Zig. Choose a filename that identifies its OS, architecture and, on Linux, libc. The script requires Python 3 and a filesystem that supports hard links. It runs the core offline CLI suite from the unpacked archive before creating the output files.
 

@@ -42,6 +42,10 @@ def main():
         assert first.stdout.split()[0] == hashlib.sha256(original).hexdigest()
         assert second.stdout.split()[0] == first.stdout.split()[0]
         assert output.stat().st_mode & 0o777 == 0o644
+        release_root = 'zpi-0.1.0-linux-x64-gnu'
+        release_output = root / 'release.tar.gz'
+        subprocess.run([sys.executable, str(PACKAGER), str(prefix), str(release_output), '--root-name', release_root],
+                       check=True, text=True, capture_output=True)
         with tarfile.open(output, 'r:gz') as archive:
             names = archive.getnames()
             assert names == [
@@ -56,6 +60,13 @@ def main():
             for relative in ('bin/zpi', 'include/zpi_plugin.h', 'include/zpi_plugin_runtime.h',
                              'LICENSE', 'share/zpi/pi-sdk.mjs', 'share/zpi/ts-host.mjs'):
                 assert archive.extractfile(f'zpi/{relative}').read() == (prefix / relative).read_bytes()
+        with tarfile.open(release_output, 'r:gz') as archive:
+            assert [m.name for m in archive.getmembers()] == [f'{release_root}/{name}' for name in (
+                'bin/zpi', 'include/zpi_plugin.h', 'include/zpi_plugin_runtime.h', 'LICENSE',
+                'share/zpi/pi-sdk.mjs', 'share/zpi/ts-host.mjs')]
+        bad_root = subprocess.run([sys.executable, str(PACKAGER), str(prefix), str(root / 'bad-root.tar.gz'),
+                                   '--root-name', '../escape'], text=True, capture_output=True)
+        assert bad_root.returncode == 2 and not (root / 'bad-root.tar.gz').exists(), bad_root
         refusal = subprocess.run([sys.executable, str(PACKAGER), str(prefix), str(output)],
                                  text=True, capture_output=True)
         assert refusal.returncode == 1 and output.read_bytes() == original, refusal

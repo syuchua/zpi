@@ -1648,15 +1648,27 @@ def check_https_proxy(root, environment, server):
         assert rejected.returncode != 0 and 'ProxyConnectFailed' in rejected.stderr, rejected.stderr
         assert ('rejected', '127.0.0.1:4443', 'Basic d3Jvbmc6Y3JlZHM=') in proxy_events, proxy_events
 
-        # 3. End-to-end TLS origin over HTTP CONNECT proxy when openssl is available.
-        if shutil.which('openssl'):
+        # Use a config file for SANs so OpenSSL 1.0.2 can run this fixture too.
+        if openssl_path := shutil.which('openssl'):
             cert_file = root / 'tls-cert.pem'
             key_file = root / 'tls-key.pem'
+            cert_config = root / 'tls-cert.cnf'
+            cert_config.write_text('''[req]
+distinguished_name=dn
+x509_extensions=v3
+prompt=no
+[dn]
+CN=127.0.0.1
+[v3]
+subjectAltName=@alt_names
+[alt_names]
+DNS.1=localhost
+IP.1=127.0.0.1
+''')
             subprocess.run([
-                'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                openssl_path, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
                 '-keyout', str(key_file), '-out', str(cert_file),
-                '-days', '1', '-subj', '/CN=127.0.0.1',
-                '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1',
+                '-days', '1', '-config', str(cert_config), '-extensions', 'v3',
             ], check=True, capture_output=True, timeout=20)
 
             class TlsOriginHandler(BaseHTTPRequestHandler):
@@ -3959,7 +3971,7 @@ for line in sys.stdin:
             assert help_run.returncode == 0 and b'Usage:' in help_run.stdout
             first = run_repo_cli(common + ['--tools', '*', '-p', 'workflow'], input='', text=True, capture_output=True,
                                    env=environment, timeout=20)
-            assert first.returncode == 0, first.stderr
+            assert first.returncode == 0, (first.stderr, server.failures)
             assert first.stdout == 'workflow complete\n', repr(first.stdout)
             assert (root / 'sample.txt').read_text() == 'alpha\ngamma\n'
             records = [json.loads(line) for line in session.read_text().splitlines()]
