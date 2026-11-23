@@ -2174,7 +2174,9 @@ def check_tui_components(root, environment, server):
 
         # 2b. Live bash tool_update streaming + Ctrl+O compact/expanded toggle.
         start = len(transcript)
-        os.write(master, b'stream-bash\n')
+        os.write(master, b's')
+        expect(b'\x1b[0m s', start)
+        os.write(master, b'tream-bash\n')
         expect(b'[tool: bash]', start)
         expect(b'B1', start)
         expect(b'Ctrl+O to expand', start)
@@ -2185,7 +2187,9 @@ def check_tui_components(root, environment, server):
         os.write(master, b'\x0f')
         expect(b'expanded', mark_o)
         start = len(transcript)
-        os.write(master, b'stream-bash\n')
+        os.write(master, b's')
+        expect(b'\x1b[0m s', start)
+        os.write(master, b'tream-bash\n')
         expect(b'B12', start)
         done2 = expect(b'bash stream done', start)
         expect(b'\x1b[?2004h', done2)
