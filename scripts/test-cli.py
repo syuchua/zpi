@@ -192,6 +192,18 @@ class Handler(BaseHTTPRequestHandler):
                 elif users[-1] == 'rpc failure':
                     self.send_error(400)
                     return
+                elif users == ['rpc disabled write']:
+                    results = [m for m in request['messages'] if m['role'] == 'tool']
+                    if results:
+                        assert len(results) == 1 and results[0]['content'] == 'Unknown tool: write', results
+                        response = self.text('rpc denied write')
+                    else:
+                        response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                            'index': 0, 'id': 'rpc-disabled-write', 'type': 'function',
+                            'function': {'name': 'write', 'arguments': json.dumps({
+                                'path': 'rpc-forbidden.txt', 'content': 'fixture marker',
+                            })},
+                        }]}, 'finish_reason': 'tool_calls'}]}
                 else:
                     raise AssertionError(f'Unexpected RPC fixture prompt: {users[-1]!r}')
                 data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
@@ -497,7 +509,19 @@ class Handler(BaseHTTPRequestHandler):
                 messages = request['messages']
                 user_msg = [m['content'] for m in messages if m['role'] == 'user'][-1]
                 results = [m for m in messages if m['role'] == 'tool']
-                if user_msg == 'wrap-and-usage':
+                if user_msg == 'verify shell context':
+                    users = [m['content'] for m in messages if m['role'] == 'user']
+                    assert sum('Exit outcome and output:\nSHELL_CONTEXT_MARKER' in text for text in users) == 1, users
+                    assert not any('SHELL_EXCLUDED_MARKER' in text for text in users), users
+                    self.server.shell_context_requests.append(messages)
+                    body = ('data: ' + json.dumps(self.text('shell context verified')) + '\n\ndata: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                elif user_msg == 'wrap-and-usage':
                     assert request.get('reasoning_effort') == 'high', request
                     long_md = '- ' + ' '.join(f'word{i}' for i in range(1, 22)) + ' **wrapend**\n'
                     c_text = self.text(long_md)
@@ -1443,7 +1467,8 @@ def terminal_editor_check(common, environment, root):
         os.write(master, b'edit-preview\n')
         p = read_prompt(read_until(b'preview complete', mark))
         snippet = transcript[mark:p]
-        assert b'-2 beta' in snippet and b'+2 BETA' in snippet, snippet
+        assert b'[tool: edit]' in snippet and b'preview.txt' in snippet, snippet
+        assert b'-2 beta' not in snippet and b'+2 BETA' not in snippet, snippet
 
         # 7. Ctrl-D on empty line exits cleanly with status 0 and restored termios
         os.write(master, b'\x04')
@@ -1987,11 +2012,11 @@ def check_queued_followup_editing(root, environment, server):
         prompt_ready = b'\x1b[?2004h'
         expect(prompt_ready)
 
-        # 1. Start a streaming turn; no live prompt overlay renders until user types.
+        # 1. Start a streaming turn; the committed prompt is rendered as a user panel.
         start = len(transcript)
         os.write(master, b'queue-slow\n')
         end = expect(b'working...', start)
-        assert b'> ' not in transcript[start:end + len(b'working...')], transcript[start:]
+        assert b'\x1b[48;2;25;43;61m> queue-slow' in transcript[start:end], transcript[start:]
 
         # 2. Type a live draft while streaming; mid-stream output preserves the draft cleanly.
         prompt_marker = b'\x1b[36m>\x1b[0m '
@@ -2124,6 +2149,7 @@ def check_tui_components(root, environment, server):
     }))
     env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color', COLORTERM='truecolor')
     env.pop('NO_COLOR', None)
+    server.shell_context_requests = []
     args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(comp_dir)]
 
     master, slave = pty.openpty()
@@ -2173,16 +2199,31 @@ def check_tui_components(root, environment, server):
         expect(b'\xe2\x95\xad\xe2\x94\x80 ', start)
         expect(b'[tool: edit]', start)
         expect(b'comp.txt', start)
-        expect(b'-2 old', start)
-        expect(b'+2 new', start)
+        expect(b'Ctrl+O shows 20 lines', start)
         expect(b'\xe2\x95\xb0\xe2\x94\x80 ', start)
         expect(b'\xe2\x9c\x93', start)
         expect(b'\x1b[1;38;2;103;212;242m## Summary\x1b[0m', start)
         expect(b'\xe2\x80\xa2 ', start)
-        expect(b'const ok = true;', start)
-        expect(b'comp-fixture/comp-model (medium)', len(transcript) - 256 if len(transcript) > 256 else 0)
+        reply = expect(b'const ok = true;', start)
+        expect(b'\x1b[?2004h', reply)
+        assert b'\x1b[48;2;36;39;48m' not in transcript[start:]
+        user_row = b'> update comp'.ljust(79)
+        assert b'\x1b[48;2;25;43;61m' + user_row + b'\x1b[0m' in transcript[start:]
+        expect(b'comp-fixture/comp-model (medium)', reply)
         assert b'\x1b[?1049h' not in transcript, 'alt-screen triggered'
         assert (comp_dir / 'comp.txt').read_text() == 'line1\nnew\nline3\n'
+
+        # /details opens a bounded independent overlay with persisted tool calls and results.
+        details_mark = len(transcript)
+        os.write(master, b'/details\n')
+        expect(b'Tool output ', details_mark)
+        expect(b'tool edit:', details_mark)
+        expect(b'-2 old', details_mark)
+        expect(b'+2 new', details_mark)
+        expect(b'Esc close', details_mark)
+        closed_mark = len(transcript)
+        os.write(master, b'q')
+        expect(b'\x1b[?2004h', closed_mark)
 
         # 2b. Live bash tool_update streaming + Ctrl+O compact/expanded toggle.
         start = len(transcript)
@@ -2191,7 +2232,7 @@ def check_tui_components(root, environment, server):
         os.write(master, b'tream-bash\n')
         expect(b'[tool: bash]', start)
         expect(b'B1', start)
-        expect(b'Ctrl+O to expand', start)
+        expect(b'Ctrl+O shows 20 lines', start)
         done1 = expect(b'bash stream done', start)
         expect(b'\x1b[?2004h', done1)
 
@@ -2205,9 +2246,37 @@ def check_tui_components(root, environment, server):
         expect(b'B12', start)
         done2 = expect(b'bash stream done', start)
         expect(b'\x1b[?2004h', done2)
-        assert b'Ctrl+O to expand' not in transcript[start:], transcript[start:]
+        assert b'Ctrl+O shows 20 lines' not in transcript[start:], transcript[start:]
         os.write(master, b'\x0f')
         time.sleep(0.08)
+
+        # `!` enters a green shell mode, ! output reaches the next agent request,
+        # while `!!` runs visibly without issuing another provider request.
+        shell_mode = len(transcript)
+        os.write(master, b'!')
+        expect(b'\x1b[38;2;152;195;121m', shell_mode)
+        os.write(master, b'printf SHELL_CONTEXT_MARKER\n')
+        recorded = expect(b'[output added to conversation context]', shell_mode)
+        expect(b'\x1b[?2004h', recorded)
+        excluded_mode = len(transcript)
+        os.write(master, b'!!printf SHELL_EXCLUDED_MARKER\n')
+        expect(b'SHELL_EXCLUDED_MARKER', excluded_mode)
+        excluded = expect(b'command output excluded from agent context', excluded_mode)
+        expect(b'\x1b[?2004h', excluded)
+        assert not server.shell_context_requests
+        context_mark = len(transcript)
+        os.write(master, b'verify shell context\n')
+        verified = expect(b'shell context verified', context_mark)
+        expect(b'\x1b[?2004h', verified)
+        assert len(server.shell_context_requests) == 1, server.failures
+
+        # A partial slash query has a selected match; Enter dispatches it.
+        command_mark = len(transcript)
+        os.write(master, b'/ho\n')
+        expect(b'Keyboard shortcuts', command_mark)
+        dialog_close = len(transcript)
+        os.write(master, b'q')
+        expect(b'\x1b[36m>\x1b[0m ', dialog_close)
 
         # 2c. Shift+Tab cycles thinking_level (medium -> high), Markdown wraps at 80 cols, and live usage updates Footer warning color.
         shift_mark = len(transcript)
@@ -3126,6 +3195,17 @@ def check_rpc(root, environment, server):
                                 env=environment, timeout=10)
     assert incomplete.returncode == 0, incomplete.stderr
     assert json.loads(incomplete.stdout)['error'] == 'Unterminated RPC record', incomplete.stdout
+
+    # A fresh process with tools disabled must reject a model-proposed write
+    # at dispatch, even if the provider ignores the absence of tool definitions.
+    denial_args = args[:-2] + ['--no-session']
+    denied = subprocess.run(denial_args, input=b'{"type":"prompt","message":"rpc disabled write"}\n',
+                            capture_output=True, env=environment, timeout=10)
+    assert denied.returncode == 0 and not denied.stderr, (denied, server.failures)
+    events = [json.loads(line) for line in denied.stdout.split(b'\n') if line]
+    assert events[-1] == {'type': 'agent_settled', 'aborted': False}, events
+    assert any(e.get('event') == {'text_delta': 'rpc denied write'} for e in events), events
+    assert not (root / 'rpc-forbidden.txt').exists()
 
 
 def main():

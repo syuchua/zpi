@@ -32,9 +32,15 @@ pub const builtin_commands = [_]BuiltinCommandDesc{
     .{ .name = "/thinking", .description = "Set thinking level" },
     .{ .name = "/compact", .description = "Compact conversation context" },
     .{ .name = "/jobs", .description = "List background tasks" },
+    .{ .name = "/details", .description = "View full tool output" },
     .{ .name = "/exit", .description = "Exit zpi" },
     .{ .name = "/quit", .description = "Quit zpi" },
 };
+
+pub fn isBuiltin(name: []const u8) bool {
+    for (builtin_commands) |command| if (std.mem.eql(u8, command.name, name)) return true;
+    return false;
+}
 
 pub const Popup = struct {
     allocator: std.mem.Allocator,

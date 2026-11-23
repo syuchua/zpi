@@ -261,6 +261,30 @@ pub fn writeSafeText(io: std.Io, file: std.Io.File, text: []const u8) !void {
     try file.writeStreamingAll(io, text[start..]);
 }
 
+/// Keep line breaks and tabs, replacing malformed UTF-8 and control codes.
+/// Use for complete untrusted output before storing it or passing it to a renderer.
+pub fn safeUtf8Alloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var index: usize = 0;
+    while (index < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+        const bytes = text[index..@min(index + len, text.len)];
+        const cp = std.unicode.utf8Decode(bytes) catch {
+            try out.appendSlice(allocator, "�");
+            index += 1;
+            continue;
+        };
+        index += bytes.len;
+        if ((cp < 0x20 and cp != '\n' and cp != '\t') or (cp >= 0x7f and cp <= 0x9f)) {
+            try out.append(allocator, '?');
+        } else {
+            try out.appendSlice(allocator, bytes);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn appendSanitizedText(out: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) !void {
     var start: usize = 0;
     for (text, 0..) |byte, i| {

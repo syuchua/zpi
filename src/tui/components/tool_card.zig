@@ -14,7 +14,7 @@ pub fn formatStartWithArgAlloc(
     arg_summary: []const u8,
     cols_raw: usize,
 ) ![]u8 {
-    const max_cols = @max(cols_raw, 20) -| 1;
+    const max_cols = @max(cols_raw, 4) -| 1;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -49,7 +49,7 @@ pub fn formatStartWithArgAlloc(
     try out.append(allocator, ' ');
 
     const used = 3 + 7 + terminal.visibleWidth(safe_name.items) + 1 + arg_w + 1;
-    const fill = @min(max_cols -| used, 32);
+    const fill = max_cols -| used;
     if (fill > 0) {
         try th.appendOpen(&out, allocator, theme.Theme.border);
         for (0..fill) |_| try out.appendSlice(allocator, "─");

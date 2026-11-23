@@ -1045,6 +1045,37 @@ pub const Harness = struct {
         return ctx.allocator.dupe(u8, text.items);
     }
 
+    /// Run a user-requested shell command through Zpi's bounded shell tool.
+    /// The result is borrowed from the supplied allocator for the caller's turn.
+    pub fn executeUserShell(self: *Harness, allocator: std.mem.Allocator, command: []const u8, cancel: ?zpi.model.Cancel) !agent.ToolResult {
+        if (command.len == 0 or command.len > 16 * 1024) return error.InvalidCommand;
+        const tool = for (self.tool_set.tools) |candidate| {
+            if (std.mem.eql(u8, candidate.definition.name, "bash")) break candidate;
+        } else return error.ShellUnavailable;
+        var arguments: std.json.ObjectMap = .empty;
+        defer arguments.deinit(allocator);
+        try arguments.put(allocator, "command", .{ .string = command });
+        return tool.execute(tool.context, .{
+            .allocator = allocator,
+            .io = self.io,
+            .cwd = self.cwd,
+            .cancel = cancel,
+        }, .{ .object = arguments });
+    }
+
+    /// The interactive editor records local output between turns. Both stores
+    /// clone the supplied text before the shell command's arena is released.
+    pub fn recordUserShellResult(self: *Harness, text: []const u8) !void {
+        if (self.runtime.running) return error.AgentBusy;
+        if (self.runtime.commit_failed) return error.SessionCommitFailed;
+        const message: zpi.model.Message = .{ .role = .user, .content = &.{.{ .text = text }} };
+        try self.runtime.append(message);
+        _ = self.store.appendMessage(message) catch |err| {
+            self.runtime.commit_failed = true;
+            return err;
+        };
+    }
+
     pub fn submit(self: *Harness, prompt: []const u8) !SubmitResult {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();

@@ -41,6 +41,10 @@ pub const max_prompt_bytes: usize = 64 * 1024;
 const max_history_entries: usize = 200;
 const max_queued_followups: usize = 32;
 
+fn isBangMode(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, "!");
+}
+
 pub const LiveWriter = struct {
     context: *anyopaque,
     write_segment: *const fn (*anyopaque, []const u8, []const u8, []const u8) anyerror!void,
@@ -108,6 +112,8 @@ pub const BgNotification = struct {
     trigger: bool,
 };
 
+pub const ToolDetailItem = struct { name: []const u8, text: []const u8 };
+
 pub const StartupInfo = struct {
     version: []const u8 = "",
     skills: []const []const u8 = &.{},
@@ -142,6 +148,9 @@ pub const Submit = struct {
     session_source: ?*const fn (*anyopaque) anyerror!?SessionSource = null,
     status_info: ?*const fn (*anyopaque) components.chrome.FooterInfo = null,
     toggle_expand: ?*const fn (*anyopaque) bool = null,
+    tool_details: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![]ToolDetailItem = null,
+    run_user_shell: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, ?agent.model.Cancel) anyerror!agent.ToolResult = null,
+    record_user_shell: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     push_steering: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     drain_steering: ?*const fn (*anyopaque, std.mem.Allocator) anyerror![][]u8 = null,
     bg_wake: ?agent.model.Cancel = null,
@@ -266,6 +275,117 @@ fn renderStartupBanner(io: std.Io, output: std.Io.File, submit: Submit, th: them
     return lines;
 }
 
+fn runLocalShell(io: std.Io, input_fd: std.posix.fd_t, queue: *InputQueue, submit: Submit, allocator: std.mem.Allocator, command: []const u8) !agent.ToolResult {
+    const original = try enterRawMode(input_fd);
+    defer terminal.setTermiosNow(input_fd, original) catch {};
+    var done = try agent.model.Interrupt.init();
+    defer done.deinit(io);
+    const Worker = struct {
+        submit: Submit,
+        allocator: std.mem.Allocator,
+        command: []const u8,
+        done: *agent.model.Interrupt,
+        result: anyerror!agent.ToolResult = error.Canceled,
+
+        fn run(self: *@This()) void {
+            self.result = self.submit.run_user_shell.?(self.submit.context, self.allocator, self.command, self.submit.cancel);
+            self.done.trigger();
+        }
+    };
+    var worker: Worker = .{ .submit = submit, .allocator = allocator, .command = command, .done = &done };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    errdefer {
+        if (submit.trigger_cancel) |trigger| trigger(submit.context);
+        thread.join();
+    }
+    const wake = done.cancel();
+    while (!done.isCanceled()) {
+        const key = try queue.readByteWithWake(input_fd, wake, 100);
+        if (done.isCanceled()) break;
+        if (queue.eof or key == 0x03 or key == 0x1b) {
+            if (submit.trigger_cancel) |trigger| trigger(submit.context);
+        }
+    }
+    thread.join();
+    return worker.result;
+}
+
+fn showToolDetails(io: std.Io, input_fd: std.posix.fd_t, output: std.Io.File, queue: *InputQueue, submit: Submit, th: theme.Theme, items: []const ToolDetailItem) !void {
+    if (items.len == 0) return output.writeStreamingAll(io, "No tool output in this conversation.\n");
+    const original = try enterRawMode(input_fd);
+    defer terminal.setTermiosNow(input_fd, original) catch {};
+    var viewport = renderer.MainScreenRenderer.init(submit.allocator, th.mode != .none);
+    defer viewport.deinit();
+    defer viewport.clearViewport(io, output) catch {};
+    var scratch = std.heap.ArenaAllocator.init(submit.allocator);
+    defer scratch.deinit();
+    var wrapped: std.ArrayList([]const u8) = .empty;
+    var width: usize = 0;
+    var offset: usize = 0;
+    while (true) {
+        const size = terminalSize(output);
+        const cols = @max(@as(usize, size.col), 4);
+        if (cols != width) {
+            width = cols;
+            _ = scratch.reset(.retain_capacity);
+            wrapped = .empty;
+            const alloc = scratch.allocator();
+            for (items) |item| {
+                var title: std.ArrayList(u8) = .empty;
+                _ = try terminal.appendClippedText(&title, alloc, item.name, cols -| 5);
+                try wrapped.append(alloc, title.items);
+                const safe = try terminal.safeUtf8Alloc(alloc, item.text);
+                const body = try terminal.wrapAnsiAlloc(alloc, safe, cols -| 5);
+                var rows = std.mem.splitScalar(u8, body, '\n');
+                while (rows.next()) |row| try wrapped.append(alloc, row);
+            }
+        }
+        const page_size = @max(@as(usize, size.row) -| 3, 1);
+        const max_offset = wrapped.items.len -| page_size;
+        offset = @min(offset, max_offset);
+        const end = @min(offset + page_size, wrapped.items.len);
+        const alloc = submit.allocator;
+        var frame_arena = std.heap.ArenaAllocator.init(alloc);
+        defer frame_arena.deinit();
+        const frame_alloc = frame_arena.allocator();
+        var page_lines: std.ArrayList([]const u8) = .empty;
+        try page_lines.appendSlice(frame_alloc, wrapped.items[offset..end]);
+        const title = try frame_alloc.print("Tool output {d}-{d}/{d}", .{ offset + 1, end, wrapped.items.len });
+        const lines = try components.dialog.renderLinesAlloc(frame_alloc, th, .{
+            .title = title,
+            .lines = page_lines.items,
+            .hint = "Arrows / PgUp / PgDn · Esc close",
+        }, cols);
+        const last = lines.len - 1;
+        try viewport.renderViewport(io, output, lines, .{ .row = last, .col = terminal.visibleWidth(lines[last]) }, cols);
+        const key = try queue.readByteTimeout(input_fd, submit.cancel, 100) orelse {
+            if (queue.eof) return;
+            continue;
+        };
+        switch (key) {
+            'q', 0x03, '\r', '\n' => return,
+            'j' => offset +|= 1,
+            'k' => offset -|= 1,
+            0x1b => {
+                const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse return;
+                if (next != '[' and next != 'O') continue;
+                const code = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse continue;
+                switch (code) {
+                    'A' => offset -|= 1,
+                    'B' => offset +|= 1,
+                    'H' => offset = 0,
+                    'F' => offset = max_offset,
+                    '5', '6' => if ((try queue.readByteTimeout(input_fd, submit.cancel, 25)) == '~') {
+                        if (code == '5') offset -|= page_size else offset +|= page_size;
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+}
+
 pub fn run(io: std.Io, submit: Submit) !void {
     const input = std.Io.File.stdin();
     const output = std.Io.File.stdout();
@@ -315,7 +435,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
         const raw = if (followups.items.len > 0) blk: {
             pending_dialog = null;
             const next = followups.orderedRemove(0);
-            const echo = try components.message.formatUserEchoAlloc(submit.allocator, th, next);
+            const echo = try components.message.formatUserEchoAlloc(submit.allocator, th, next, terminalColumns(output));
             defer submit.allocator.free(echo);
             try output.writeStreamingAll(io, echo);
             try output.writeStreamingAll(io, "\n");
@@ -352,9 +472,69 @@ pub fn run(io: std.Io, submit: Submit) !void {
 
         const text = std.mem.trim(u8, raw, " \t\r\n");
         if (text.len == 0) continue;
+        // Bare `!` enters a visibly distinct shell-editing state; execution is
+        // only triggered after the user enters a non-empty command.
+        if (!is_bg_wakeup and (std.mem.eql(u8, text, "!") or std.mem.eql(u8, text, "!!"))) {
+            if (carried_draft) |old| submit.allocator.free(old);
+            carried_draft = try submit.allocator.dupe(u8, text);
+            continue;
+        }
         if (!is_bg_wakeup) {
             try history.push(text);
             if (std.mem.eql(u8, text, "/exit") or std.mem.eql(u8, text, "/quit")) return;
+        }
+        if (std.mem.eql(u8, text, "/details")) {
+            if (submit.tool_details) |get| {
+                var scratch = std.heap.ArenaAllocator.init(submit.allocator);
+                defer scratch.deinit();
+                const items = try get(submit.context, scratch.allocator());
+                if (color) try eraseSubmittedPromptLine(io, output);
+                showToolDetails(io, input.handle, output, &queue, submit, th, items) catch |err| switch (err) {
+                    error.Canceled => {},
+                    else => return err,
+                };
+            } else try output.writeStreamingAll(io, "Tool details are unavailable.\n");
+            continue;
+        }
+        if (!is_bg_wakeup and isBangMode(text) and submit.run_user_shell != null) {
+            const excluded = std.mem.startsWith(u8, text, "!!");
+            const prefix_len: usize = if (excluded) 2 else 1;
+            const command = std.mem.trim(u8, text[prefix_len..], " \t");
+            if (command.len == 0) {
+                try output.writeStreamingAll(io, "Usage: !<command> runs with context; !!<command> runs without context.\n");
+                continue;
+            }
+            var shell_prompt: std.ArrayList(u8) = .empty;
+            defer shell_prompt.deinit(submit.allocator);
+            try shell_prompt.appendSlice(submit.allocator, if (excluded) "!! " else "! ");
+            try shell_prompt.appendSlice(submit.allocator, command);
+            const panel = try components.message.formatUserEchoAlloc(submit.allocator, th, shell_prompt.items, terminalColumns(output));
+            defer submit.allocator.free(panel);
+            try output.writeStreamingAll(io, panel);
+            try output.writeStreamingAll(io, "\n");
+            var scratch = std.heap.ArenaAllocator.init(submit.allocator);
+            defer scratch.deinit();
+            const result = runLocalShell(io, input.handle, &queue, submit, scratch.allocator(), command) catch |err| {
+                var error_buf: [160]u8 = undefined;
+                const line = std.fmt.bufPrint(&error_buf, "Shell command failed: {s}\n", .{@errorName(err)}) catch "Shell command failed.\n";
+                try std.Io.File.stderr().writeStreamingAll(io, line);
+                continue;
+            };
+            const safe_output = try terminal.safeUtf8Alloc(scratch.allocator(), result.text);
+            const preview = try components.tool_card.formatBodyBlockAlloc(submit.allocator, th, safe_output, 8);
+            defer submit.allocator.free(preview.text);
+            try output.writeStreamingAll(io, preview.text);
+            if (preview.truncated) try output.writeStreamingAll(io, "│ ... (local preview truncated)\n");
+            try output.writeStreamingAll(io, if (result.is_error) "[command failed]\n" else "[command complete]\n");
+            if (excluded) {
+                try output.writeStreamingAll(io, "[command output excluded from agent context]\n");
+                continue;
+            }
+            const context_text = try submit.allocator.print("User ran shell command: {s}\nExit outcome and output:\n{s}", .{ command, safe_output });
+            defer submit.allocator.free(context_text);
+            if (submit.record_user_shell) |record| try record(submit.context, context_text);
+            try output.writeStreamingAll(io, "[output added to conversation context]\n");
+            continue;
         }
         if (std.mem.eql(u8, text, "/help")) {
             if (color) {
@@ -900,12 +1080,12 @@ const EditorState = struct {
 
     fn renderWithFooter(self: *EditorState, io: std.Io, output: std.Io.File, cols: usize, color: bool, footer_line: ?[]const u8) !void {
         const lines: []const []const u8 = if (footer_line) |fl| &.{fl} else &.{};
-        return self.renderWithOverlay(io, output, cols, color, theme.Theme.init(if (color) .ansi16 else .none), &.{}, &.{}, lines, false);
+        return self.renderWithOverlay(io, output, cols, color, theme.Theme.init(if (color) .ansi16 else .none), &.{}, &.{}, lines, false, false);
     }
 
-    fn appendRuleLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, th: theme.Theme, cols: usize) !usize {
+    fn appendRuleLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, th: theme.Theme, cols: usize, editing_bang: bool) !usize {
         const rule_w = @max(@as(usize, 4), cols -| 1);
-        try th.appendOpen(out, allocator, theme.Theme.border);
+        try th.appendOpen(out, allocator, if (editing_bang) theme.Theme.tool_ok else theme.Theme.border);
         var i: usize = 0;
         while (i < rule_w) : (i += 1) try out.appendSlice(allocator, "─");
         try th.appendClose(out, allocator);
@@ -936,6 +1116,7 @@ const EditorState = struct {
         popup_lines: []const []const u8,
         footer_lines: []const []const u8,
         show_rules: bool,
+        shell_mode: bool,
     ) !void {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(self.allocator);
@@ -952,12 +1133,16 @@ const EditorState = struct {
         var rows_above = dialog_lines.len;
 
         if (show_rules) {
-            _ = try appendRuleLine(&out, self.allocator, th, cols);
+            _ = try appendRuleLine(&out, self.allocator, th, cols, shell_mode);
             try out.appendSlice(self.allocator, "\r\n");
             rows_above += 1;
         }
 
-        try out.appendSlice(self.allocator, if (use_sgr) "\x1b[36m>\x1b[0m " else "> ");
+        if (shell_mode) {
+            try th.paint(&out, self.allocator, theme.Theme.tool_ok, "! ");
+        } else {
+            try out.appendSlice(self.allocator, if (use_sgr) "\x1b[36m>\x1b[0m " else "> ");
+        }
 
         // Compute visual coordinates (prompt width = 2 on line 0) across newlines and soft wraps.
         const layout = computeLayout(self.buf.items, self.cursor, cols, 2);
@@ -967,7 +1152,7 @@ const EditorState = struct {
         var total_end_col = layout.end_col;
         if (show_rules) {
             try out.appendSlice(self.allocator, "\r\n");
-            const rule_w = try appendRuleLine(&out, self.allocator, th, cols);
+            const rule_w = try appendRuleLine(&out, self.allocator, th, cols, shell_mode);
             total_end_row += 1;
             total_end_col = rule_w;
         }
@@ -1280,7 +1465,7 @@ fn readPromptLine(
             defer allocator.free(dialog_slices);
             for (dialog_lines, dialog_slices) |dl, *s| s.* = dl;
 
-            try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, popup_slices, footer_slices, th.mode != .none);
+            try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, popup_slices, footer_slices, th.mode != .none, isBangMode(editor.buf.items));
             dialog_on_screen = dialog_slices.len > 0;
             dirty = false;
         }
@@ -1299,7 +1484,7 @@ fn readPromptLine(
             popup.clear();
             if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                 editor.resetCompletionTrack();
-                editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false) catch {};
+                editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false, isBangMode(editor.buf.items)) catch {};
                 dialog_on_screen = false;
             }
             if (editor.buf.items.len == 0) {
@@ -1326,7 +1511,7 @@ fn readPromptLine(
                 popup.clear();
                 if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                     editor.resetCompletionTrack();
-                    editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false) catch {};
+                    editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false, false) catch {};
                     dialog_on_screen = false;
                 }
                 return error.Canceled;
@@ -1336,7 +1521,7 @@ fn readPromptLine(
                     popup.clear();
                     if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
                         editor.resetCompletionTrack();
-                        editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false) catch {};
+                        editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false, isBangMode(editor.buf.items)) catch {};
                         dialog_on_screen = false;
                     }
                     try output.writeStreamingAll(io, "\n");
@@ -1354,9 +1539,17 @@ fn readPromptLine(
                 if (th.mode != .none and dirty) {
                     try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
                 }
-                if (popup.isOpen() and popup.user_navigated) {
-                    if (popup.selectedItem()) |cand| {
-                        try applyAutocomplete(&editor, &popup, io, submit, cand);
+                if (popup.isOpen() and popup.kind == .command and editor.cursor == editor.buf.items.len) {
+                    if (popup.selectedItem()) |candidate| {
+                        const execute = components.autocomplete.isBuiltin(candidate.label) or std.mem.eql(u8, candidate.label, editor.buf.items);
+                        try applyAutocomplete(&editor, &popup, io, submit, candidate);
+                        dirty = true;
+                        if (!execute) continue;
+                    }
+                }
+                if (popup.isOpen() and popup.user_navigated and popup.kind == .path) {
+                    if (popup.selectedItem()) |candidate| {
+                        try applyAutocomplete(&editor, &popup, io, submit, candidate);
                         dirty = true;
                         continue;
                     }
@@ -1368,12 +1561,21 @@ fn readPromptLine(
                     dirty = true;
                     continue;
                 }
+                const submitted = std.mem.trim(u8, editor.buf.items, " \t\r\n");
+                if (use_sgr and submitted.len > 0 and submitted[0] != '/' and !isBangMode(submitted)) {
+                    try editor.clearAll(io, output, th);
+                    const echo = try components.message.formatUserEchoAlloc(allocator, th, submitted, terminalColumns(output));
+                    defer allocator.free(echo);
+                    try output.writeStreamingAll(io, echo);
+                    try output.writeStreamingAll(io, "\n");
+                    return .{ .text = try editor.buf.toOwnedSlice(allocator) };
+                }
                 const had_hint = editor.completion_hint != null or popup.isOpen();
                 popup.clear();
                 editor.resetCompletionTrack();
                 if (dirty or had_hint or has_footer or th.mode != .none) {
                     cols = terminalColumns(output);
-                    try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false);
+                    try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false, isBangMode(editor.buf.items));
                 }
                 try output.writeStreamingAll(io, "\n");
                 return .{ .text = try editor.buf.toOwnedSlice(allocator) };
@@ -2343,6 +2545,8 @@ fn runTurnWithLiveEditor(
                         try editor.replaceBuffer("");
                         editor.history_idx = null;
                         dirty = true;
+                    } else if (submit.trigger_cancel) |trigger| {
+                        trigger(submit.context);
                     }
                     continue;
                 };

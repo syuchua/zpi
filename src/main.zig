@@ -244,6 +244,9 @@ fn run(init: std.process.Init) !void {
                 .session_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.sessionSourceErased,
                 .status_info = CliAdapter.statusInfoErased,
                 .toggle_expand = CliAdapter.toggleExpandErased,
+                .tool_details = CliAdapter.toolDetailsErased,
+                .run_user_shell = CliAdapter.runUserShellErased,
+                .record_user_shell = CliAdapter.recordUserShellResultErased,
                 .push_steering = CliAdapter.pushSteeringErased,
                 .drain_steering = CliAdapter.drainSteeringErased,
                 .bg_wake = h.bgWakeCancel(),
@@ -475,6 +478,69 @@ const CliAdapter = struct {
     fn submitErased(context: *anyopaque, prompt: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         return self.submit(prompt);
+    }
+
+    fn runUserShellErased(context: *anyopaque, allocator: std.mem.Allocator, command: []const u8, cancel: ?zpi.model.Cancel) anyerror!zpi.agent.ToolResult {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        return self.harness.?.executeUserShell(allocator, command, cancel);
+    }
+
+    fn recordUserShellResultErased(context: *anyopaque, text: []const u8) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        return self.harness.?.recordUserShellResult(text);
+    }
+
+    fn toolDetailsErased(context: *anyopaque, allocator: std.mem.Allocator) anyerror![]tui.ToolDetailItem {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness orelse return try allocator.alloc(tui.ToolDetailItem, 0);
+        var items: std.ArrayList(tui.ToolDetailItem) = .empty;
+        errdefer {
+            for (items.items) |item| {
+                allocator.free(item.name);
+                allocator.free(item.text);
+            }
+            items.deinit(allocator);
+        }
+        for (h.runtime.messages.items) |message| switch (message.role) {
+            .assistant => for (message.content) |part| switch (part) {
+                .tool_call => |call| {
+                    const label = try std.fmt.allocPrint(allocator, "tool {s}: {s}", .{ call.name, call.id });
+                    errdefer allocator.free(label);
+                    const arguments = try std.json.Stringify.valueAlloc(allocator, call.arguments, .{});
+                    defer allocator.free(arguments);
+                    const bounded = if (arguments.len > 16 * 1024) arguments[0..16*1024] else arguments;
+                    try items.append(allocator, .{ .name = label, .text = try allocator.dupe(u8, bounded) });
+                },
+                else => {},
+            },
+            .tool_result => {
+                const label = try allocator.print("{s} ({s})", .{ message.tool_name orelse "tool", message.tool_call_id orelse "result" });
+                errdefer allocator.free(label);
+                var body: std.ArrayList(u8) = .empty;
+                errdefer body.deinit(allocator);
+                for (message.content, 0..) |part, index| switch (part) {
+                    .text => |text| {
+                        if (index > 0) try body.append(allocator, '\n');
+                        try body.appendSlice(allocator, text);
+                    },
+                    else => {},
+                };
+                if (message.details) |details| {
+                    if (details == .object) {
+                        if (details.object.get("diff")) |diff| {
+                            if (diff == .string and diff.string.len > 0) {
+                                try body.append(allocator, '\n');
+                                try body.appendSlice(allocator, diff.string);
+                            }
+                        }
+                    }
+                }
+                if (body.items.len > 64 * 1024) body.items.len = 64 * 1024;
+                try items.append(allocator, .{ .name = label, .text = try body.toOwnedSlice(allocator) });
+            },
+            else => {},
+        };
+        return try items.toOwnedSlice(allocator);
     }
 
     fn modelSourceErased(context: *anyopaque) anyerror!?tui.ModelSource {
@@ -805,7 +871,7 @@ const CliAdapter = struct {
                     for (entry.message.content) |part| switch (part) {
                         .text => |txt| {
                             if (comptime build_options.enable_tui) {
-                                const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt);
+                                const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt, cols);
                                 defer self.allocator.free(echo);
                                 try stdout.writeStreamingAll(self.io, echo);
                                 try stdout.writeStreamingAll(self.io, "\n\n");
@@ -961,7 +1027,7 @@ const CliAdapter = struct {
                         } else if (comptime build_options.enable_tui) {
                             for (message.content) |part| switch (part) {
                                 .text => |txt| {
-                                    const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt);
+                                    const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt, tui.terminal.terminalColumns(.stdout()));
                                     defer self.allocator.free(echo);
                                     try self.outSegment("\n", "", "");
                                     try self.outSegment(echo, "", "\n");
@@ -1090,7 +1156,7 @@ const CliAdapter = struct {
                         try self.json(.{ .type = "tool_execution_update", .id = update.call.id, .name = update.call.name, .result = update.result });
                     } else if (self.mode == .interactive) {
                         if (comptime build_options.enable_tui) {
-                            const max_lines: usize = if (self.isExpanded()) 64 else 8;
+                            const max_lines: usize = if (self.isExpanded()) 20 else 1;
                             if (self.live_tool_lines < max_lines) {
                                 const block = try tui.components.tool_card.formatBodyBlockAlloc(
                                     self.allocator,
@@ -1103,13 +1169,13 @@ const CliAdapter = struct {
                                 self.live_tool_lines += block.lines_written;
                                 if (block.truncated and !self.live_tool_truncated) {
                                     self.live_tool_truncated = true;
-                                    const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (Ctrl+O to expand)");
+                                    const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (/details for full output; Ctrl+O shows 20 lines)");
                                     defer self.allocator.free(note);
                                     try self.errSegment(note, "", "");
                                 }
                             } else if (!self.live_tool_truncated) {
                                 self.live_tool_truncated = true;
-                                const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (Ctrl+O to expand)");
+                                const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (/details for full output; Ctrl+O shows 20 lines)");
                                 defer self.allocator.free(note);
                                 try self.errSegment(note, "", "");
                             }
@@ -1228,13 +1294,13 @@ const CliAdapter = struct {
     }
 
     fn writeDiffPreview(self: *CliAdapter, diff: []const u8) !void {
-        const limit: usize = if (comptime build_options.enable_tui) (if (self.isExpanded()) 80 else 12) else 40;
+        const limit: usize = if (comptime build_options.enable_tui) (if (self.isExpanded()) 20 else 1) else 40;
         var lines = std.mem.splitScalar(u8, diff, '\n');
         var count: usize = 0;
         while (lines.next()) |line| {
             if (count >= limit) {
                 if (comptime build_options.enable_tui) {
-                    const msg = if (self.isExpanded()) "... (preview truncated)" else "... (preview truncated, Ctrl+O to expand)";
+                    const msg = if (self.isExpanded()) "... (preview truncated; /details for full output)" else "... (/details for full output; Ctrl+O shows 20 lines)";
                     const trunc = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, msg);
                     defer self.allocator.free(trunc);
                     try self.errSegment(trunc, "", "");

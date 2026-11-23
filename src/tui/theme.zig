@@ -20,6 +20,7 @@ pub const ColorSpec = struct {
     dim: bool = false,
     italic: bool = false,
     reverse: bool = false,
+    background: bool = false,
 };
 
 pub const Theme = struct {
@@ -29,6 +30,7 @@ pub const Theme = struct {
     pub const muted = ColorSpec{ .ansi16_fg = 90, .ansi256 = 245, .rgb = .{ .r = 148, .g = 154, .b = 166 }, .dim = true };
     pub const border = ColorSpec{ .ansi16_fg = 90, .ansi256 = 240, .rgb = .{ .r = 88, .g = 96, .b = 110 }, .dim = true };
     pub const user_badge = ColorSpec{ .ansi16_fg = 36, .ansi256 = 117, .rgb = .{ .r = 132, .g = 204, .b = 248 }, .bold = true };
+    pub const user_panel = ColorSpec{ .ansi16_fg = 39, .ansi16_bg = 44, .ansi256 = 24, .rgb = .{ .r = 25, .g = 43, .b = 61 }, .background = true };
     pub const thinking = ColorSpec{ .ansi16_fg = 90, .ansi256 = 246, .rgb = .{ .r = 156, .g = 163, .b = 175 }, .dim = true, .italic = true };
     pub const tool_header = ColorSpec{ .ansi16_fg = 33, .ansi256 = 180, .rgb = .{ .r = 229, .g = 192, .b = 123 }, .bold = true };
     pub const warn = ColorSpec{ .ansi16_fg = 33, .ansi256 = 214, .rgb = .{ .r = 229, .g = 192, .b = 123 } };
@@ -103,6 +105,16 @@ pub const Theme = struct {
                 .ansi16 => try out.print(a, "{d}", .{spec.ansi16_fg}),
                 .ansi256 => try out.print(a, "38;5;{d}", .{spec.ansi256}),
                 .truecolor => try out.print(a, "38;2;{d};{d};{d}", .{ spec.rgb.r, spec.rgb.g, spec.rgb.b }),
+            }
+            first = false;
+        }
+        if (spec.background) {
+            if (!first) try out.append(a, ';');
+            switch (self.mode) {
+                .none => unreachable,
+                .ansi16 => try out.print(a, "{d}", .{if (spec.ansi16_bg < 10) spec.ansi16_bg + 40 else spec.ansi16_bg}),
+                .ansi256 => try out.print(a, "48;5;{d}", .{spec.ansi256}),
+                .truecolor => try out.print(a, "48;2;{d};{d};{d}", .{ spec.rgb.r, spec.rgb.g, spec.rgb.b }),
             }
         }
         try out.append(a, 'm');
