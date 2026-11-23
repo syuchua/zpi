@@ -44,7 +44,7 @@ Useful options include `--continue`, `--session PATH`, `--no-session`, `--tools`
 
 Interactive commands include `/help`, `/hotkeys`, `/model`, `/thinking`, `/resume`, `/tree`, `/compact`, `/session`, `/jobs`, and `/exit`. The editor supports `Shift+Tab` to cycle thinking levels, `Ctrl+O` to toggle compact output, `Ctrl+S` to steer an active turn, and queued follow-up prompts.
 
-Experimental `--mode rpc` accepts newline-delimited JSON commands on stdin and writes responses and events to stdout. It supports `prompt`, `get_state`, and `abort`. Commands accept an optional string `id`, and each accepted prompt emits `agent_settled` after completion or failure. Events currently use Zpi's JSON event shapes. Pi RPC commands, message formats, and event compatibility remain partial. RPC also works with `-Dtui=none`.
+Experimental `--mode rpc` supports `prompt`, `get_state`, and `abort` over Zpi's own JSONL protocol. Commands accept an optional string `id`, and each started turn emits `agent_settled` on completion, failure, or cancellation. RPC works with `-Dtui=none`. See the [Zpi JSONL RPC v1 contract](docs/spec/zpi-rpc-v1.md) for message shapes, ordering, and the independent client fixture.
 
 ## Native Subagents
 
@@ -82,7 +82,7 @@ Priorities are subject to change; this is a project direction, not a release pro
 - [Compatibility matrix](docs/spec/compatibility-matrix.md)
 - [Performance baseline and comparison method](docs/spec/performance-baseline.md)
 - [Platform verification](docs/spec/platform-verification.md)
-- [Security notes](docs/security.md)
+- [Security notes](docs/security.md) and [execution policy boundaries](docs/spec/security-boundaries.md)
 - [Install, upgrade and remove](docs/install.md)
 - [v0.1.0 release notes](docs/releases/v0.1.0.md)
 - [Native plugin ABI](docs/spec/native-plugin-abi.md) and [runtime](docs/spec/native-plugin-runtime.md)

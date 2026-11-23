@@ -128,6 +128,7 @@ jobs:
           if [ "$RUNNER_OS" = macOS ]; then extension=dylib; else extension=so; fi
           export ZPI_TEST_NATIVE_PLUGINS="$PWD/zig-out/lib/libzpi-native-c-fixture.$extension:$PWD/zig-out/lib/libzpi-native-zig-fixture.$extension"
           python3 scripts/test-cli.py
+          python3 scripts/test-rpc.py "$(pwd)/zig-out/bin/zpi"
           python3 scripts/test-ts-host.py "$ZPI_PI_SDK"
           python3 scripts/test-context-budget.py
 
