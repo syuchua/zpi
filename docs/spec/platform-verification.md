@@ -347,6 +347,18 @@ Exact SHA-256 hashes recorded at the start of the passing verification run:
 | `src/tui/components/select_list.zig` | `adbcb1d4476c3cf2c2a0256e3d0ce289fb5c4baef745960bcd22e9101a6023df` |
 | `src/tui/components/tool_card.zig` | `725940b3ca3491eff848f0df5b36f281b1ce1ccd8146744d293a9ade1cd19792` |
 
+#### ReleaseSafe terminal regression
+
+[GitHub Actions run 45045859950](https://github.com/syuchua/zpi/actions/runs/45045859950) on `cac7206` reported an illegal instruction in Linux x64 raw-mode setup and a timeout waiting for `/tree` to redraw on macOS arm64. The fix pairs Zig 0.17's Linux kernel `termios` layout with the Linux terminal syscalls, queries terminal size with `ioctl`, and waits for raw-mode readiness before sending `/help` in the startup PTY fixture.
+
+| Local verification | Result | SHA-256 |
+| --- | --- | --- |
+| Native macOS arm64 ReleaseSafe archive (`b0ac43a82`) | Build, archive checksum, and unpacked CLI integration passed, including `/tree` resize and terminal restoration | archive `2ee09430f351d2f1f2da290fa7823e6bce3fed1bf2869064a91f0f39dc957328` |
+| macOS arm64 cross-build to `x86_64-linux-gnu.2.39` ReleaseSafe, executed under translation in Colima's arm64 VM with an Ubuntu 24.04 amd64 container (`be138222a`) | Build and CLI integration passed with glibc 2.39 and both search dependencies installed | executable `b7c35a52de6d210296192ab1623c203debf954fea9b8ffa24f1cdb472ca11da6` |
+| Native macOS arm64 Debug and headless (`bd10d3633`) | Zig tests, `-Dtui=none` build and tests, and headless `--version` passed | |
+
+The two ReleaseSafe CLI runs skipped SDK and native-plugin CLI fixtures. The CLI test script used in both runs had SHA-256 `404b5b052955d415c3e148574e550000f6cc72ac6ca7e253a2b96e060746b12c`. GitHub-hosted verification of the fix is pending.
+
 ## Further acceptance
 
 - Extend the same build-installed test executables as real core behavior lands; preserve failures and distinguish compilation from execution.

@@ -207,7 +207,7 @@ fn writeStartupSection(
 
 fn renderStartupBanner(io: std.Io, output: std.Io.File, submit: Submit, th: theme.Theme) !usize {
     const a = submit.allocator;
-    const sz = terminalSize(io, output);
+    const sz = terminalSize(output);
     const max_cols = @max(@as(usize, 24), @as(usize, sz.col) -| 1);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
@@ -279,7 +279,7 @@ pub fn run(io: std.Io, submit: Submit) !void {
     }
     const had_initial_history = if (submit.render_initial_history) |render_init| try render_init(submit.context) else false;
     if (!had_initial_history and !submit.quiet_startup and th.mode != .none) {
-        const sz = terminalSize(io, output);
+        const sz = terminalSize(output);
         const editor_chrome_rows: usize = 5;
         if (sz.row > header_lines + editor_chrome_rows) {
             const pad = @min(@as(usize, sz.row) - header_lines - editor_chrome_rows, 80);
@@ -1209,7 +1209,7 @@ fn readPromptLine(
         if (token.isCanceled()) return error.Canceled;
     }
     const orig_term = try enterRawMode(input_fd);
-    defer std.posix.tcsetattr(input_fd, .NOW, orig_term) catch {};
+    defer terminal.setTermiosNow(input_fd, orig_term) catch {};
 
     try output.writeStreamingAll(io, "\x1b[?2004h");
     defer output.writeStreamingAll(io, "\x1b[?2004l") catch {};
@@ -1223,7 +1223,7 @@ fn readPromptLine(
     var dialog = initial_dialog;
     var dialog_on_screen = false;
     var in_paste = false;
-    var cols = terminalColumns(io, output);
+    var cols = terminalColumns(output);
     var dirty = has_footer or dialog != null;
     if (initial) |text| {
         if (text.len > 0) {
@@ -1234,7 +1234,7 @@ fn readPromptLine(
 
     while (true) {
         if ((dirty and !queue.hasBuffered()) or (dialog != null and !dialog_on_screen)) {
-            cols = terminalColumns(io, output);
+            cols = terminalColumns(output);
             if (th.mode != .none and !in_paste) {
                 try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
             } else {
@@ -1372,7 +1372,7 @@ fn readPromptLine(
                 popup.clear();
                 editor.resetCompletionTrack();
                 if (dirty or had_hint or has_footer or th.mode != .none) {
-                    cols = terminalColumns(io, output);
+                    cols = terminalColumns(output);
                     try editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false);
                 }
                 try output.writeStreamingAll(io, "\n");
@@ -1440,7 +1440,7 @@ fn readPromptLine(
             },
             '\t' => {
                 if (!in_paste) {
-                    cols = terminalColumns(io, output);
+                    cols = terminalColumns(output);
                     if (th.mode == .none) {
                         if (try handleTab(&editor, io, submit, cols, term_ansi, false)) dirty = true;
                     } else {
@@ -2155,7 +2155,7 @@ fn runTurnWithLiveEditor(
     th: theme.Theme,
 ) !void {
     const orig_term = try enterRawMode(input_fd);
-    defer std.posix.tcsetattr(input_fd, .NOW, orig_term) catch {};
+    defer terminal.setTermiosNow(input_fd, orig_term) catch {};
 
     try output.writeStreamingAll(io, "\x1b[?2004h");
     defer output.writeStreamingAll(io, "\x1b[?2004l") catch {};
@@ -2163,7 +2163,7 @@ fn runTurnWithLiveEditor(
     var done = try agent.model.Interrupt.init();
     defer done.deinit(io);
 
-    var cols = terminalColumns(io, output);
+    var cols = terminalColumns(output);
     var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th);
     screen.overlay_cols = cols;
     defer screen.deinit();
@@ -2206,7 +2206,7 @@ fn runTurnWithLiveEditor(
 
     while (true) {
         if (done.isCanceled()) break;
-        const current_cols = terminalColumns(io, output);
+        const current_cols = terminalColumns(output);
         if ((dirty or current_cols != cols) and !queue.hasBuffered()) {
             cols = current_cols;
             try screen.loaderTickAndRender(&editor, followups.items, submit, cols, 0);
@@ -2219,7 +2219,7 @@ fn runTurnWithLiveEditor(
             const elapsed: u64 = @intCast(@max(@as(i64, 0), now_ms - last_tick_ms));
             if (elapsed >= 120 and !queue.hasBuffered()) {
                 last_tick_ms = now_ms;
-                cols = terminalColumns(io, output);
+                cols = terminalColumns(output);
                 try screen.loaderTickAndRender(&editor, followups.items, submit, cols, elapsed);
             }
             continue;
@@ -2329,7 +2329,7 @@ fn runTurnWithLiveEditor(
             },
             '\t' => {
                 if (!in_paste) {
-                    cols = terminalColumns(io, output);
+                    cols = terminalColumns(output);
                     if (try handleTab(&editor, io, submit, cols, use_sgr, false)) dirty = true;
                 } else {
                     try editor.insertSlice("\t");

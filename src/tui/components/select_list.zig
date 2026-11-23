@@ -208,7 +208,7 @@ pub fn run(
     }
 
     const original = try terminal.enterRawMode(input_fd);
-    defer std.posix.tcsetattr(input_fd, .NOW, original) catch {};
+    defer terminal.setTermiosNow(input_fd, original) catch {};
     var renderer = renderer_mod.MainScreenRenderer.init(allocator, th.mode != .none);
     defer renderer.deinit();
     try output.writeStreamingAll(io, "\x1b[?2004h");
@@ -226,7 +226,7 @@ pub fn run(
     var filtering = options.mode == .direct_filter;
 
     while (true) {
-        const size = terminal.terminalSize(io, output);
+        const size = terminal.terminalSize(output);
         const can_confirm = if (options.confirm_prompt) |cp|
             size.row >= 2 and size.col > cp.len
         else
@@ -404,7 +404,7 @@ pub fn run(
                                 dirty = true;
                             },
                             'y', 'Y' => {
-                                const current_size = terminal.terminalSize(io, output);
+                                const current_size = terminal.terminalSize(output);
                                 if (options.confirm_prompt) |cp| {
                                     if (current_size.row >= 2 and current_size.col > cp.len) {
                                         if (list.currentItemIndex()) |idx| {

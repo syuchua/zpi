@@ -190,8 +190,34 @@ pub const InputQueue = struct {
     }
 };
 
+// Zig 0.17 exposes Linux's kernel termios layout, which is smaller than
+// libc's termios. Use the matching kernel calls on Linux.
+fn getTermios(fd: std.posix.fd_t) !std.posix.termios {
+    if (@import("builtin").os.tag != .linux) return std.posix.tcgetattr(fd);
+    const linux = std.os.linux;
+    var term = std.mem.zeroes(linux.termios);
+    while (true) switch (linux.errno(linux.tcgetattr(fd, &term))) {
+        .SUCCESS => return term,
+        .INTR => continue,
+        .NOTTY => return error.NotATerminal,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+pub fn setTermiosNow(fd: std.posix.fd_t, term: std.posix.termios) !void {
+    if (@import("builtin").os.tag != .linux) return std.posix.tcsetattr(fd, .NOW, term);
+    const linux = std.os.linux;
+    while (true) switch (linux.errno(linux.tcsetattr(fd, .NOW, &term))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .NOTTY => return error.NotATerminal,
+        .IO => return error.ProcessOrphaned,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
 pub fn enterRawMode(fd: std.posix.fd_t) !std.posix.termios {
-    const original = try std.posix.tcgetattr(fd);
+    const original = try getTermios(fd);
     var raw = original;
     raw.lflag.ICANON = false;
     raw.lflag.ECHO = false;
@@ -200,24 +226,27 @@ pub fn enterRawMode(fd: std.posix.fd_t) !std.posix.termios {
     raw.iflag.IXON = false;
     raw.cc[@backingInt(std.posix.V.MIN)] = 1;
     raw.cc[@backingInt(std.posix.V.TIME)] = 0;
-    try std.posix.tcsetattr(fd, .NOW, raw);
+    try setTermiosNow(fd, raw);
     return original;
 }
 
-pub fn terminalSize(io: std.Io, file: std.Io.File) std.posix.winsize {
-    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const rc = io.operate(.{ .device_io_control = .{
-        .file = file,
-        .code = std.posix.T.IOCGWINSZ,
-        .arg = &ws,
-    } }) catch return .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
-    if (rc.device_io_control < 0 or ws.col == 0) ws.col = 80;
-    if (rc.device_io_control < 0 or ws.row == 0) ws.row = 24;
-    return ws;
+pub fn terminalSize(file: std.Io.File) std.posix.winsize {
+    const fallback: std.posix.winsize = .{ .row = 24, .col = 80, .xpixel = 0, .ypixel = 0 };
+    var ws: std.posix.winsize = undefined;
+    // Pass the writable pointer directly to libc's variadic ioctl.
+    while (true) switch (std.c.errno(std.c.ioctl(file.handle, @bitCast(@as(u32, std.posix.T.IOCGWINSZ)), &ws))) {
+        .SUCCESS => {
+            if (ws.col == 0) ws.col = fallback.col;
+            if (ws.row == 0) ws.row = fallback.row;
+            return ws;
+        },
+        .INTR => continue,
+        else => return fallback,
+    };
 }
 
-pub fn terminalColumns(io: std.Io, file: std.Io.File) usize {
-    return terminalSize(io, file).col;
+pub fn terminalColumns(file: std.Io.File) usize {
+    return terminalSize(file).col;
 }
 
 pub fn writeSafeText(io: std.Io, file: std.Io.File, text: []const u8) !void {

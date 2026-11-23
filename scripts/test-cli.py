@@ -1053,9 +1053,10 @@ def terminal_check(common, environment, session, tool_count):
         return transcript.find(marker, start)
 
     try:
-        read_until(b'Ctrl-D exits')
+        banner = read_until(b'Ctrl-D exits')
+        ready = read_until(b'\x1b[?2004h', banner)
         os.write(master, b'/help\n')
-        read_until(b'Use --session PATH')
+        read_until(b'Use --session PATH', ready)
         os.write(master, b'/hotkeys\n')
         read_until(b'Keyboard shortcuts')
         session_mark = len(transcript)

@@ -778,7 +778,7 @@ const CliAdapter = struct {
         if (!has_visible) return false;
 
         const stdout = std.Io.File.stdout();
-        const cols = if (comptime build_options.enable_tui) tui.terminal.terminalColumns(self.io, stdout) else 80;
+        const cols = if (comptime build_options.enable_tui) tui.terminal.terminalColumns(stdout) else 80;
         const wrap_cols = @max(@as(usize, 16), cols -| 1);
         const hide_thinking = h.settings.hide_thinking_block;
         const expanded = if (comptime build_options.enable_tui) self.isExpanded() else false;
@@ -1072,7 +1072,7 @@ const CliAdapter = struct {
                             if (self.live_writer) |writer| {
                                 if (writer.set_phase) |set_phase| set_phase(writer.context, .tool, call.name);
                             }
-                            const cols = tui.terminal.terminalColumns(self.io, .stdout());
+                            const cols = tui.terminal.terminalColumns(.stdout());
                             const arg_summary = extractToolArgSummary(call);
                             const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
                             defer self.allocator.free(header);
