@@ -357,7 +357,55 @@ Exact SHA-256 hashes recorded at the start of the passing verification run:
 | macOS arm64 cross-build to `x86_64-linux-gnu.2.39` ReleaseSafe, executed under translation in Colima's arm64 VM with an Ubuntu 24.04 amd64 container (`be138222a`) | Build and CLI integration passed with glibc 2.39 and both search dependencies installed | executable `b7c35a52de6d210296192ab1623c203debf954fea9b8ffa24f1cdb472ca11da6` |
 | Native macOS arm64 Debug and headless (`bd10d3633`) | Zig tests, `-Dtui=none` build and tests, and headless `--version` passed | |
 
-The two ReleaseSafe CLI runs skipped SDK and native-plugin CLI fixtures. The CLI test script used in both runs had SHA-256 `404b5b052955d415c3e148574e550000f6cc72ac6ca7e253a2b96e060746b12c`. GitHub-hosted verification of the fix is pending.
+The two local ReleaseSafe CLI runs skipped SDK and native-plugin CLI fixtures. The CLI test script used in both runs had SHA-256 `404b5b052955d415c3e148574e550000f6cc72ac6ca7e253a2b96e060746b12c`. Subsequent GitHub-hosted archive verification is recorded below.
+
+#### v0.1.0 compatibility release assets
+
+GitHub Actions run [45154941036](https://github.com/syuchua/zpi/actions/runs/45154941036) refreshed the existing `v0.1.0` release from the default branch. All six archive jobs and `Publish GitHub release` completed successfully. The annotated tag remains fixed: `v0.1.0^{}` resolves to `8f04e55101a1e21300ea6ea8b4dc19232a6aa5bf`, while the workflow was run from `main` at the compatibility-release commit `7f7e134f156a5a664ae8c2283612c6eed09a8e57`. The release build guard confirmed that executable sources, ABI headers, build definitions, `LICENSE`, and the two shipped JavaScript resources were unchanged from the tag.
+
+The matrix used Zig 0.17.0 with baseline CPU features and the following pinned environments:
+
+| Asset platform | GitHub runner | Target and runtime verification | Build mode |
+| --- | --- | --- | --- |
+| `linux-x64-gnu` | `ubuntu-24.04` (`x86_64`) | `x86_64-linux-gnu.2.17` in manylinux2014 x86_64 (glibc 2.17) | Same-architecture build and container smoke |
+| `linux-arm64-gnu` | `ubuntu-24.04-arm` (`aarch64`) | `aarch64-linux-gnu.2.17` in manylinux2014 aarch64 (glibc 2.17) | Same-architecture build and container smoke |
+| `linux-x64-musl` | `ubuntu-24.04` (`x86_64`) | `x86_64-linux-musl` in Alpine 3.24 amd64 | Same-architecture build targeting a different libc and container smoke |
+| `linux-arm64-musl` | `ubuntu-24.04-arm` (`aarch64`) | `aarch64-linux-musl` in Alpine 3.24 arm64 | Same-architecture build targeting a different libc and container smoke |
+| `macos-x64` | `macos-15-intel` (`x86_64`) | `x86_64-macos.10.15` with `minos 10.15` checked by `vtool` | Same-architecture build and runner smoke |
+| `macos-arm64` | `macos-15` (`arm64`) | `aarch64-macos.11.0` with `minos 11.0` checked by `vtool` | Same-architecture build and runner smoke |
+
+Linux GNU uses pinned manylinux images `quay.io/pypa/manylinux2014_x86_64@sha256:8a79ff36ce155d8f242dc8013d73c5e8bbe937defb15de7d7afb342c1ab537f4` and `quay.io/pypa/manylinux2014_aarch64@sha256:382236bfd11d86894d9792a6fa5286190b8dd3d075a7032284e123c288711e4f`. Linux musl uses the pinned Alpine 3.24 index `sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a`. The GNU smoke checks glibc 2.17 and runs the installed CLI fixture; the musl smoke installs its test dependencies and runs the same fixture. The macOS jobs verify deployment metadata and run the installed CLI on macOS 15. They do not establish execution on Catalina 10.15 or Big Sur 11.0 hardware/operating systems.
+
+Independent downloads from the public release were checked with `shasum -a 256 -c` on 2026-11-23. The archive digests were:
+
+| Asset | SHA-256 |
+| --- | --- |
+| `zpi-0.1.0-linux-x64-gnu.tar.gz` | `1afec6d8e9c5ae441db9a65a3c773a851d1574785de96f3fe36f7fc7aada289c` |
+| `zpi-0.1.0-linux-arm64-gnu.tar.gz` | `0bd5f42b27e1780a6260696380532f8d1f139cd8c5b91d64e66e48d6e7cb12f0` |
+| `zpi-0.1.0-linux-x64-musl.tar.gz` | `80cbcb5d931766509d02dc8e2c181ff6b1eed7fefea2fd563e443d02645d094f` |
+| `zpi-0.1.0-linux-arm64-musl.tar.gz` | `47f23b242bec6088e53dcc71868e85e9e21c3cc8eba5ff7173b178850647f5b9` |
+| `zpi-0.1.0-macos-x64.tar.gz` | `1a5d366b9f9ea0d7285abde0a7ed4892c53c6f96fe41aca85af90fec244fe2e4` |
+| `zpi-0.1.0-macos-arm64.tar.gz` | `4fab23a1a33e63e156b9b920a4a5b585bb6274b25142d53b68e840080abdfa28` |
+
+Reproduce the public-asset check with:
+
+```sh
+assets=$(mktemp -d)
+gh release download v0.1.0 -R syuchua/zpi -D "$assets" \
+  -p 'zpi-0.1.0-*.tar.gz' -p 'zpi-0.1.0-*.tar.gz.sha256'
+(
+  set -e
+  cd "$assets"
+  for platform in linux-x64-gnu linux-arm64-gnu linux-x64-musl linux-arm64-musl macos-x64 macos-arm64; do
+    archive="zpi-0.1.0-$platform.tar.gz"
+    test "$(awk '{ print $2 }' "$archive.sha256")" = "$archive"
+    shasum -a 256 -c "$archive.sha256"
+  done
+)
+git ls-remote https://github.com/syuchua/zpi.git 'refs/tags/v0.1.0^{}'
+```
+
+All six builds use native-architecture runners and explicit target triples. The Linux containers use the runner kernel, and the archive fixture excludes the optional SDK and native-plugin CLI scenarios. The standard CI jobs provide separate SDK, plugin, and search coverage. The release provides SHA-256 files alongside the archives.
 
 #### Experimental RPC and native subagents
 

@@ -1,0 +1,606 @@
+{
+  "binary_sha256": "6a1c3fc903501f92393bffaf85f4f25f3ce15ac33c0910760c535829ce32f1c3",
+  "binary_version": "zpi 0.1.0",
+  "compaction_context": [
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    },
+    {
+      "after": {
+        "max_tokens": 1024,
+        "messages": 17,
+        "request_bytes": 2664
+      },
+      "before": {
+        "max_tokens": 1024,
+        "messages": 1025,
+        "request_bytes": 176705
+      },
+      "estimated_tokens_before": 41895
+    }
+  ],
+  "compaction_input_messages": 1024,
+  "environment": "Apple M4, macOS 27.2.1 (26B131), native arm64, v0.1.0 ReleaseSafe archive",
+  "latency_ms": {
+    "after_compaction_turn": {
+      "max": 0.550209,
+      "p50": 0.5064375,
+      "p95": 0.544459,
+      "samples": [
+        0.528584,
+        0.544459,
+        0.482875,
+        0.53825,
+        0.416833,
+        0.495875,
+        0.505875,
+        0.483792,
+        0.508916,
+        0.48,
+        0.550209,
+        0.514666,
+        0.511375,
+        0.507,
+        0.524458,
+        0.491709,
+        0.487792,
+        0.405792,
+        0.534917,
+        0.473167
+      ]
+    },
+    "before_compaction_turn": {
+      "max": 4.292708,
+      "p50": 3.210938,
+      "p95": 3.431458,
+      "samples": [
+        3.170542,
+        3.331833,
+        3.211084,
+        3.431458,
+        3.049208,
+        3.210792,
+        3.264,
+        3.185625,
+        3.176959,
+        3.116875,
+        3.250958,
+        3.218208,
+        3.166625,
+        3.244667,
+        3.333583,
+        3.2355,
+        4.292708,
+        3.075458,
+        3.13225,
+        2.900458
+      ]
+    },
+    "compact": {
+      "max": 2.095333,
+      "p50": 1.902333,
+      "p95": 2.025375,
+      "samples": [
+        2.006625,
+        2.025375,
+        1.876,
+        1.92525,
+        1.770625,
+        1.894292,
+        1.92075,
+        1.873708,
+        1.87125,
+        1.820084,
+        1.919792,
+        2.095333,
+        1.8515,
+        1.906583,
+        1.956291,
+        1.898083,
+        1.9435,
+        1.801625,
+        2.005916,
+        1.8385
+      ]
+    },
+    "editor_update": {
+      "max": 0.0705,
+      "p50": 0.0498535,
+      "p95": 0.062791,
+      "samples": [
+        0.049916,
+        0.049791,
+        0.049583,
+        0.061583,
+        0.050417,
+        0.043209,
+        0.055833,
+        0.04425,
+        0.050083,
+        0.050417,
+        0.0705,
+        0.042167,
+        0.048458,
+        0.045417,
+        0.049333,
+        0.04475,
+        0.062791,
+        0.043042,
+        0.053875,
+        0.052084
+      ]
+    },
+    "first_screen": {
+      "max": 6.160667,
+      "p50": 2.8186455,
+      "p95": 3.10975,
+      "samples": [
+        6.160667,
+        2.872834,
+        3.032583,
+        2.57975,
+        2.855791,
+        3.005292,
+        2.588333,
+        2.80725,
+        2.830041,
+        2.794375,
+        2.552167,
+        2.8635,
+        2.801041,
+        2.716416,
+        2.667167,
+        3.050834,
+        2.899042,
+        2.739167,
+        2.511791,
+        3.10975
+      ]
+    },
+    "launch_to_first_text": {
+      "max": 7.369709,
+      "p50": 3.574375,
+      "p95": 3.961958,
+      "samples": [
+        7.369709,
+        3.585,
+        3.961958,
+        3.245792,
+        3.608208,
+        3.751292,
+        3.299375,
+        3.480625,
+        3.56375,
+        3.476042,
+        3.20675,
+        3.601375,
+        3.62875,
+        3.406333,
+        3.353542,
+        3.923875,
+        3.71125,
+        3.436167,
+        3.1595,
+        3.902
+      ]
+    },
+    "session_restore": {
+      "max": 275.029333,
+      "p50": 221.0527915,
+      "p95": 235.025541,
+      "samples": [
+        223.48,
+        235.025541,
+        219.649583,
+        275.029333,
+        220.931875,
+        219.860833,
+        221.997542,
+        220.765625,
+        222.614417,
+        221.439584,
+        222.206,
+        220.393334,
+        220.830041,
+        222.043458,
+        220.872667,
+        220.376125,
+        221.298666,
+        221.173708,
+        220.056917,
+        219.236542
+      ]
+    },
+    "stream_completion": {
+      "max": 9.71325,
+      "p50": 8.021666,
+      "p95": 8.980542,
+      "samples": [
+        7.5775,
+        8.232417,
+        8.277417,
+        9.71325,
+        8.20125,
+        8.368834,
+        7.801,
+        7.770083,
+        8.577709,
+        8.980542,
+        7.883916,
+        7.470458,
+        7.917542,
+        8.072792,
+        7.354959,
+        8.019791,
+        8.273584,
+        7.998834,
+        7.910042,
+        8.023541
+      ]
+    },
+    "submit_to_first_text": {
+      "max": 1.208417,
+      "p50": 0.7223955,
+      "p95": 0.928,
+      "samples": [
+        1.208417,
+        0.711791,
+        0.928,
+        0.665625,
+        0.75175,
+        0.744792,
+        0.710542,
+        0.673,
+        0.733,
+        0.68125,
+        0.654208,
+        0.737416,
+        0.827125,
+        0.689458,
+        0.685833,
+        0.872125,
+        0.8115,
+        0.696542,
+        0.647334,
+        0.791292
+      ]
+    },
+    "tree_open": {
+      "max": 0.119042,
+      "p50": 0.0854585,
+      "p95": 0.101708,
+      "samples": [
+        0.082666,
+        0.093542,
+        0.083625,
+        0.119042,
+        0.091458,
+        0.099458,
+        0.083625,
+        0.081542,
+        0.08575,
+        0.085167,
+        0.101708,
+        0.084334,
+        0.08475,
+        0.095334,
+        0.083375,
+        0.093083,
+        0.098458,
+        0.079917,
+        0.084417,
+        0.092125
+      ]
+    },
+    "tree_select_previous": {
+      "max": 0.046417,
+      "p50": 0.034354,
+      "p95": 0.045041,
+      "samples": [
+        0.034,
+        0.033,
+        0.034125,
+        0.046417,
+        0.029209,
+        0.031541,
+        0.034583,
+        0.031042,
+        0.037166,
+        0.045,
+        0.035042,
+        0.031041,
+        0.042,
+        0.045041,
+        0.039458,
+        0.029917,
+        0.039625,
+        0.03225,
+        0.032875,
+        0.041375
+      ]
+    }
+  },
+  "long_stream_peak_rss_bytes": {
+    "max": 5406720.0,
+    "p50": 5406720.0,
+    "p95": 5406720.0,
+    "samples": [
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5390336.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0,
+      5406720.0
+    ]
+  },
+  "machine": "arm64",
+  "os_release": "27.2.0",
+  "pty_columns": 80,
+  "pty_rows": 24,
+  "python": "3.9.6",
+  "sample_count": 20,
+  "script_sha256": "2c126374d6c876ef7a5ca802b3850f5e7e78605c04511c8fa6ecc1605d99c170",
+  "session_bytes": 2288671,
+  "session_message_padding": 128,
+  "session_messages": 8192,
+  "stream_text_bytes": 262159,
+  "system": "Darwin"
+}
