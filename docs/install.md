@@ -6,7 +6,9 @@ Install `rg` and `fd` (or `fdfind`) separately if you use the corresponding sear
 
 ## Install a release archive
 
-From the source tree, build an archive for the machine running Zig. Choose a filename that identifies its OS, architecture and, on Linux, libc. The script requires Python 3 and a filesystem that supports hard links. It runs the core offline CLI suite from the unpacked archive before creating the output files.
+GitHub release archives cover Linux x64, Linux arm64, macOS x64 and macOS arm64. Each `.tar.gz` has a matching `.sha256` file. The binaries target baseline CPU features. The Linux archives are built and tested on Ubuntu 24.04 with glibc 2.39. Verify the checksum before extraction.
+
+You can also build a local archive for the machine running Zig. Choose a filename that identifies its OS, architecture and, on Linux, libc. The script requires Python 3 and a filesystem that supports hard links. It runs the core offline CLI suite from the unpacked archive before creating the output files.
 
 ```sh
 sh scripts/build-release.sh zpi-macos-arm64.tar.gz zig-out/release-archives

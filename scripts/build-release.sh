@@ -34,13 +34,18 @@ if [ "$version" != 0.17.0 ]; then
 fi
 zig fmt --check build.zig build.zig.zon src
 python3 scripts/test-package-release.py
-zig build -Doptimize=ReleaseSafe --prefix "$stage/prefix" --summary all
+zig build -Doptimize=ReleaseSafe -Dcpu=baseline --prefix "$stage/prefix" --summary all
 cp LICENSE "$stage/prefix/LICENSE"
 python3 scripts/package-release.py "$stage/prefix" "$stage/$name" > "$stage/$name.sha256"
 mkdir "$stage/unpacked" "$stage/smoke-home"
 tar -xzf "$stage/$name" -C "$stage/unpacked"
 binary="$stage/unpacked/zpi/bin/zpi"
-"$binary" --version
+binary_version=$("$binary" --version)
+printf '%s\n' "$binary_version"
+if [ -n "${ZPI_RELEASE_VERSION:-}" ] && [ "$binary_version" != "zpi $ZPI_RELEASE_VERSION" ]; then
+    printf 'Expected release version %s, got %s.\n' "$ZPI_RELEASE_VERSION" "$binary_version" >&2
+    exit 1
+fi
 "$binary" --help >/dev/null
 # The runtime smoke uses only localhost and an isolated configuration.
 env -i PATH="$PATH" HOME="$stage/smoke-home" ZPI_TEST_BINARY="$binary" python3 scripts/test-cli.py
