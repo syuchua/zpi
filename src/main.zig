@@ -508,7 +508,7 @@ const CliAdapter = struct {
                     errdefer allocator.free(label);
                     const arguments = try std.json.Stringify.valueAlloc(allocator, call.arguments, .{});
                     defer allocator.free(arguments);
-                    const bounded = if (arguments.len > 16 * 1024) arguments[0..16*1024] else arguments;
+                    const bounded = if (arguments.len > 16 * 1024) arguments[0 .. 16 * 1024] else arguments;
                     try items.append(allocator, .{ .name = label, .text = try allocator.dupe(u8, bounded) });
                 },
                 else => {},
