@@ -2230,6 +2230,7 @@ def check_tui_components(root, environment, server):
         assert b'\x1b[48;2;25;43;61m' + user_row + b'\x1b[0m' in transcript[start:]
         expect(b'comp-fixture/comp-model (medium)', reply)
         assert b'\x1b[?1049h' not in transcript, 'alt-screen triggered'
+        assert b'\x1b[?1000h' not in transcript and b'\x1b[?1006h' not in transcript, 'mouse capture enabled'
         assert (comp_dir / 'comp.txt').read_text() == 'line1\nnew\nline3\n'
 
         # /details opens a bounded independent overlay with persisted tool calls and results.
@@ -3274,8 +3275,9 @@ def check_fullscreen_viewport(root, environment, server):
     os.close(slave)
     transcript = bytearray()
 
-    def expect(marker, start=0):
-        deadline = time.monotonic() + 10
+    def expect(marker, start=0, deadline=None):
+        if deadline is None:
+            deadline = time.monotonic() + 10
         while (pos := transcript.find(marker, start)) < 0:
             remaining = deadline - time.monotonic()
             assert remaining > 0, ('fullscreen PTY timed out', marker, bytes(transcript[-3000:]))
@@ -3293,20 +3295,30 @@ def check_fullscreen_viewport(root, environment, server):
     frame_start = b'\x1b[?2026h\x1b[H\x1b[J'
     frame_end = b'\x1b[?2026l'
 
-    def frame_with(marker, start):
-        while True:
-            begin = expect(frame_start, start) + len(frame_start)
-            end = expect(frame_end, begin)
+    def frame_with(marker, start, editor_row=None):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            begin = expect(frame_start, start, deadline) + len(frame_start)
+            end = expect(frame_end, begin, deadline)
             frame = bytes(transcript[begin:end])
             start = end + len(frame_end)
-            if marker in frame:
+            if marker in frame and (editor_row is None or frame.endswith(f'\x1b[{editor_row};3H'.encode())):
                 return frame, start
+        raise AssertionError(('no matching fullscreen frame', marker, editor_row, bytes(transcript[-3000:])))
 
     try:
         expect(b'\x1b[?1049h')
         frame, pos = frame_with(b'restored assistant', 0)
         assert b'> restored user' in frame.splitlines()[0], frame
         assert b'\x1b[?2004h\x1b[?1006h\x1b[?1000h' in transcript
+
+        # Resize while idle: the redraw keeps the pinned message and editor, and
+        # subsequent mouse coordinates are calculated using the new geometry.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 16, 60, 0, 0))
+        resized_mark = len(transcript)
+        frame, pos = frame_with(b'> restored user', resized_mark, editor_row=14)
+        assert b'queue-fixture/queue-model' in frame, frame
+        assert frame.count(b'\n') == 15, frame
 
         tool_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'second.txt' in line)
         os.write(master, f'\x1b[<0;5;{tool_row}M'.encode())
@@ -3320,30 +3332,49 @@ def check_fullscreen_viewport(root, environment, server):
         frame, pos = frame_with(b'Show keyboard shortcuts', pos)
         popup_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'Show keyboard shortcuts' in line)
         os.write(master, f'\x1b[<0;5;{popup_row}M'.encode())
-        frame, pos = frame_with(b'/hotkeys ', pos)
-        assert b'Show keyboard shortcuts' not in frame and b'Keyboard shortcuts' not in frame, frame
+        input_frame, pos = frame_with(b'/hotkeys ', pos)
+        assert b'Show keyboard shortcuts' not in input_frame, input_frame
         os.write(master, b'\n')
         frame, pos = frame_with(b'Keyboard shortcuts', pos)
-        os.write(master, b'q')
+        os.write(master, b'\r')
         frame, pos = frame_with(b'restored assistant', pos)
 
         os.write(master, b'fullscreen-slow\n')
         frame, pos = frame_with(b'older-23', pos)
         assert b'> fullscreen-slow' in frame.splitlines()[0], frame
         assert b'queue-fixture/queue-model' in frame, frame
+        # Resize during streaming and wait for the editor cursor on row 8; the
+        # height is checked through the frame cursor position, not PTY newlines.
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 54, 0, 0))
+        resized_live, pos = frame_with(b'older-23', pos, editor_row=8)
+        assert b'queue-fixture/queue-model' in resized_live, resized_live
         os.write(master, b'\x1b[<64;10;4M')
         frame, pos = frame_with(b'Browsing history', pos)
-        before_body = frame.splitlines()[1:8]
+        # Ten terminal rows leave five transcript rows after the header and chrome.
+        before_body = frame.split(b'\n')[1:6]
         assert b'older-23' not in frame and b'> fullscreen-slow' not in frame.splitlines()[0], frame
         server.queue_stream_mid.set()
+        # While paused, live frames keep the same transcript. End reveals the
+        # second chunk before the server is allowed to finish the turn.
+        paused_frame, pos = frame_with(b'Browsing history', pos)
+        assert paused_frame.split(b'\n')[1:6] == before_body, paused_frame
+        assert b'fullscreen-new-output' not in paused_frame, paused_frame
+        resume_mark = pos
+        os.write(master, b'\x1b[F')
+        frame, pos = frame_with(b'fullscreen-new-output', resume_mark)
+        assert b'> fullscreen-slow' in frame.split(b'\n')[0], frame
+        assert b'\x1b[?2004l' not in transcript[resume_mark:pos]
+        os.write(master, b'\x1b[5~')
+        frame, pos = frame_with(b'Browsing history', pos)
+        before_body = frame.split(b'\n')[1:6]
         server.queue_stream_release.set()
         idle = expect(b'\x1b[?2004h', expect(b'\x1b[?2004l', pos))
         frame, pos = frame_with(b'Browsing history', idle)
-        assert frame.splitlines()[1:8] == before_body, frame
+        assert frame.split(b'\n')[1:6] == before_body, frame
         assert b'fullscreen-new-output' not in frame, frame
         os.write(master, b'\x1b[<65;10;4M')
         frame, pos = frame_with(b'Browsing history', pos)
-        assert frame.splitlines()[1:8] != before_body, frame
+        assert frame.split(b'\n')[1:6] != before_body, frame
         os.write(master, b'\x1b[F')
         frame, pos = frame_with(b'fullscreen-new-output', pos)
         assert b'> fullscreen-slow' in frame.splitlines()[0] and b'done' in frame, frame

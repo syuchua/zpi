@@ -40,9 +40,11 @@ export OPENAI_API_KEY=...    # or configure another supported provider
 
 Zpi supports OpenAI Chat Completions, a text/tool subset of OpenAI Responses, and a text/tool subset of Anthropic Messages. Configure providers and models in `~/.zpi/agent/models.json` or point to an existing compatible file with `--models-file`. Choose a provider/model with `--provider` and `--model`; credentials can come from provider environment variables or configuration.
 
-Useful options include `--continue`, `--session PATH`, `--no-session`, `--tools`, `--no-tools`, `--skill PATH`, `--prompt-template PATH`, `--system-prompt`, and `--cwd`. Run `zpi --help` for the complete CLI reference. Build a headless binary without the interactive UI using `zig build -Dtui=none`.
+Useful options include `--continue`, `--session PATH`, `--no-session`, `--fullscreen` (opt into a full-screen conversation reader with mouse support), `--tools`, `--no-tools`, `--skill PATH`, `--prompt-template PATH`, `--system-prompt`, and `--cwd`. Run `zpi --help` for the complete CLI reference. Build a headless binary without the interactive UI using `zig build -Dtui=none`.
 
 Interactive commands include `/help`, `/hotkeys`, `/model`, `/thinking`, `/resume`, `/tree`, `/compact`, `/session`, `/jobs`, and `/exit`. The editor supports `Shift+Tab` to cycle thinking levels, `Ctrl+O` to toggle compact output, `Ctrl+S` to steer an active turn, and queued follow-up prompts.
+
+In `zpi --fullscreen`, the latest user message has a short pinned preview while the view follows new output. Scroll the wheel or use `PgUp` and `PgDn` to browse history, and press `End` to follow the latest output again. When the editor is idle, click a tool header to inspect that call or use `/details` with the keyboard. Clicking a slash-command candidate fills the editor. Press `Enter` to submit it. Mouse support requires an ANSI terminal with xterm SGR mouse reports. Run `zpi` for native terminal scrollback and text selection.
 
 Experimental `--mode rpc` supports `prompt`, `get_state`, and `abort` over Zpi's own JSONL protocol. Commands accept an optional string `id`, and each started turn emits `agent_settled` on completion, failure, or cancellation. RPC works with `-Dtui=none`. See the [Zpi JSONL RPC v1 contract](docs/spec/zpi-rpc-v1.md) for message shapes, ordering, and the independent client fixture.
 
@@ -66,7 +68,7 @@ Zpi is a tested, useful subset and is **not production-ready or broadly pi-compa
 - OpenAI and Anthropic text/tool workflows, optional MCP stdio servers, and experimental native C/Zig plugins.
 - Offline import of a limited subset of pi v3 session history and an opt-in host for a limited set of existing pi TypeScript extensions.
 
-Important gaps include `web_search`, broad provider and OAuth support, images, pi session-format parity, fullscreen TUI mode, full RPC compatibility, stable plugin ABI/Rust interoperability, package management, and general project trust/approval controls. See the [compatibility matrix](docs/spec/compatibility-matrix.md) for feature-level status.
+Important gaps include `web_search`, broad provider and OAuth support, images, pi session-format parity, full RPC compatibility, stable plugin ABI/Rust interoperability, package management, and general project trust/approval controls. See the [compatibility matrix](docs/spec/compatibility-matrix.md) for feature-level status.
 
 ## Roadmap
 
@@ -75,7 +77,7 @@ Priorities are subject to change; this is a project direction, not a release pro
 1. **Compatibility and daily-use reliability**: broaden provider/auth and session compatibility, improve project trust and tool approval controls, and keep native macOS/Linux verification current.
 2. **Search and orchestration**: evaluate a first-party `web_search` integration and extend native subagents with additional model selection, persistent child sessions and background orchestration.
 3. **Integration surface**: extend the experimental RPC command and event subset, then strengthen plugin lifecycle/ABI guarantees and Rust interoperability.
-4. **Product maturity**: assess package/resource management, settings parity, fullscreen TUI behavior, and release provenance/signing based on user needs and maintenance capacity.
+4. **Product maturity**: assess package/resource management, settings parity, further fullscreen TUI behavior, and release provenance/signing based on user needs and maintenance capacity.
 
 ## Documentation
 

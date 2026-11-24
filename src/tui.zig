@@ -55,9 +55,10 @@ fn renderFullscreenConversation(
     const loader_rows: usize = @intFromBool(rows >= 5);
     const popup_rows = @min(popup.len, (rows -| (2 + header_rows + chrome_rows + loader_rows)) / 2);
     const queued_rows = @min(@min(queued.len, 4), rows -| (3 + header_rows + chrome_rows + loader_rows + popup_rows));
-    const body_rows = rows - 1 - header_rows - chrome_rows - loader_rows - popup_rows - queued_rows;
+    const body_rows = rows -| 1 -| header_rows -| chrome_rows -| loader_rows -| popup_rows -| queued_rows;
     view.body_height = @max(1, body_rows);
     view.frame_size = size;
+    // Popup rows sit directly above the editor. Mouse coordinates are 1-based.
     view.popup_row = rows - chrome_rows - popup_rows;
     view.popup_rows = popup_rows;
     try view.hit_rows.resize(allocator, rows);
@@ -1576,6 +1577,7 @@ fn readPromptLine(
     var dialog_on_screen = false;
     var in_paste = false;
     var cols = terminalColumns(output);
+    var last_size = terminalSize(output);
     var dirty = has_footer or dialog != null or submit.fullscreen;
     if (initial) |text| {
         if (text.len > 0) {
@@ -1640,9 +1642,18 @@ fn readPromptLine(
             dialog_on_screen = dialog_slices.len > 0;
             dirty = false;
         }
-        const b_opt = try queue.readByteWithCancelAndWake(input_fd, submit.cancel, submit.bg_wake, -1);
+        const b_opt = try queue.readByteWithCancelAndWake(input_fd, submit.cancel, submit.bg_wake, if (submit.fullscreen) 100 else -1);
         const b = b_opt orelse {
             if (!queue.eof) {
+                if (submit.fullscreen) {
+                    const new_size = terminalSize(output);
+                    if (new_size.row != last_size.row or new_size.col != last_size.col) {
+                        last_size = new_size;
+                        dirty = true;
+                    }
+                    const bg_ready = if (submit.bg_wake) |wake| wake.isCanceled() else false;
+                    if (!bg_ready) continue;
+                }
                 try collectBgNotifications(submit, io, output, bg_queue, true);
                 if (bg_queue.items.len > 0 and editor.buf.items.len == 0 and dialog == null and !popup.isOpen()) {
                     try editor.clearAll(io, output, th);
@@ -1948,11 +1959,7 @@ fn readPromptLine(
                                         if (event.row >= view.popup_row and index < view.popup_rows and popup.isOpen() and popup.kind == .command) {
                                             const item = popup.scroll + index;
                                             if (index < components.autocomplete.Popup.max_visible and item < popup.items.items.len) {
-                                                const candidate = popup.items.items[item];
-                                                try applyAutocomplete(&editor, &popup, io, submit, candidate);
-                                                if (components.autocomplete.isBuiltin(candidate.label) and editor.buf.items.len > 0 and editor.buf.items[editor.buf.items.len - 1] == ' ') {
-                                                    editor.backspace();
-                                                }
+                                                try applyAutocomplete(&editor, &popup, io, submit, popup.items.items[item]);
                                             }
                                         } else if (view.toolAtRow(event.row)) |id| {
                                             if (submit.tool_details) |get| {
@@ -2620,6 +2627,7 @@ fn runTurnWithLiveEditor(
     defer done.deinit(io);
 
     var cols = terminalColumns(output);
+    var last_size = terminalSize(output);
     var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th, submit.conversation_view);
     screen.overlay_cols = cols;
     defer screen.deinit();
@@ -2664,9 +2672,11 @@ fn runTurnWithLiveEditor(
 
     while (true) {
         if (done.isCanceled()) break;
-        const current_cols = terminalColumns(output);
-        if ((dirty or current_cols != cols) and !queue.hasBuffered()) {
+        const current_size = terminalSize(output);
+        const current_cols = @as(usize, current_size.col);
+        if ((dirty or current_cols != cols or current_size.row != last_size.row) and !queue.hasBuffered()) {
             cols = current_cols;
+            last_size = current_size;
             try screen.loaderTickAndRender(&editor, followups.items, submit, cols, 0);
             dirty = false;
         }
