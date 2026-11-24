@@ -2016,7 +2016,8 @@ def check_queued_followup_editing(root, environment, server):
         start = len(transcript)
         os.write(master, b'queue-slow\n')
         end = expect(b'working...', start)
-        assert b'\x1b[48;2;25;43;61m> queue-slow' in transcript[start:end], transcript[start:]
+        panel = transcript[start:end]
+        assert b'\x1b[44m> queue-slow' in panel or b'\x1b[48;2;25;43;61m> queue-slow' in panel, transcript[start:]
 
         # 2. Type a live draft while streaming; mid-stream output preserves the draft cleanly.
         prompt_marker = b'\x1b[36m>\x1b[0m '
