@@ -663,15 +663,17 @@ class Handler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(data)
                     return
-                if user == 'queue-slow':
+                if user in ('queue-slow', 'fullscreen-slow'):
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/event-stream')
                     self.end_headers()
-                    chunk1 = {'choices': [{'index': 0, 'delta': {'content': 'working...'}}]}
+                    first_text = 'working...' if user == 'queue-slow' else ''.join(f'older-{i:02d}\n' for i in range(24))
+                    chunk1 = {'choices': [{'index': 0, 'delta': {'content': first_text}}]}
                     self.wfile.write(('data: ' + json.dumps(chunk1) + '\n\n').encode())
                     self.wfile.flush()
                     assert self.server.queue_stream_mid.wait(timeout=10)
-                    chunk2 = {'choices': [{'index': 0, 'delta': {'content': ' mid\n'}}]}
+                    next_text = ' mid\n' if user == 'queue-slow' else 'fullscreen-new-output\n'
+                    chunk2 = {'choices': [{'index': 0, 'delta': {'content': next_text}}]}
                     self.wfile.write(('data: ' + json.dumps(chunk2) + '\n\n').encode())
                     self.wfile.flush()
                     assert self.server.queue_stream_release.wait(timeout=10)
@@ -3225,6 +3227,143 @@ def check_rpc(root, environment, server):
     assert not (root / 'rpc-forbidden.txt').exists()
 
 
+def check_fullscreen_viewport(root, environment, server):
+    agent_dir = root / 'fullscreen-agent'
+    agent_dir.mkdir()
+    (agent_dir / 'models.json').write_text(json.dumps({'providers': {'queue-fixture': {
+        'api': 'openai-completions',
+        'baseUrl': f'http://127.0.0.1:{server.server_port}/queue-fixture',
+        'apiKey': 'queue-key',
+        'models': [{'id': 'queue-model'}],
+    }}}))
+    env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color', COLORTERM='truecolor')
+    env.pop('NO_COLOR', None)
+    server.queue_stream_mid.clear()
+    server.queue_stream_release.clear()
+    session = root / 'fullscreen-session.jsonl'
+    session.write_text('\n'.join(json.dumps(record) for record in [
+        {'type': 'session', 'cwd': str(root)},
+        {'type': 'message', 'id': '1', 'parent_id': None, 'message': {
+            'role': 'user', 'content': [{'text': 'restored user'}],
+        }},
+        {'type': 'message', 'id': '2', 'parent_id': '1', 'message': {
+            'role': 'assistant', 'content': [{'tool_call': {
+                'id': 'fullscreen-read-1', 'name': 'read', 'arguments': {'path': 'first.txt'},
+            }}, {'tool_call': {
+                'id': 'fullscreen-read-2', 'name': 'read', 'arguments': {'path': 'second.txt'},
+            }}],
+        }},
+        {'type': 'message', 'id': '3', 'parent_id': '2', 'message': {
+            'role': 'tool_result', 'tool_call_id': 'fullscreen-read-1', 'tool_name': 'read',
+            'content': [{'text': 'first result marker'}],
+        }},
+        {'type': 'message', 'id': '4', 'parent_id': '3', 'message': {
+            'role': 'tool_result', 'tool_call_id': 'fullscreen-read-2', 'tool_name': 'read',
+            'content': [{'text': 'second result marker'}],
+        }},
+        {'type': 'message', 'id': '5', 'parent_id': '4', 'message': {
+            'role': 'assistant', 'content': [{'text': 'restored assistant'}],
+        }},
+    ]) + '\n')
+    args = [str(BINARY), '--fullscreen', '--no-proxy', '--provider', 'queue-fixture', '--session', str(session)]
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 70, 0, 0))
+    before = termios.tcgetattr(slave)
+    process = subprocess.Popen(args, cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave,
+                               close_fds=True, preexec_fn=lambda: (os.setsid(), fcntl.ioctl(slave, termios.TIOCSCTTY, 0)))
+    os.close(slave)
+    transcript = bytearray()
+
+    def expect(marker, start=0):
+        deadline = time.monotonic() + 10
+        while (pos := transcript.find(marker, start)) < 0:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('fullscreen PTY timed out', marker, bytes(transcript[-3000:]))
+            if select.select([master], [], [], remaining)[0]:
+                try:
+                    chunk = os.read(master, 16384)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        raise AssertionError(('fullscreen exited early', marker, bytes(transcript[-3000:]))) from exc
+                    raise
+                assert chunk, (marker, bytes(transcript[-3000:]))
+                transcript.extend(chunk)
+        return pos
+
+    frame_start = b'\x1b[?2026h\x1b[H\x1b[J'
+    frame_end = b'\x1b[?2026l'
+
+    def frame_with(marker, start):
+        while True:
+            begin = expect(frame_start, start) + len(frame_start)
+            end = expect(frame_end, begin)
+            frame = bytes(transcript[begin:end])
+            start = end + len(frame_end)
+            if marker in frame:
+                return frame, start
+
+    try:
+        expect(b'\x1b[?1049h')
+        frame, pos = frame_with(b'restored assistant', 0)
+        assert b'> restored user' in frame.splitlines()[0], frame
+        assert b'\x1b[?2004h\x1b[?1006h\x1b[?1000h' in transcript
+
+        tool_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'second.txt' in line)
+        os.write(master, f'\x1b[<0;5;{tool_row}M'.encode())
+        detail = expect(b'tool read: fullscreen-read-2', pos)
+        detail_end = expect(b'second result marker', detail)
+        assert b'first result marker' not in transcript[pos:detail_end], transcript[pos:detail_end]
+        os.write(master, b'q')
+        frame, pos = frame_with(b'restored assistant', detail_end)
+
+        os.write(master, b'/hot')
+        frame, pos = frame_with(b'Show keyboard shortcuts', pos)
+        popup_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'Show keyboard shortcuts' in line)
+        os.write(master, f'\x1b[<0;5;{popup_row}M'.encode())
+        frame, pos = frame_with(b'/hotkeys ', pos)
+        assert b'Show keyboard shortcuts' not in frame and b'Keyboard shortcuts' not in frame, frame
+        os.write(master, b'\n')
+        frame, pos = frame_with(b'Keyboard shortcuts', pos)
+        os.write(master, b'q')
+        frame, pos = frame_with(b'restored assistant', pos)
+
+        os.write(master, b'fullscreen-slow\n')
+        frame, pos = frame_with(b'older-23', pos)
+        assert b'> fullscreen-slow' in frame.splitlines()[0], frame
+        assert b'queue-fixture/queue-model' in frame, frame
+        os.write(master, b'\x1b[<64;10;4M')
+        frame, pos = frame_with(b'Browsing history', pos)
+        before_body = frame.splitlines()[1:8]
+        assert b'older-23' not in frame and b'> fullscreen-slow' not in frame.splitlines()[0], frame
+        server.queue_stream_mid.set()
+        server.queue_stream_release.set()
+        idle = expect(b'\x1b[?2004h', expect(b'\x1b[?2004l', pos))
+        frame, pos = frame_with(b'Browsing history', idle)
+        assert frame.splitlines()[1:8] == before_body, frame
+        assert b'fullscreen-new-output' not in frame, frame
+        os.write(master, b'\x1b[<65;10;4M')
+        frame, pos = frame_with(b'Browsing history', pos)
+        assert frame.splitlines()[1:8] != before_body, frame
+        os.write(master, b'\x1b[F')
+        frame, pos = frame_with(b'fullscreen-new-output', pos)
+        assert b'> fullscreen-slow' in frame.splitlines()[0] and b'done' in frame, frame
+        os.write(master, b'/exit\n')
+        leave = expect(b'\x1b[?1049l', pos)
+        assert b'\x1b[?1000l\x1b[?1006l' in transcript[pos:leave], transcript[pos:leave]
+        assert process.wait(timeout=5) == 0, bytes(transcript[-4096:])
+        after = termios.tcgetattr(master)
+        after[3] &= ~getattr(termios, 'PENDIN', 0)
+        before[3] &= ~getattr(termios, 'PENDIN', 0)
+        assert after == before
+    finally:
+        server.queue_stream_mid.set()
+        server.queue_stream_release.set()
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        os.close(master)
+
+
 def main():
     server = Server(('127.0.0.1', 0), Handler)
     server.failures = []
@@ -3273,6 +3412,11 @@ def main():
             environment['ZPI_TEST_HEADER_TOKEN'] = 'header-secret'
             environment['ZPI_TEST_KEY_PART'] = 'key'
             environment['ZPI_EMPTY_HEADER'] = ''
+            if sys.argv[1:] == ['--fullscreen-only']:
+                check_fullscreen_viewport(root, environment, server)
+                assert not server.failures, server.failures
+                print('Fullscreen viewport integration passed')
+                return
             if sys.argv[1:] == ['--subagent-only']:
                 check_subagent(root, environment, server)
                 assert not server.failures, server.failures
@@ -4359,6 +4503,7 @@ for line in sys.stdin:
             check_queued_followup_editing(root, environment, server)
             check_bg_tasks_pty(root, environment, server)
             check_tui_components(root, environment, server)
+            check_fullscreen_viewport(root, environment, server)
             assert not server.failures, server.failures
             tools = 'write/edit/read/bash/grep/find/ls' if HAS_SEARCH else 'write/edit/read/bash (search dependencies absent)'
             extensions = ', real pi TS input/tool/gate/details integration' if environment.get('ZPI_PI_SDK') else ' (TS integration skipped: ZPI_PI_SDK unset)'

@@ -41,6 +41,7 @@ pub const Options = struct {
     no_proxy: bool = false,
     no_tools: bool = false,
     allow_loopback_web_fetch: bool = false,
+    fullscreen: bool = false,
     print_version: bool = false,
     print_help: bool = false,
 };
@@ -102,6 +103,10 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
         }
         if (!positional_only and std.mem.eql(u8, arg, "--allow-loopback-web-fetch")) {
             result.allow_loopback_web_fetch = true;
+            continue;
+        }
+        if (!positional_only and std.mem.eql(u8, arg, "--fullscreen")) {
+            result.fullscreen = true;
             continue;
         }
         if (!positional_only and (std.mem.eql(u8, arg, "--no-tools") or std.mem.eql(u8, arg, "-nt"))) {

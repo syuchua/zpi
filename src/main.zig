@@ -17,6 +17,7 @@ const help =
     \\       zpi --import-pi-session SOURCE --session DESTINATION
     \\
     \\  -p, --print            Print final response and exit
+    \\  --fullscreen           Enable optional fullscreen conversation viewport
     \\  --mode text            Text output; print when stdin/stdout is redirected
     \\  --mode json            Write Zpi JSONL events and exit
     \\  --mode rpc             Serve experimental JSONL commands over stdin/stdout
@@ -225,12 +226,14 @@ fn run(init: std.process.Init) !void {
                 .run = CliAdapter.submitErased,
                 .session_info = CliAdapter.sessionInfoErased,
                 .render_initial_history = CliAdapter.renderInitialHistoryErased,
+                .render_fullscreen_history = CliAdapter.renderFullscreenHistoryErased,
                 .jobs_info = CliAdapter.jobsErased,
                 .cancel = cancel_token,
                 .reset_cancel = CliAdapter.resetCancelErased,
                 .trigger_cancel = CliAdapter.triggerCancelErased,
                 .set_live_writer = CliAdapter.setLiveWriterErased,
                 .allocator = init.gpa,
+                .fullscreen = options.fullscreen,
                 .cwd = status.cwd,
                 .commands = slash_commands,
                 .compact = CliAdapter.compactErased,
@@ -275,6 +278,7 @@ const CliAdapter = struct {
     arena: std.mem.Allocator,
     io: std.Io,
     mode: args_module.OutputMode,
+    fullscreen_view: if (build_options.enable_tui) ?*tui.ConversationView else ?void = null,
     interrupt: ?*zpi.model.Interrupt = null,
     stderr_is_tty: bool = false,
     stderr_color: bool = false,
@@ -490,7 +494,7 @@ const CliAdapter = struct {
         return self.harness.?.recordUserShellResult(text);
     }
 
-    fn toolDetailsErased(context: *anyopaque, allocator: std.mem.Allocator) anyerror![]tui.ToolDetailItem {
+    fn toolDetailsErased(context: *anyopaque, allocator: std.mem.Allocator, filter_id: ?[]const u8) anyerror![]tui.ToolDetailItem {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         const h = self.harness orelse return try allocator.alloc(tui.ToolDetailItem, 0);
         var items: std.ArrayList(tui.ToolDetailItem) = .empty;
@@ -504,6 +508,7 @@ const CliAdapter = struct {
         for (h.runtime.messages.items) |message| switch (message.role) {
             .assistant => for (message.content) |part| switch (part) {
                 .tool_call => |call| {
+                    if (filter_id) |id| if (!std.mem.eql(u8, id, call.id)) continue;
                     const label = try std.fmt.allocPrint(allocator, "tool {s}: {s}", .{ call.name, call.id });
                     errdefer allocator.free(label);
                     const arguments = try std.json.Stringify.valueAlloc(allocator, call.arguments, .{});
@@ -514,6 +519,7 @@ const CliAdapter = struct {
                 else => {},
             },
             .tool_result => {
+                if (filter_id) |id| if (!std.mem.eql(u8, id, message.tool_call_id orelse "")) continue;
                 const label = try allocator.print("{s} ({s})", .{ message.tool_name orelse "tool", message.tool_call_id orelse "result" });
                 errdefer allocator.free(label);
                 var body: std.ArrayList(u8) = .empty;
@@ -832,6 +838,25 @@ const CliAdapter = struct {
         return try self.renderSessionHistory();
     }
 
+    fn renderFullscreenHistoryErased(context: *anyopaque, view: *tui.ConversationView) anyerror!bool {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        self.fullscreen_view = view;
+        return self.renderSessionHistory();
+    }
+
+    fn historyText(self: *CliAdapter, text: []const u8, styled: bool) !void {
+        if (comptime build_options.enable_tui) {
+            if (self.fullscreen_view) |view| {
+                if (styled) return view.appendText(text);
+                const safe = try tui.terminal.safeUtf8Alloc(self.allocator, text);
+                defer self.allocator.free(safe);
+                return view.appendText(safe);
+            }
+        }
+        if (styled) return std.Io.File.stdout().writeStreamingAll(self.io, text);
+        return writeSafe(self.io, .stdout(), text);
+    }
+
     fn renderSessionHistory(self: *CliAdapter) anyerror!bool {
         const h = self.harness orelse return false;
         const projected = try h.store.projectedActivePath(self.allocator);
@@ -844,6 +869,9 @@ const CliAdapter = struct {
                 break;
             }
         }
+        if (comptime build_options.enable_tui) if (self.fullscreen_view) |view| {
+            view.clear();
+        };
         if (!has_visible) return false;
 
         const stdout = std.Io.File.stdout();
@@ -857,13 +885,13 @@ const CliAdapter = struct {
             if (entry.compaction) |comp| {
                 const line = try std.fmt.allocPrint(self.allocator, "[compacted history]\n{s}\n\n", .{comp.summary});
                 defer self.allocator.free(line);
-                try writeSafe(self.io, stdout, line);
+                try self.historyText(line, false);
                 continue;
             }
             if (entry.branch_summary) |bs| {
                 const line = try std.fmt.allocPrint(self.allocator, "[branch summary]\n{s}\n\n", .{bs.summary});
                 defer self.allocator.free(line);
-                try writeSafe(self.io, stdout, line);
+                try self.historyText(line, false);
                 continue;
             }
             switch (entry.message.role) {
@@ -873,8 +901,9 @@ const CliAdapter = struct {
                             if (comptime build_options.enable_tui) {
                                 const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt, cols);
                                 defer self.allocator.free(echo);
-                                try stdout.writeStreamingAll(self.io, echo);
-                                try stdout.writeStreamingAll(self.io, "\n\n");
+                                if (self.fullscreen_view) |view| try view.setPinnedUser(txt);
+                                try self.historyText(echo, true);
+                                try self.historyText("\n\n", true);
                             } else {
                                 try stdout.writeStreamingAll(self.io, "> ");
                                 try writeSafe(self.io, stdout, txt);
@@ -897,22 +926,25 @@ const CliAdapter = struct {
                             if (comptime build_options.enable_tui) {
                                 const hdr = try tui.components.message.formatThinkingHeaderAlloc(self.allocator, self.tui_theme);
                                 defer self.allocator.free(hdr);
-                                try stdout.writeStreamingAll(self.io, hdr);
+                                try self.historyText(hdr, true);
                                 const body = try tui.components.message.formatThinkingDeltaAlloc(self.allocator, self.tui_theme, txt[0..take]);
                                 defer self.allocator.free(body);
-                                try stdout.writeStreamingAll(self.io, body);
-                                if (take < txt.len) try stdout.writeStreamingAll(self.io, " ...");
-                                try stdout.writeStreamingAll(self.io, "\n");
+                                try self.historyText(body, true);
+                                if (take < txt.len) try self.historyText(" ...", true);
+                                try self.historyText("\n", true);
                             }
                         },
                         .text => |txt| if (txt.len > 0) {
                             if (comptime build_options.enable_tui) {
                                 var lines = std.mem.splitScalar(u8, txt, '\n');
                                 while (lines.next()) |line| {
-                                    const styled = try md.styleWrappedLineAlloc(self.allocator, self.tui_theme, line, wrap_cols);
+                                    const styled = if (self.fullscreen_view != null)
+                                        try md.styleLine(self.allocator, self.tui_theme, line)
+                                    else
+                                        try md.styleWrappedLineAlloc(self.allocator, self.tui_theme, line, wrap_cols);
                                     defer self.allocator.free(styled);
-                                    try stdout.writeStreamingAll(self.io, styled);
-                                    try stdout.writeStreamingAll(self.io, "\n");
+                                    try self.historyText(styled, true);
+                                    try self.historyText("\n", true);
                                 }
                             } else {
                                 try writeSafe(self.io, stdout, txt);
@@ -924,7 +956,9 @@ const CliAdapter = struct {
                                 const arg_summary = extractToolArgSummary(call);
                                 const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
                                 defer self.allocator.free(header);
-                                try stdout.writeStreamingAll(self.io, header);
+                                if (self.fullscreen_view) |view| {
+                                    try view.appendToolHeader(header, call.id);
+                                } else try self.historyText(header, true);
                             } else {
                                 try stdout.writeStreamingAll(self.io, "[tool: ");
                                 try writeSafe(self.io, stdout, call.name);
@@ -933,7 +967,7 @@ const CliAdapter = struct {
                         },
                         else => {},
                     };
-                    try stdout.writeStreamingAll(self.io, "\n");
+                    try self.historyText("\n", true);
                 },
                 .tool_result => {
                     if (comptime build_options.enable_tui) {
@@ -948,11 +982,11 @@ const CliAdapter = struct {
                             };
                             const err_line = try tui.components.tool_card.formatEndErrorAlloc(self.allocator, self.tui_theme, first_text);
                             defer self.allocator.free(err_line);
-                            try stdout.writeStreamingAll(self.io, err_line);
+                            try self.historyText(err_line, true);
                         } else {
                             const ok_line = try tui.components.tool_card.formatEndOkAlloc(self.allocator, self.tui_theme);
                             defer self.allocator.free(ok_line);
-                            try stdout.writeStreamingAll(self.io, ok_line);
+                            try self.historyText(ok_line, true);
                         }
                     }
                 },
@@ -1145,6 +1179,12 @@ const CliAdapter = struct {
                             const arg_summary = extractToolArgSummary(call);
                             const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
                             defer self.allocator.free(header);
+                            if (self.live_writer) |writer| {
+                                if (writer.write_tool_header) |write_header| {
+                                    try write_header(writer.context, header, call.id);
+                                    return;
+                                }
+                            }
                             try self.errSegment(header, "", "");
                         } else {
                             try self.errSegment("\n[tool: ", call.name, "]\n");
