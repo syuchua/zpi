@@ -2078,28 +2078,26 @@ const LiveScreen = struct {
         cols: usize,
         delta_ms: u64,
     ) !void {
-        var status_buf: ?[]u8 = null;
-        defer if (status_buf) |s| self.allocator.free(s);
+        var loader_line: ?[]u8 = null;
+        defer if (loader_line) |line| self.allocator.free(line);
+        var footer_lines: ?[2][]u8 = null;
+        defer if (footer_lines) |lines| {
+            for (lines) |line| self.allocator.free(line);
+        };
         {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             if (delta_ms > 0) self.loader.tick(delta_ms);
             if (self.th.mode != .none) {
                 const max_cols = @max(1, cols -| 1);
-                const loader_line = try self.loader.renderLineAlloc(self.allocator, self.th, max_cols);
-                defer self.allocator.free(loader_line);
-                if (submit.status_info) |get_info| {
-                    var info = get_info(submit.context);
-                    info.queued_count = followups.len;
-                    const footer_lines = try components.chrome.Footer.renderLinesAlloc(self.allocator, self.th, info, max_cols);
-                    defer {
-                        self.allocator.free(footer_lines[0]);
-                        self.allocator.free(footer_lines[1]);
-                    }
-                    status_buf = try std.fmt.allocPrint(self.allocator, "{s}\r\n{s}\r\n{s}", .{ loader_line, footer_lines[0], footer_lines[1] });
-                } else {
-                    status_buf = try self.allocator.dupe(u8, loader_line);
-                }
+                loader_line = try self.loader.renderLineAlloc(self.allocator, self.th, max_cols);
+            }
+        }
+        if (self.th.mode != .none) {
+            if (submit.status_info) |get_info| {
+                var info = get_info(submit.context);
+                info.queued_count = followups.len;
+                footer_lines = try components.chrome.Footer.renderLinesAlloc(self.allocator, self.th, info, @max(1, cols -| 1));
             }
         }
         const rendered = try renderLiveOverlayFrameWithChrome(
@@ -2108,7 +2106,9 @@ const LiveScreen = struct {
             followups,
             cols,
             self.color,
-            status_buf,
+            self.th,
+            loader_line,
+            if (footer_lines) |*lines| lines else &.{},
         );
         defer self.allocator.free(rendered.bytes);
         try self.updateOverlay(rendered.bytes, rendered.cursor_row, cols);
@@ -2191,7 +2191,7 @@ fn renderLiveOverlayFrame(
     cols_raw: usize,
     color: bool,
 ) !LiveOverlayFrame {
-    return renderLiveOverlayFrameWithChrome(allocator, editor, followups, cols_raw, color, null);
+    return renderLiveOverlayFrameWithChrome(allocator, editor, followups, cols_raw, color, theme.Theme.init(if (color) .ansi16 else .none), null, &.{});
 }
 
 fn renderLiveOverlayFrameWithChrome(
@@ -2200,9 +2200,12 @@ fn renderLiveOverlayFrameWithChrome(
     followups: []const []const u8,
     cols_raw: usize,
     color: bool,
-    chrome_block: ?[]const u8,
+    th: theme.Theme,
+    loader_line: ?[]const u8,
+    footer_lines: []const []const u8,
 ) !LiveOverlayFrame {
-    if (followups.len == 0 and editor.buf.items.len == 0 and (chrome_block == null or chrome_block.?.len == 0)) {
+    const show_editor = loader_line != null or editor.buf.items.len > 0;
+    if (followups.len == 0 and !show_editor) {
         return .{ .bytes = try allocator.alloc(u8, 0), .cursor_row = 0 };
     }
     const cols = @max(cols_raw, 4);
@@ -2211,6 +2214,11 @@ fn renderLiveOverlayFrameWithChrome(
     errdefer out.deinit(allocator);
 
     var rows_above: usize = 0;
+    if (loader_line) |line| {
+        try out.appendSlice(allocator, line);
+        try out.appendSlice(allocator, "\r\n");
+        rows_above += 1;
+    }
     if (followups.len > 0) {
         const shown = @min(followups.len, 4);
         for (followups[0..shown], 1..) |item, idx| {
@@ -2220,10 +2228,8 @@ fn renderLiveOverlayFrameWithChrome(
             const used = try appendTreeText(&out, allocator, label, max_preview_cols);
             _ = try appendTreeText(&out, allocator, item, max_preview_cols -| used);
             if (color) try out.appendSlice(allocator, "\x1b[0m");
-            if (idx < shown or followups.len > shown or editor.buf.items.len > 0) {
-                try out.appendSlice(allocator, "\r\n");
-                rows_above += 1;
-            }
+            try out.appendSlice(allocator, "\r\n");
+            rows_above += 1;
         }
         if (followups.len > shown) {
             var more_buf: [48]u8 = undefined;
@@ -2231,60 +2237,46 @@ fn renderLiveOverlayFrameWithChrome(
             if (color) try out.appendSlice(allocator, "\x1b[2m");
             _ = try appendTreeText(&out, allocator, more, max_preview_cols);
             if (color) try out.appendSlice(allocator, "\x1b[0m");
-            if (editor.buf.items.len > 0) {
-                try out.appendSlice(allocator, "\r\n");
-                rows_above += 1;
-            }
-        }
-        if (editor.buf.items.len == 0) {
             try out.appendSlice(allocator, "\r\n");
             rows_above += 1;
+        }
+        if (editor.buf.items.len == 0) {
             if (color) try out.appendSlice(allocator, "\x1b[2m");
             _ = try appendTreeText(&out, allocator, "  Alt+Up edit queued", max_preview_cols);
             if (color) try out.appendSlice(allocator, "\x1b[0m");
-            if (chrome_block) |cb| {
-                if (cb.len > 0) {
-                    try out.appendSlice(allocator, "\r\n");
-                    rows_above += 1;
-                    try out.appendSlice(allocator, cb);
-                    rows_above += std.mem.count(u8, cb, "\n");
-                }
-            }
-            return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above };
+            if (!show_editor) return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above };
+            try out.appendSlice(allocator, "\r\n");
+            rows_above += 1;
         }
     }
 
-    if (editor.buf.items.len > 0) {
-        const rule_w = @max(@as(usize, 4), cols -| 1);
-        if (color) {
-            try out.appendSlice(allocator, "\x1b[2m");
-            var ri: usize = 0;
-            while (ri < rule_w) : (ri += 1) try out.appendSlice(allocator, "─");
-            try out.appendSlice(allocator, "\x1b[0m\r\n");
+    if (show_editor) {
+        const shell_mode = isBangMode(editor.buf.items);
+        if (th.mode != .none) {
+            _ = try EditorState.appendRuleLine(&out, allocator, th, cols, shell_mode);
+            try out.appendSlice(allocator, "\r\n");
             rows_above += 1;
         }
-        try out.appendSlice(allocator, if (color) "\x1b[36m>\x1b[0m " else "> ");
+        if (shell_mode) {
+            try th.paint(&out, allocator, theme.Theme.tool_ok, "! ");
+        } else {
+            try out.appendSlice(allocator, if (color) "\x1b[36m>\x1b[0m " else "> ");
+        }
         const layout = computeLayout(editor.buf.items, editor.cursor, cols, 2);
         try appendSafeTerminalBytes(&out, allocator, editor.buf.items);
         var bottom_row = layout.end_row;
         var bottom_col = layout.end_col;
-        if (color) {
-            try out.appendSlice(allocator, "\r\n\x1b[2m");
-            var ri: usize = 0;
-            while (ri < rule_w) : (ri += 1) try out.appendSlice(allocator, "─");
-            try out.appendSlice(allocator, "\x1b[0m");
+        if (th.mode != .none) {
+            try out.appendSlice(allocator, "\r\n");
+            bottom_col = try EditorState.appendRuleLine(&out, allocator, th, cols, shell_mode);
             bottom_row += 1;
-            bottom_col = rule_w;
         }
-        if (chrome_block) |cb| {
-            if (cb.len > 0) {
-                try out.appendSlice(allocator, "\r\n");
-                try out.appendSlice(allocator, cb);
-                bottom_row += 1 + std.mem.count(u8, cb, "\n");
-                const last_nl = std.mem.lastIndexOfScalar(u8, cb, '\n');
-                const last_line = if (last_nl) |idx| cb[idx + 1 ..] else cb;
-                bottom_col = terminal.visibleWidth(last_line);
-            }
+        for (footer_lines) |line| {
+            if (line.len == 0) continue;
+            try out.appendSlice(allocator, "\r\n");
+            try out.appendSlice(allocator, line);
+            bottom_row += 1;
+            bottom_col = terminal.visibleWidth(line);
         }
         if (bottom_row > layout.cursor_row) {
             try out.print(allocator, "\x1b[{d}A", .{bottom_row - layout.cursor_row});
@@ -2296,12 +2288,6 @@ fn renderLiveOverlayFrameWithChrome(
         return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = rows_above + layout.cursor_row };
     }
 
-    if (chrome_block) |cb| {
-        if (cb.len > 0) {
-            try out.appendSlice(allocator, cb);
-            return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = std.mem.count(u8, cb, "\n") };
-        }
-    }
     return .{ .bytes = try out.toOwnedSlice(allocator), .cursor_row = 0 };
 }
 
@@ -2393,6 +2379,8 @@ fn runTurnWithLiveEditor(
             state.done.trigger();
         }
     };
+    errdefer screen.clearOverlay() catch {};
+    try screen.loaderTickAndRender(&editor, followups.items, submit, cols, 0);
     var worker = WorkerState{ .submit = submit, .text = text, .done = &done };
     var thread = try std.Thread.spawn(.{}, WorkerState.run, .{&worker});
     var joined = false;
@@ -2402,7 +2390,7 @@ fn runTurnWithLiveEditor(
     };
 
     var in_paste = false;
-    var dirty = followups.items.len > 0 or editor.buf.items.len > 0;
+    var dirty = false;
     const wake = done.cancel();
     var last_tick_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
 
@@ -2798,4 +2786,15 @@ test "renderLiveOverlayFrame clips queued previews and tracks multiline draft cu
     defer a.free(with_rules.bytes);
     try std.testing.expect(std.mem.indexOf(u8, with_rules.bytes, "───────────────────") != null);
     try std.testing.expectEqual(@as(usize, 2), with_rules.cursor_row);
+
+    try editor.replaceBuffer("");
+    const loader = "Working...";
+    const status = [_][]const u8{ "cwd/status", "provider/model" };
+    const busy = try renderLiveOverlayFrameWithChrome(a, &editor, &.{}, 20, true, theme.Theme.init(.ansi16), loader, &status);
+    defer a.free(busy.bytes);
+    try std.testing.expect(std.mem.indexOf(u8, busy.bytes, "Working...\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, busy.bytes, "\x1b[36m>\x1b[0m ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, busy.bytes, "cwd/status\r\nprovider/model") != null);
+    try std.testing.expectEqual(@as(usize, 2), busy.cursor_row);
+    try std.testing.expect(std.mem.endsWith(u8, busy.bytes, "\x1b[3A\r\x1b[2C"));
 }

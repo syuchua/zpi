@@ -1419,7 +1419,11 @@ def terminal_editor_check(common, environment, root):
     def read_prompt(start=0):
         deadline = time.monotonic() + 10
         while True:
-            for marker in (b'>\x1b[0m ', b'> '):
+            marker = b'\x1b[36m>\x1b[0m '
+            pos = transcript.find(marker, start)
+            if pos != -1:
+                return pos + len(marker)
+            for marker in (b'\r\n> ', b'\n> '):
                 pos = transcript.find(marker, start)
                 if pos != -1:
                     return pos + len(marker)
@@ -1469,6 +1473,11 @@ def terminal_editor_check(common, environment, root):
         snippet = transcript[mark:p]
         assert b'[tool: edit]' in snippet and b'preview.txt' in snippet, snippet
         assert b'-2 beta' not in snippet and b'+2 BETA' not in snippet, snippet
+        # `read_prompt` can match the newly persistent editor while the model
+        # is still busy. Wait until the live turn disables bracketed paste and
+        # the normal idle prompt is restored before testing Ctrl-D exit.
+        turn_end = read_until(b'\x1b[?2004l', p)
+        p = read_prompt(turn_end)
 
         # 7. Ctrl-D on empty line exits cleanly with status 0 and restored termios
         os.write(master, b'\x04')
@@ -1942,7 +1951,8 @@ def check_tree_navigation(root, environment, server):
         summary = json.loads(added[0])
         assert (summary['type'], summary['parent_id'], summary['from_id']) == ('branch_summary', '4', '9'), summary
         assert server.tree_summary_requests == 3
-        command(b'tree-live', b'tree-live complete')
+        live_end = command(b'tree-live', b'tree-live complete')
+        expect(b'\x1b[?2004l', live_end)
         os.write(master, b'/exit\n')
         assert process.wait(timeout=5) == 0, bytes(transcript)
         term_after = termios.tcgetattr(slave)
@@ -2018,6 +2028,12 @@ def check_queued_followup_editing(root, environment, server):
         end = expect(b'working...', start)
         panel = transcript[start:end]
         assert b'\x1b[44m> queue-slow' in panel or b'\x1b[48;2;25;43;61m> queue-slow' in panel, transcript[start:]
+
+        # The busy screen keeps an empty editor and the live footer visible.
+        busy = end
+        expect(prompt_marker := b'\x1b[36m>\x1b[0m ', busy)
+        expect(b'queue-fixture/queue-model', busy)
+        assert ('─' * 16).encode() in transcript[busy:], transcript[busy:]
 
         # 2. Type a live draft while streaming; mid-stream output preserves the draft cleanly.
         prompt_marker = b'\x1b[36m>\x1b[0m '

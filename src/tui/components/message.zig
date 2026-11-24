@@ -4,7 +4,8 @@ const terminal = @import("../terminal.zig");
 const theme = @import("../theme.zig");
 
 /// Render a user message in a full-width semantic panel that wraps to the
-/// available terminal width. The returned rows include the prompt badge.
+/// available terminal width. Colored panels include bottom padding and a line
+/// break. The caller terminates the message, leaving a blank line after it.
 pub fn formatUserEchoAlloc(allocator: std.mem.Allocator, th: theme.Theme, text: []const u8, terminal_cols: usize) ![]u8 {
     const safe = try terminal.safeUtf8Alloc(allocator, text);
     defer allocator.free(safe);
@@ -34,6 +35,12 @@ pub fn formatUserEchoAlloc(allocator: std.mem.Allocator, th: theme.Theme, text: 
         try th.appendClose(&out, allocator);
         first = false;
     }
+    // Pad the bottom of the panel, then leave space for a plain spacer row.
+    try out.append(allocator, '\n');
+    try th.appendOpen(&out, allocator, theme.Theme.user_panel);
+    try out.appendNTimes(allocator, ' ', width);
+    try th.appendClose(&out, allocator);
+    try out.append(allocator, '\n');
     return out.toOwnedSlice(allocator);
 }
 
@@ -59,16 +66,22 @@ test "user panel wraps to terminal cells and closes its background on every row"
     for ([_]usize{ 9, 40, 80 }) |cols| {
         const user = try formatUserEchoAlloc(allocator, theme.Theme.init(.truecolor), "较长的输入\twrap\nsecond", cols);
         defer allocator.free(user);
-        var rows = std.mem.splitScalar(u8, user, '\n');
+        const background = "\x1b[48;2;25;43;61m";
+        const reset = "\x1b[0m";
+        try std.testing.expect(std.mem.endsWith(u8, user, "\n"));
+        var rows = std.mem.splitScalar(u8, user[0 .. user.len - 1], '\n');
+        var last: []const u8 = "";
         var count: usize = 0;
         while (rows.next()) |row| {
-            try std.testing.expectEqual(@max(@as(usize, 1), cols -| 1), terminal.visibleWidth(row));
-            try std.testing.expect(std.mem.startsWith(u8, row, "\x1b[48;2;25;43;61m"));
-            try std.testing.expect(std.mem.endsWith(u8, row, "\x1b[0m"));
+            try std.testing.expectEqual(cols - 1, terminal.visibleWidth(row));
+            try std.testing.expect(std.mem.startsWith(u8, row, background));
+            try std.testing.expect(std.mem.endsWith(u8, row, reset));
             try std.testing.expect(std.mem.indexOfScalar(u8, row, '\t') == null);
+            last = row;
             count += 1;
         }
-        try std.testing.expect(count >= 2);
+        try std.testing.expect(count >= 3);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, last[background.len .. last.len - reset.len], " ").len);
     }
 }
 
