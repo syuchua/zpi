@@ -2347,32 +2347,30 @@ const LiveScreen = struct {
         cols: usize,
         delta_ms: u64,
     ) !void {
-        var loader_line: ?[]u8 = null;
-        defer if (loader_line) |line| self.allocator.free(line);
+        const max_cols = @max(1, cols -| 1);
+        const loader_line = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (delta_ms > 0) self.loader.tick(delta_ms);
+            break :blk try self.loader.renderLineAlloc(self.allocator, self.th, max_cols);
+        };
+        defer self.allocator.free(loader_line);
+
         var footer_lines: ?[2][]u8 = null;
         defer if (footer_lines) |lines| {
             for (lines) |line| self.allocator.free(line);
         };
-        {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            if (delta_ms > 0) self.loader.tick(delta_ms);
-            if (self.th.mode != .none) {
-                const max_cols = @max(1, cols -| 1);
-                loader_line = try self.loader.renderLineAlloc(self.allocator, self.th, max_cols);
-            }
-        }
         if (self.th.mode != .none) {
             if (submit.status_info) |get_info| {
                 var info = get_info(submit.context);
                 info.queued_count = followups.len;
-                footer_lines = try components.chrome.Footer.renderLinesAlloc(self.allocator, self.th, info, @max(1, cols -| 1));
+                footer_lines = try components.chrome.Footer.renderLinesAlloc(self.allocator, self.th, info, max_cols);
             }
         }
         if (self.conversation_view) |view| {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            try renderFullscreenConversation(self.allocator, self.io, self.output, view, editor, loader_line orelse "", &.{}, &.{}, if (footer_lines) |*lines| lines else &.{}, followups, self.th);
+            try renderFullscreenConversation(self.allocator, self.io, self.output, view, editor, loader_line, &.{}, &.{}, if (footer_lines) |*lines| lines else &.{}, followups, self.th);
             return;
         }
         const rendered = try renderLiveOverlayFrameWithChrome(
@@ -3081,4 +3079,9 @@ test "renderLiveOverlayFrame clips queued previews and tracks multiline draft cu
     try std.testing.expect(std.mem.indexOf(u8, busy.bytes, "cwd/status\r\nprovider/model") != null);
     try std.testing.expectEqual(@as(usize, 2), busy.cursor_row);
     try std.testing.expect(std.mem.endsWith(u8, busy.bytes, "\x1b[3A\r\x1b[2C"));
+
+    const plain = try renderLiveOverlayFrameWithChrome(a, &editor, &.{}, 20, false, theme.Theme.init(.none), loader, &.{});
+    defer a.free(plain.bytes);
+    try std.testing.expectEqualStrings("Working...\r\n> ", plain.bytes);
+    try std.testing.expectEqual(@as(usize, 1), plain.cursor_row);
 }

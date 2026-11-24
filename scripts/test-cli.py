@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -509,6 +510,16 @@ class Handler(BaseHTTPRequestHandler):
                 messages = request['messages']
                 user_msg = [m['content'] for m in messages if m['role'] == 'user'][-1]
                 results = [m for m in messages if m['role'] == 'tool']
+                if user_msg == 'plain-busy':
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.end_headers()
+                    self.wfile.write(('data: ' + json.dumps({'choices': [{'index': 0, 'delta': {'content': 'plain partial\n'}}]}) + '\n\n').encode())
+                    self.wfile.flush()
+                    assert self.server.plain_busy_release.wait(timeout=10)
+                    self.wfile.write(('data: ' + json.dumps({'choices': [{'index': 0, 'delta': {'content': 'plain complete'}, 'finish_reason': 'stop'}]}) + '\n\n').encode())
+                    self.wfile.write(b'data: [DONE]\n\n')
+                    return
                 if user_msg == 'verify shell context':
                     users = [m['content'] for m in messages if m['role'] == 'user']
                     assert sum('Exit outcome and output:\nSHELL_CONTEXT_MARKER' in text for text in users) == 1, users
@@ -2359,26 +2370,42 @@ def check_tui_components(root, environment, server):
     # 3. Verify NO_COLOR suppresses ANSI styling in interactive mode.
     (comp_dir / 'comp.txt').write_text('line1\nold\nline3\n')
     no_color_env = dict(env, NO_COLOR='1')
+    server.plain_busy_release = threading.Event()
     master2, slave2 = pty.openpty()
     proc2 = subprocess.Popen(args, cwd=comp_dir, env=no_color_env, stdin=slave2, stdout=slave2, stderr=slave2, close_fds=True)
     os.close(slave2)
     t2 = bytearray()
+
+    def expect_plain(marker, start=0):
+        deadline = time.monotonic() + 5
+        while t2.find(marker, start) == -1:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, ('NO_COLOR PTY timed out', marker, bytes(t2[start:]))
+            if select.select([master2], [], [], remaining)[0]:
+                chunk = os.read(master2, 16384)
+                assert chunk, bytes(t2)
+                t2.extend(chunk)
+        return t2.index(marker, start) + len(marker)
+
     try:
-        deadline = time.monotonic() + 10
-        while b'comp-fixture/comp-model' not in t2 and b'> ' not in t2:
-            if select.select([master2], [], [], 0.2)[0]:
-                t2.extend(os.read(master2, 16384))
-            assert time.monotonic() < deadline, bytes(t2)
+        expect_plain(b'\x1b[?2004h')
+        mark = len(t2)
+        os.write(master2, b'plain-busy\n')
+        partial_end = expect_plain(b'plain partial', mark)
+        expect_plain(b'\n> ', partial_end)
+        server.plain_busy_release.set()
+        done = expect_plain(b'plain complete', partial_end)
+        expect_plain(b'\x1b[?2004h', done)
+
         mark = len(t2)
         os.write(master2, b'update comp\n')
-        while b'const ok = true;' not in t2[mark:]:
-            if select.select([master2], [], [], 0.2)[0]:
-                t2.extend(os.read(master2, 16384))
-            assert time.monotonic() < deadline, bytes(t2)
-        assert b'\x1b[38;' not in t2[mark:] and b'\x1b[32m' not in t2[mark:] and b'\x1b[36m' not in t2, bytes(t2)
+        done = expect_plain(b'const ok = true;', mark)
+        expect_plain(b'\x1b[?2004h', done)
+        assert re.search(rb'\x1b\[[0-9;]*m', t2) is None, bytes(t2)
         os.write(master2, b'/exit\n')
         assert proc2.wait(timeout=5) == 0
     finally:
+        server.plain_busy_release.set()
         if proc2.poll() is None:
             proc2.kill()
             proc2.wait(timeout=5)
