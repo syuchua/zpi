@@ -14,6 +14,8 @@ pub const help_lines = [_][]const u8{
     "Enter a task to stream a response and run tools. /exit leaves.",
     "Use --session PATH to reopen; --branch ENTRY-ID switches branches.",
     "Tab completes /commands and @paths; Up/Down history; Alt+Enter newline.",
+    "Fullscreen: Ctrl-F or Esc on an empty prompt searches (/search);",
+    "Ctrl-P/Ctrl-N or Alt+Up/Alt+Down jump between your messages.",
 };
 
 pub const hotkeys_lines = [_][]const u8{
@@ -22,13 +24,15 @@ pub const hotkeys_lines = [_][]const u8{
     "Ctrl-D      Exit on empty line / delete char",
     "Ctrl-O      Toggle compact/expanded thinking and tool output",
     "Ctrl-S      Steer active turn mid-execution (while busy)",
+    "Ctrl-F      Search transcript (/search, or Esc on empty prompt)",
+    "Ctrl-P/N    Previous/next user message (Alt+Up/Alt+Down)",
     "Up/Down     Navigate history or lines",
     "Left/Right  Move cursor (Ctrl-A/E home/end, Ctrl-W/U/K delete)",
     "Tab         Complete /command or @path",
     "Shift+Tab   Cycle thinking level (off -> minimal -> ... -> max)",
     "Alt+Enter   Insert newline (or trailing \\)",
     "Alt+Up      Edit queued follow-up messages",
-    "Esc         Clear draft while busy / dismiss overlay",
+    "Esc         Clear draft / dismiss overlay / open search when empty",
     "/model      Fuzzy model picker (/model [ref] | --list)",
     "/thinking   Set thinking level (/thinking [level])",
     "/tree       Branch picker (/ filter, p prefill, s summary, Enter)",

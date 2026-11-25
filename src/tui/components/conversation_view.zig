@@ -1,6 +1,7 @@
 //! Bounded transcript and stable scroll anchor for the fullscreen TUI.
 const std = @import("std");
 const terminal = @import("../terminal.zig");
+const search = @import("search.zig");
 
 pub const ConversationView = struct {
     allocator: std.mem.Allocator,
@@ -14,6 +15,13 @@ pub const ConversationView = struct {
     frame_size: std.posix.winsize = std.mem.zeroes(std.posix.winsize),
     first: usize = 0,
     pinned_users: std.Deque(PinnedUser) = .empty,
+    // Absolute row of every user message in the ring, oldest first.
+    user_rows: std.Deque(usize) = .empty,
+    // User message last navigated/displayed by prompt navigation; keeps
+    // forward navigation walking message by message even on a short page.
+    user_nav_row: ?usize = null,
+    // Absolute row of the focused search match, when it is visible.
+    search_hit_row: ?usize = null,
     pending: std.ArrayList(u8) = .empty,
     pending_clipped: bool = false,
     expanded_tools: std.StringHashMapUnmanaged(bool) = .empty,
@@ -47,7 +55,7 @@ pub const ConversationView = struct {
         }
     };
 
-    const max_lines = 8192;
+    pub const max_lines = 8192;
     const max_line_bytes = 8192;
 
     pub fn init(allocator: std.mem.Allocator) ConversationView {
@@ -61,6 +69,7 @@ pub const ConversationView = struct {
         self.hit_rows.deinit(self.allocator);
         self.expanded_tools.deinit(self.allocator);
         self.pinned_users.deinit(self.allocator);
+        self.user_rows.deinit(self.allocator);
     }
 
     pub fn clear(self: *ConversationView) void {
@@ -75,10 +84,13 @@ pub const ConversationView = struct {
         self.first_id = 0;
         self.tool_layout_end = 0;
         self.anchor = null;
+        self.search_hit_row = null;
+        self.user_nav_row = null;
         self.pending.clearRetainingCapacity();
         self.pending_clipped = false;
         self.clearToolOverrides();
         while (self.pinned_users.popFront()) |user| self.allocator.free(user.text);
+        while (self.user_rows.popFront()) |_| {}
     }
 
     fn recordPinnedUser(self: *ConversationView, text: []const u8, row: usize) !void {
@@ -205,6 +217,16 @@ pub const ConversationView = struct {
                 if (user.row >= self.first_id) break;
                 self.allocator.free(self.pinned_users.popFront().?.text);
             }
+            while (self.user_rows.front()) |row| {
+                if (row >= self.first_id) break;
+                _ = self.user_rows.popFront();
+            }
+            if (self.search_hit_row) |row| {
+                if (row < self.first_id) self.search_hit_row = null;
+            }
+            if (self.user_nav_row) |row| {
+                if (row < self.first_id) self.user_nav_row = null;
+            }
         } else try self.lines.append(self.allocator, line);
     }
 
@@ -225,7 +247,10 @@ pub const ConversationView = struct {
         const row = self.end() + content_row;
         try self.appendText(panel);
         if (self.pending.items.len > 0) try self.flush();
-        if (row >= self.first_id and row < self.end()) try self.recordPinnedUser(text, row);
+        if (row >= self.first_id and row < self.end()) {
+            try self.recordPinnedUser(text, row);
+            try self.user_rows.pushBack(self.allocator, row);
+        }
     }
 
     /// The caller supplies display text and any trusted renderer SGR sequences.
@@ -255,6 +280,7 @@ pub const ConversationView = struct {
 
     pub fn followLatest(self: *ConversationView) void {
         self.anchor = null;
+        self.user_nav_row = null;
     }
 
     /// Keep the last user message until it falls beyond the page's newer edge.
@@ -276,7 +302,123 @@ pub const ConversationView = struct {
     pub fn jumpToUserRow(self: *ConversationView, row: usize) void {
         if (row < self.first_id or row >= self.end()) return;
         // The exclusive end includes the message's first text row even in a short pane.
-        self.anchor = row + 1;
+        // When the target already ends the page, step one row further back so
+        // repeated jumps to the same message still move the viewport.
+        self.anchor = if (row + 1 == self.pageEnd() and row > self.first_id) row else row + 1;
+    }
+
+    /// Absolute row of the newest user message strictly older than `before`.
+    /// Returns null when every user message starts at or after `before`.
+    pub fn userRowBefore(self: *const ConversationView, before: usize) ?usize {
+        if (self.user_rows.len == 0) return null;
+        var first: usize = 0;
+        var limit = self.user_rows.len;
+        while (first < limit) {
+            const mid = first + (limit - first) / 2;
+            if (self.user_rows.at(mid) < before) first = mid + 1 else limit = mid;
+        }
+        return if (first > 0) self.user_rows.at(first - 1) else null;
+    }
+
+    /// Absolute row of the oldest user message at or after `after`, if any.
+    pub fn userRowAtOrAfter(self: *const ConversationView, after: usize) ?usize {
+        if (self.user_rows.len == 0) return null;
+        var first: usize = 0;
+        var limit = self.user_rows.len;
+        while (first < limit) {
+            const mid = first + (limit - first) / 2;
+            if (self.user_rows.at(mid) < after) first = mid + 1 else limit = mid;
+        }
+        return if (first < self.user_rows.len) self.user_rows.at(first) else null;
+    }
+
+    /// Jump to the previous user message; false when none is reachable.
+    /// A null anchor means the page is following the live tail, so the newest
+    /// message is the first stop.
+    pub fn jumpToPreviousUserMessage(self: *ConversationView) bool {
+        const page = self.pageEnd();
+        const reference = if (self.anchor != null) @min(self.user_nav_row orelse page, page) else page;
+        const target = self.userRowBefore(reference) orelse return false;
+        self.user_nav_row = target;
+        self.jumpToUserRow(target);
+        return true;
+    }
+
+    /// Jump to the next user message; false only when already following the
+    /// newest message. The newest reachable message resumes following.
+    pub fn jumpToNextUserMessage(self: *ConversationView) bool {
+        if (self.user_rows.len == 0) return false;
+        const newest = self.user_rows.at(self.user_rows.len - 1);
+        if (self.anchor == null) return false;
+        const current = self.user_nav_row orelse {
+            // Page moved by scrolling/clicking rather than prompt navigation:
+            // resume the next message after the page end.
+            const target = self.userRowAtOrAfter(self.pageEnd()) orelse {
+                self.followLatest();
+                return true;
+            };
+            self.user_nav_row = target;
+            if (target == newest) {
+                self.followLatest();
+                return true;
+            }
+            self.jumpToUserRow(target);
+            return true;
+        };
+        const target = self.userRowAtOrAfter(current + 1) orelse {
+            self.followLatest();
+            return true;
+        };
+        if (target == newest) {
+            self.followLatest();
+            return true;
+        }
+        self.user_nav_row = target;
+        self.jumpToUserRow(target);
+        return true;
+    }
+
+    /// Searchable rows are exactly the rows `renderFullscreenConversation` can
+    /// draw for the page at the current width: folded tool bodies and their
+    /// hidden hints are skipped, individually expanded bodies are included.
+    pub fn isRowVisible(self: *const ConversationView, id: usize) bool {
+        return self.lineAt(id) != null;
+    }
+
+    /// Collect absolute rows whose visible text contains `query`. Results are
+    /// ascending and bounded by `search.SearchState.max_matches`.
+    pub fn collectMatches(self: *const ConversationView, query: []const u8, out: *std.ArrayList(usize)) !void {
+        out.clearRetainingCapacity();
+        if (query.len == 0) return;
+        var id = self.first_id;
+        while (id < self.end() and out.items.len < search.SearchState.max_matches) : (id += 1) {
+            const text = self.lineAt(id) orelse continue;
+            if (search.findBytes(text, query) != null) try out.append(self.allocator, id);
+        }
+    }
+
+    /// Focus a search row: reveal it and mark it so the renderer can highlight
+    /// the focused match. Returns false when the row is no longer retained.
+    /// Matches already inside the tail viewport keep following so streaming
+    /// output does not move the viewport away from them.
+    pub fn jumpToSearchRow(self: *ConversationView, row: usize) bool {
+        if (row < self.first_id or row >= self.end()) {
+            if (self.search_hit_row == row) self.search_hit_row = null;
+            return false;
+        }
+        self.search_hit_row = row;
+        // Exclusive end is row + 1, so the matched row is the last page row.
+        self.anchor = @min(row + 1, self.end());
+        // Measure the tail viewport from the live end, not from the new anchor,
+        // and keep following when the match is already visible there.
+        var visible: usize = 0;
+        var id = self.end();
+        while (id > self.first_id and visible < self.body_height) {
+            id -= 1;
+            if (self.lineAt(id) != null) visible += 1;
+        }
+        if (id <= row) self.followLatest();
+        return true;
     }
 
     pub fn end(self: *const ConversationView) usize {
@@ -465,4 +607,107 @@ test "paused page survives streamed lines and End resumes following" {
     try std.testing.expect(view.handleScrollKey('F', ""));
     try std.testing.expect(view.isFollowing());
     try std.testing.expectEqualStrings("sixth", view.lineAt(view.end() - 1).?);
+}
+
+test "search covers visible rows only and keeps absolute row IDs stable" {
+    var view = ConversationView.init(std.testing.allocator);
+    defer view.deinit();
+    try view.appendUserMessage("alpha request", "> alpha request\n", 0);
+    try view.appendToolText("Input · [tool: read]", "call-1");
+    // Two rows show as the compact preview; the rest are hidden while folded.
+    try view.appendToolBody("preview one\npreview two\nalpha folded line\n", "call-1");
+    try view.layoutTools(80);
+    try view.appendToolText("╰─ ok", "call-1");
+    try view.appendText("alpha final answer\n");
+
+    var matches: std.ArrayList(usize) = .empty;
+    defer matches.deinit(view.allocator);
+
+    // Folded tool body rows are not visible, so their "alpha" is not found.
+    try view.collectMatches("alpha", &matches);
+    try std.testing.expectEqualSlices(usize, &.{ 0, view.end() - 1 }, matches.items);
+
+    // Expanded bodies become searchable without changing other row IDs.
+    view.setToolsExpanded(true);
+    try view.collectMatches("alpha", &matches);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 5, view.end() - 1 }, matches.items);
+
+    // ASCII case-insensitive; empty query finds nothing.
+    try view.collectMatches("ALPHA", &matches);
+    try std.testing.expectEqual(@as(usize, 3), matches.items.len);
+    try view.collectMatches("", &matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.items.len);
+
+    // A match never spans a logical line boundary.
+    try view.collectMatches("answer\n", &matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.items.len);
+    try view.collectMatches("answer >", &matches);
+    try std.testing.expectEqual(@as(usize, 0), matches.items.len);
+
+    // Row IDs survive appended output and resize-driven relayout.
+    try view.collectMatches("alpha final", &matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.items.len);
+    const target = matches.items[0];
+    try view.appendText("more streamed output\n");
+    try view.layoutTools(24);
+    try std.testing.expect(view.jumpToSearchRow(target));
+    try std.testing.expectEqual(target + 1, view.pageEnd());
+    try std.testing.expectEqual(@as(?usize, target), view.search_hit_row);
+}
+
+test "prompt navigation walks marked user messages in both directions" {
+    var view = ConversationView.init(std.testing.allocator);
+    defer view.deinit();
+    try view.appendUserMessage("one", "> one\n", 0);
+    try view.appendText("reply one\nreply two\n");
+    try view.appendUserMessage("two", "> two\n", 0);
+    try view.appendText("reply three\n");
+    try view.appendUserMessage("three", "> three\n", 0);
+    try view.appendText("reply four\nreply five\npartial");
+    view.body_height = 2;
+
+    // Newest message is first, then progressively older ones.
+    try std.testing.expect(view.jumpToPreviousUserMessage());
+    try std.testing.expectEqualStrings("> three", view.lineAt(view.pageEnd() - 1).?);
+    try std.testing.expect(view.jumpToPreviousUserMessage());
+    try std.testing.expectEqualStrings("> two", view.lineAt(view.pageEnd() - 1).?);
+    try std.testing.expect(view.jumpToPreviousUserMessage());
+    try std.testing.expectEqualStrings("> one", view.lineAt(view.pageEnd() - 1).?);
+    // No older message: the page stays put.
+    try std.testing.expect(!view.jumpToPreviousUserMessage());
+    try std.testing.expectEqualStrings("> one", view.lineAt(view.pageEnd() - 1).?);
+
+    // Forward navigation mirrors the backward walk, and reaching the newest
+    // message resumes following so live output stays visible.
+    try std.testing.expect(view.jumpToNextUserMessage());
+    try std.testing.expectEqualStrings("> two", view.lineAt(view.pageEnd() - 1).?);
+    try std.testing.expect(!view.isFollowing());
+    try std.testing.expect(view.jumpToNextUserMessage());
+    try std.testing.expect(view.isFollowing());
+    try std.testing.expectEqualStrings("partial", view.pending.items);
+    // Following the newest message leaves no forward target.
+    try std.testing.expect(!view.jumpToNextUserMessage());
+
+    // Evicted user rows are forgotten so navigation never targets a dead row.
+    for (0..ConversationView.max_lines) |_| try view.appendText("\n");
+    try std.testing.expect(view.user_rows.len == 0);
+    try std.testing.expect(!view.jumpToPreviousUserMessage());
+    try std.testing.expectEqual(@as(?usize, null), view.userRowBefore(view.end()));
+}
+
+test "jumpToSearchRow keeps following when the match is inside the tail" {
+    var view = ConversationView.init(std.testing.allocator);
+    defer view.deinit();
+    view.body_height = 3;
+    try view.appendText("old marker\n");
+    for (0..10) |_| try view.appendText("filler\n");
+    try view.appendText("fresh marker\n");
+    try std.testing.expect(view.isFollowing());
+    try std.testing.expect(view.jumpToSearchRow(view.end() - 1));
+    try std.testing.expect(view.isFollowing());
+    try std.testing.expect(view.jumpToSearchRow(0));
+    try std.testing.expect(!view.isFollowing());
+    try std.testing.expectEqual(@as(usize, 1), view.pageEnd());
+    // An evicted window no longer accepts a stale row.
+    try std.testing.expect(!view.jumpToSearchRow(view.end() + 5));
 }

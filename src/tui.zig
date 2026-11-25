@@ -15,6 +15,7 @@ pub const components = struct {
     pub const select_list = @import("tui/components/select_list.zig");
     pub const dialog = @import("tui/components/dialog.zig");
     pub const autocomplete = @import("tui/components/autocomplete.zig");
+    pub const search = @import("tui/components/search.zig");
     pub const conversation_view = @import("tui/components/conversation_view.zig");
 };
 
@@ -23,6 +24,29 @@ const DialogKind = enum { help, hotkeys };
 fn eraseSubmittedPromptLine(io: std.Io, output: std.Io.File) !void {
     try output.writeStreamingAll(io, "\x1b[1A\r\x1b[J");
 }
+
+/// Terminal output for the prompt loop. In fullscreen mode every direct write
+/// invalidates the retained row diff first, because the renderer can no longer
+/// assume the screen still matches its last painted frame.
+const ScreenIo = struct {
+    io: std.Io,
+    file: std.Io.File,
+    painter: ?*renderer.FullscreenRenderer = null,
+
+    fn invalidate(self: ScreenIo) void {
+        if (self.painter) |painter| painter.invalidate();
+    }
+
+    fn write(self: ScreenIo, bytes: []const u8) !void {
+        self.invalidate();
+        try self.file.writeStreamingAll(self.io, bytes);
+    }
+
+    fn writeStderr(self: ScreenIo, bytes: []const u8) !void {
+        self.invalidate();
+        try std.Io.File.stderr().writeStreamingAll(self.io, bytes);
+    }
+};
 
 const InputQueue = terminal.InputQueue;
 const mouse = @import("tui/mouse.zig");
@@ -66,6 +90,7 @@ fn renderFullscreenConversation(
     allocator: std.mem.Allocator,
     io: std.Io,
     output: std.Io.File,
+    painter: *renderer.FullscreenRenderer,
     view: *ConversationView,
     editor: *const EditorState,
     loader: []const u8,
@@ -74,6 +99,8 @@ fn renderFullscreenConversation(
     footer: []const []const u8,
     queued: []const []const u8,
     th: theme.Theme,
+    search_line: ?[]const u8,
+    search_query: ?[]const u8,
 ) !void {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
@@ -85,20 +112,23 @@ fn renderFullscreenConversation(
     const header_rows: usize = if (rows >= 6 and pinned_user != null) 3 else @intFromBool(rows >= 3);
     // Reserve the editor and a transcript row before budgeting optional chrome.
     const chrome_budget = rows -| (header_rows + 2);
-    const jump_latest_rows: usize = @intFromBool(!view.isFollowing() and chrome_budget > 0 and popup.len == 0 and width > 0 and dialog.len == 0);
-    const chrome_rows = @min(footer.len, chrome_budget - jump_latest_rows);
-    const extra_rows = chrome_budget - jump_latest_rows - chrome_rows;
+    // Search and Jump to latest share a row below the transcript.
+    const search_rows: usize = @intFromBool(search_line != null and chrome_budget > 0 and width > 0 and dialog.len == 0);
+    const jump_latest_rows: usize = @intFromBool(search_rows == 0 and !view.isFollowing() and chrome_budget > 0 and popup.len == 0 and width > 0 and dialog.len == 0);
+    const chrome_rows = @min(footer.len, chrome_budget - (if (jump_latest_rows > 0 or search_rows > 0) @as(usize, 1) else 0));
+    const reserved_below_body: usize = @intFromBool(jump_latest_rows > 0 or search_rows > 0);
+    const extra_rows = chrome_budget - reserved_below_body - chrome_rows;
     const loader_rows: usize = @intFromBool(rows >= 5 and extra_rows > 0);
-    const rule_rows: usize = if (rows >= 9 and width >= 4 and chrome_budget - chrome_rows >= 5) 2 else 0;
+    const rule_rows: usize = if (rows >= 9 and width >= 4 and extra_rows >= 4) 2 else 0;
     const popup_budget = extra_rows - loader_rows - rule_rows;
     const popup_rows = @min(popup.len, popup_budget / 2);
     const queued_rows = @min(@min(queued.len, 4), popup_budget - popup_rows);
-    const body_rows = rows -| (1 + header_rows + chrome_rows + loader_rows + popup_rows + queued_rows + rule_rows + jump_latest_rows);
+    const body_rows = rows -| (1 + header_rows + chrome_rows + loader_rows + popup_rows + queued_rows + rule_rows + reserved_below_body);
     view.body_height = @max(1, body_rows);
     view.frame_size = size;
     view.pinned_hit_row = if (pinned_user) |user| user.row else null;
     view.pinned_header_rows = if (dialog.len == 0 and width > 0 and pinned_user != null) header_rows else 0;
-    view.jump_latest_row = if (dialog.len == 0 and jump_latest_rows > 0 and width > 0) header_rows + body_rows + loader_rows + 1 else 0;
+    view.jump_latest_row = if (dialog.len == 0 and jump_latest_rows > 0 and width > 0) header_rows + body_rows + 1 else 0;
     try view.layoutTools(width);
     // Popup rows sit above the editor and its optional separator. Mouse rows are 1-based.
     view.popup_row = rows - chrome_rows - popup_rows - rule_rows;
@@ -106,23 +136,28 @@ fn renderFullscreenConversation(
     try view.hit_rows.resize(allocator, rows);
     @memset(view.hit_rows.items, null);
 
-    var frame: std.ArrayList(u8) = .empty;
-    try frame.appendSlice(a, renderer.sync_begin ++ "\x1b[H\x1b[J");
+    // Retained rows: one clipped row per terminal row. Blank rows are empty so an
+    // unchanged blank line costs nothing to repaint.
+    var rows_out: std.ArrayList([]const u8) = .empty;
+    try rows_out.ensureTotalCapacity(a, rows);
     if (header_rows > 0) {
         if (pinned_user) |pinned| {
             var header: std.ArrayList(u8) = .empty;
             if (width >= 2) try header.appendSlice(a, "> ");
             _ = try terminal.appendClippedText(&header, a, pinned.text, width -| 2);
-            if (header_rows == 3) try appendPinnedUserRow(&frame, a, th, "", width);
-            try appendPinnedUserRow(&frame, a, th, header.items, width);
-            if (header_rows == 3) try appendPinnedUserRow(&frame, a, th, "", width);
-        } else try appendFullscreenRow(&frame, a, "Conversation · PgUp / PgDn / End", width);
+            if (header_rows == 3) try appendPinnedUserRow(&rows_out, a, th, "", width);
+            try appendPinnedUserRow(&rows_out, a, th, header.items, width);
+            if (header_rows == 3) try appendPinnedUserRow(&rows_out, a, th, "", width);
+        } else try appendFullscreenRow(&rows_out, a, "Conversation · PgUp / PgDn / End", width);
     }
 
     var body: std.ArrayList(struct { text: []const u8, id: ?usize, kind: ?ConversationView.ToolRowKind = null }) = .empty;
     if (dialog.len > 0) {
-        for (dialog[0..@min(dialog.len, body_rows)]) |line| try appendFullscreenRow(&frame, a, line, width);
-        try frame.appendNTimes(a, '\n', body_rows -| dialog.len);
+        // A dialog taller than the body is clipped; the padding range must use
+        // the clamped count or it would underflow/overflow the row budget.
+        const shown_dialog_rows = @min(dialog.len, body_rows);
+        for (dialog[0..shown_dialog_rows]) |line| try appendFullscreenRow(&rows_out, a, line, width);
+        for (shown_dialog_rows..body_rows) |_| try rows_out.append(a, "");
     } else {
         // Collect from the end so wrapping a long line cannot hide the newest output.
         var id = view.pageEnd();
@@ -148,12 +183,15 @@ fn renderFullscreenConversation(
             var lines = std.mem.splitBackwardsScalar(u8, wrapped, '\n');
             while (body.items.len < body_rows) {
                 const wrapped_line = lines.next() orelse break;
-                const rendered = if (row_limit != null and width >= 3) blk: {
+                var rendered = if (row_limit != null and width >= 3) blk: {
                     var tool_line: std.ArrayList(u8) = .empty;
                     try th.paint(&tool_line, a, theme.Theme.border, "│ ");
                     try tool_line.appendSlice(a, wrapped_line);
                     break :blk tool_line.items;
                 } else wrapped_line;
+                if (search_query) |query| if (query.len > 0 and line_id != null) {
+                    if (view.search_hit_row == line_id.?) rendered = try components.search.highlightAlloc(a, th, rendered, query);
+                };
                 try body.append(a, .{ .text = rendered, .id = line_id, .kind = tool_kind });
             }
         }
@@ -164,27 +202,29 @@ fn renderFullscreenConversation(
             const row = header_rows + body.items.len - 1 - index;
             view.hit_rows.items[row] = line.id;
             if (line.kind) |kind| {
-                try appendToolPanelRow(&frame, a, th, line.text, width, kind);
-            } else try appendFullscreenRow(&frame, a, line.text, width);
+                try appendToolPanelRow(&rows_out, a, th, line.text, width, kind);
+            } else try appendFullscreenRow(&rows_out, a, line.text, width);
         }
-        for (body.items.len..body_rows) |_| try frame.appendSlice(a, "\r\n");
+        for (body.items.len..body_rows) |_| try rows_out.append(a, "");
     }
-    if (loader_rows > 0) try appendFullscreenRow(&frame, a, loader, width);
-    if (jump_latest_rows > 0 and width > 0) {
+    if (search_rows > 0) try appendFullscreenRow(&rows_out, a, search_line.?, width);
+    if (search_rows == 0 and jump_latest_rows > 0 and width > 0) {
         var button: std.ArrayList(u8) = .empty;
         try th.paint(&button, a, theme.Theme.accent, "[↓ Jump to latest (End)]");
-        try appendFullscreenRow(&frame, a, button.items, width);
+        try appendFullscreenRow(&rows_out, a, button.items, width);
     }
+    if (loader_rows > 0) try appendFullscreenRow(&rows_out, a, loader, width);
     for (queued[0..queued_rows], 1..) |text, index| {
         var preview: std.ArrayList(u8) = .empty;
         try preview.print(a, "[queued {d}] ", .{index});
         _ = try terminal.appendClippedText(&preview, a, text, width -| preview.items.len);
-        try appendFullscreenRow(&frame, a, preview.items, width);
+        try appendFullscreenRow(&rows_out, a, preview.items, width);
     }
-    for (popup[0..popup_rows]) |line| try appendFullscreenRow(&frame, a, line, width);
+    for (popup[0..popup_rows]) |line| try appendFullscreenRow(&rows_out, a, line, width);
     if (rule_rows > 0) {
-        _ = try EditorState.appendRuleLine(&frame, a, th, size.col, isBangMode(editor.buf.items));
-        try frame.appendSlice(a, "\r\n");
+        var rule: std.ArrayList(u8) = .empty;
+        _ = try EditorState.appendRuleLine(&rule, a, th, size.col, isBangMode(editor.buf.items));
+        try rows_out.append(a, rule.items);
     }
     const editor_row = rows - chrome_rows - @min(rule_rows, 1);
 
@@ -203,61 +243,69 @@ fn renderFullscreenConversation(
         start = previous;
         cursor_width += char_width;
     }
+    var editor_line: std.ArrayList(u8) = .empty;
     if (prefix_width > 0) {
         if (isBangMode(text)) {
-            try th.paint(&frame, a, theme.Theme.tool_ok, "! ");
-        } else try th.paint(&frame, a, theme.Theme.accent, "> ");
+            try th.paint(&editor_line, a, theme.Theme.tool_ok, "! ");
+        } else try th.paint(&editor_line, a, theme.Theme.accent, "> ");
     }
-    _ = try terminal.appendClippedText(&frame, a, text[start..line_end], cursor_budget);
+    _ = try terminal.appendClippedText(&editor_line, a, text[start..line_end], cursor_budget);
+    try rows_out.append(a, editor_line.items);
     if (rule_rows > 0) {
-        try frame.appendSlice(a, "\r\n");
-        _ = try EditorState.appendRuleLine(&frame, a, th, size.col, isBangMode(editor.buf.items));
+        var rule: std.ArrayList(u8) = .empty;
+        _ = try EditorState.appendRuleLine(&rule, a, th, size.col, isBangMode(editor.buf.items));
+        try rows_out.append(a, rule.items);
     }
     for (footer[footer.len - chrome_rows ..]) |line| {
-        try frame.appendSlice(a, "\r\n");
-        _ = try terminal.appendTruncatedAnsi(&frame, a, line, width, "");
+        var footer_line: std.ArrayList(u8) = .empty;
+        _ = try terminal.appendTruncatedAnsi(&footer_line, a, line, width, "");
+        try rows_out.append(a, footer_line.items);
     }
-    try frame.print(a, "\x1b[{d};{d}H", .{ editor_row, 1 + prefix_width + cursor_width });
-    try frame.appendSlice(a, renderer.sync_end);
-    try output.writeStreamingAll(io, frame.items);
+    // Diff against the retained frame so steady streaming only repaints edited
+    // rows; the cursor is left on the editor row.
+    const cursor_row = if (editor_row > 0) editor_row - 1 else 0;
+    try painter.render(io, output, rows_out.items, .{ .row = cursor_row, .col = prefix_width + cursor_width }, size.col);
 }
 
-fn appendPinnedUserRow(frame: *std.ArrayList(u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize) !void {
-    try th.appendOpen(frame, a, theme.Theme.user_panel);
-    try frame.appendSlice(a, text);
-    try frame.appendNTimes(a, ' ', width -| terminal.visibleWidth(text));
-    try th.appendClose(frame, a);
-    try frame.appendSlice(a, "\r\n");
+fn appendPinnedUserRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize) !void {
+    var row: std.ArrayList(u8) = .empty;
+    try th.appendOpen(&row, a, theme.Theme.user_panel);
+    try row.appendSlice(a, text);
+    try row.appendNTimes(a, ' ', width -| terminal.visibleWidth(text));
+    try th.appendClose(&row, a);
+    try rows_out.append(a, row.items);
 }
 
-fn appendFullscreenRow(frame: *std.ArrayList(u8), a: std.mem.Allocator, line: []const u8, width: usize) !void {
-    _ = try terminal.appendTruncatedAnsi(frame, a, line, width, "");
-    try frame.appendSlice(a, "\x1b[0m\r\n");
+fn appendFullscreenRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator, line: []const u8, width: usize) !void {
+    var row: std.ArrayList(u8) = .empty;
+    _ = try terminal.appendTruncatedAnsi(&row, a, line, width, "");
+    try rows_out.append(a, row.items);
 }
 
-fn appendToolPanelRow(frame: *std.ArrayList(u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize, kind: ConversationView.ToolRowKind) !void {
+fn appendToolPanelRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize, kind: ConversationView.ToolRowKind) !void {
     var clipped: std.ArrayList(u8) = .empty;
     defer clipped.deinit(a);
     _ = try terminal.appendTruncatedAnsi(&clipped, a, text, width, "");
-    try th.appendOpen(frame, a, theme.Theme.tool_panel);
-    if (kind == .hint) try th.appendOpen(frame, a, theme.Theme.tool_hint);
-    if (kind == .output_title) try th.appendOpen(frame, a, theme.Theme.tool_output);
+    var row: std.ArrayList(u8) = .empty;
+    try th.appendOpen(&row, a, theme.Theme.tool_panel);
+    if (kind == .hint) try th.appendOpen(&row, a, theme.Theme.tool_hint);
+    if (kind == .output_title) try th.appendOpen(&row, a, theme.Theme.tool_output);
     var pos: usize = 0;
     while (pos < clipped.items.len) {
         if (clipped.items[pos] == '\x1b') {
             const end = terminal.skipEscapeSequence(clipped.items, pos);
             const seq = clipped.items[pos..end];
-            try frame.appendSlice(a, seq);
-            if (std.mem.eql(u8, seq, "\x1b[0m") or std.mem.eql(u8, seq, "\x1b[m")) try th.appendOpen(frame, a, theme.Theme.tool_panel);
+            try row.appendSlice(a, seq);
+            if (std.mem.eql(u8, seq, "\x1b[0m") or std.mem.eql(u8, seq, "\x1b[m")) try th.appendOpen(&row, a, theme.Theme.tool_panel);
             pos = end;
         } else {
-            try frame.append(a, clipped.items[pos]);
+            try row.append(a, clipped.items[pos]);
             pos += 1;
         }
     }
-    try frame.appendNTimes(a, ' ', width -| terminal.visibleWidth(clipped.items));
-    try th.appendClose(frame, a);
-    try frame.appendSlice(a, "\r\n");
+    try row.appendNTimes(a, ' ', width -| terminal.visibleWidth(clipped.items));
+    try th.appendClose(&row, a);
+    try rows_out.append(a, row.items);
 }
 
 fn mouseMatchesFrame(view: *const ConversationView, current: std.posix.winsize, event: mouse.Event) bool {
@@ -390,6 +438,7 @@ pub const Submit = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque, []const u8) anyerror!void,
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
+    copy_last_reply: ?*const fn (*anyopaque) anyerror!void = null,
     render_initial_history: ?*const fn (*anyopaque) anyerror!bool = null,
     render_fullscreen_history: ?*const fn (*anyopaque, *ConversationView) anyerror!bool = null,
     jobs_info: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
@@ -426,6 +475,18 @@ pub const Submit = struct {
     quiet_startup: bool = false,
     startup_info: StartupInfo = .{},
 };
+
+fn copyLastReply(submit: Submit, screen: ScreenIo) !void {
+    const copy_reply = submit.copy_last_reply orelse return screen.writeStderr("zpi: clipboard is unavailable\n");
+    copy_reply(submit.context) catch |err| return screen.writeStderr(switch (err) {
+        error.NoAssistantReply => "zpi: no assistant reply to copy yet\n",
+        error.ClipboardUnavailable => "zpi: clipboard unavailable. Check pbcopy (macOS) or install wl-copy / xclip and check your display session (Linux).\n",
+        error.ClipboardTimeout => "zpi: clipboard helper timed out. Check your display session and try again.\n",
+        error.InvalidClipboardPayload => "zpi: reply is too large or is not valid UTF-8\n",
+        else => "zpi: copy failed. Check your clipboard helper and display session.\n",
+    });
+    try screen.writeStderr("Copied last assistant reply to clipboard.\n");
+}
 
 const History = struct {
     allocator: std.mem.Allocator,
@@ -594,11 +655,16 @@ pub fn run(io: std.Io, options: Submit) !void {
     if (submit.fullscreen) submit.conversation_view = &fullscreen_view;
     var alternate_screen = false;
     defer if (alternate_screen) output.writeStreamingAll(io, mouse.disable ++ "\x1b[?2004l\x1b[?1049l") catch {};
+    var painter = renderer.FullscreenRenderer.init(submit.allocator, use_sgr);
+    defer painter.deinit();
     if (submit.fullscreen) {
         fullscreen_view.tools_expanded = submit.tool_outputs_expanded;
         alternate_screen = true;
         try output.writeStreamingAll(io, "\x1b[?1049h");
     }
+    // In fullscreen the retained row diff owns stdout. Every direct terminal
+    // write below goes through `tc` so it invalidates the retained frame first.
+    const tc = ScreenIo{ .io = io, .file = output, .painter = if (submit.fullscreen) &painter else null };
     var header_lines: usize = 0;
     if (!submit.quiet_startup and !submit.fullscreen) {
         header_lines = try renderStartupBanner(io, output, submit, th, null);
@@ -618,7 +684,7 @@ pub fn run(io: std.Io, options: Submit) !void {
             const pad = @min(@as(usize, sz.row) - header_lines - editor_chrome_rows, 80);
             var pad_buf: [80]u8 = undefined;
             @memset(pad_buf[0..pad], '\n');
-            try output.writeStreamingAll(io, pad_buf[0..pad]);
+            try tc.write(pad_buf[0..pad]);
         }
     }
 
@@ -638,24 +704,26 @@ pub fn run(io: std.Io, options: Submit) !void {
     var carried_draft: ?[]u8 = null;
     defer if (carried_draft) |draft| submit.allocator.free(draft);
     var pending_dialog: ?DialogKind = null;
+    // `/search` arms the next prompt read to start in transcript search mode.
+    var pending_search = false;
 
     while (true) {
         if (submit.reset_cancel) |reset| reset(submit.context);
         if (followups.items.len == 0 and bg_queue.items.len == 0) {
-            try collectBgNotifications(submit, io, output, &bg_queue, false);
+            try collectBgNotifications(submit, io, tc.file, &bg_queue, false);
         }
         var is_bg_wakeup = false;
         const raw = if (followups.items.len > 0) blk: {
             pending_dialog = null;
             const next = followups.orderedRemove(0);
-            const echo = try components.message.formatUserEchoAlloc(submit.allocator, th, next, terminalColumns(output));
+            const echo = try components.message.formatUserEchoAlloc(submit.allocator, th, next, terminalColumns(tc.file));
             defer submit.allocator.free(echo);
             if (submit.conversation_view) |view| {
-                try view.appendUserMessage(next, echo, if (th.mode == .none or terminalColumns(output) < 5) 0 else 1);
+                try view.appendUserMessage(next, echo, if (th.mode == .none or terminalColumns(tc.file) < 5) 0 else 1);
                 try view.appendText("\n");
             } else {
-                try output.writeStreamingAll(io, echo);
-                try output.writeStreamingAll(io, "\n");
+                try tc.write(echo);
+                try tc.write("\n");
             }
             break :blk next;
         } else if (bg_queue.items.len > 0) blk: {
@@ -670,15 +738,17 @@ pub fn run(io: std.Io, options: Submit) !void {
             pending_dialog = null;
             if (dlg == null and !submit.fullscreen) {
                 const prompt_prefix = if (use_sgr) "\x1b[36m>\x1b[0m " else "> ";
-                try output.writeStreamingAll(io, prompt_prefix);
+                try tc.write(prompt_prefix);
             }
-            const res = readPromptLine(submit.allocator, io, input.handle, output, &queue, &history, submit, &bg_queue, use_sgr, color, th, initial, dlg) catch |err| switch (err) {
+            const start_search = pending_search;
+            pending_search = false;
+            const res = readPromptLine(submit.allocator, io, input.handle, tc.file, &queue, &history, submit, &bg_queue, use_sgr, color, th, initial, dlg, tc.painter, start_search) catch |err| switch (err) {
                 error.Canceled => {
-                    try output.writeStreamingAll(io, "\n");
+                    try tc.write("\n");
                     continue;
                 },
                 error.StreamTooLong => {
-                    try std.Io.File.stderr().writeStreamingAll(io, "zpi: prompt exceeds 64 KiB; discarded\n");
+                    try tc.writeStderr("zpi: prompt exceeds 64 KiB; discarded\n");
                     continue;
                 },
                 else => return err,
@@ -701,7 +771,7 @@ pub fn run(io: std.Io, options: Submit) !void {
             if (std.mem.eql(u8, text, "/exit") or std.mem.eql(u8, text, "/quit")) {
                 const saved_output = alternate_screen and submit.render_saved_session_on_exit != null;
                 if (saved_output) {
-                    try output.writeStreamingAll(io, mouse.disable ++ "\x1b[?2004l\x1b[?1049l");
+                    try tc.write(mouse.disable ++ "\x1b[?2004l\x1b[?1049l");
                     alternate_screen = false;
                 }
                 if (submit.render_saved_session_on_exit) |render| try render(submit.context);
@@ -714,20 +784,20 @@ pub fn run(io: std.Io, options: Submit) !void {
             const prefix_len: usize = if (excluded) 2 else 1;
             const command = std.mem.trim(u8, text[prefix_len..], " \t");
             if (command.len == 0) {
-                try output.writeStreamingAll(io, "Usage: !<command> runs with context; !!<command> runs without context.\n");
+                try tc.write("Usage: !<command> runs with context; !!<command> runs without context.\n");
                 continue;
             }
             var shell_prompt: std.ArrayList(u8) = .empty;
             defer shell_prompt.deinit(submit.allocator);
             try shell_prompt.appendSlice(submit.allocator, if (excluded) "!! " else "! ");
             try shell_prompt.appendSlice(submit.allocator, command);
-            const panel = try components.message.formatUserEchoAlloc(submit.allocator, th, shell_prompt.items, terminalColumns(output));
+            const panel = try components.message.formatUserEchoAlloc(submit.allocator, th, shell_prompt.items, terminalColumns(tc.file));
             defer submit.allocator.free(panel);
             const view = submit.conversation_view;
             if (view) |conversation| {
-                try conversation.appendUserMessage(shell_prompt.items, panel, if (th.mode == .none or terminalColumns(output) < 5) 0 else 1);
-            } else try writeConversationText(io, output, view, panel);
-            try writeConversationText(io, output, view, "\n");
+                try conversation.appendUserMessage(shell_prompt.items, panel, if (th.mode == .none or terminalColumns(tc.file) < 5) 0 else 1);
+            } else try writeConversationText(tc.io, tc.file, view, panel);
+            try writeConversationText(tc.io, tc.file, view, "\n");
             var scratch = std.heap.ArenaAllocator.init(submit.allocator);
             defer scratch.deinit();
             const result = runLocalShell(io, input.handle, &queue, submit, scratch.allocator(), command) catch |err| {
@@ -737,36 +807,45 @@ pub fn run(io: std.Io, options: Submit) !void {
                 continue;
             };
             const safe_output = try terminal.safeUtf8Alloc(scratch.allocator(), result.text);
-            const preview = try components.tool_card.formatBodyPreviewAlloc(submit.allocator, th, safe_output, ConversationView.compact_tool_rows, terminalColumns(output));
+            const preview = try components.tool_card.formatBodyPreviewAlloc(submit.allocator, th, safe_output, ConversationView.compact_tool_rows, terminalColumns(tc.file));
             defer submit.allocator.free(preview.text);
-            try writeConversationText(io, output, view, preview.text);
-            if (preview.truncated) try writeConversationText(io, output, view, "│ ... (local preview truncated)\n");
-            try writeConversationText(io, output, view, if (result.is_error) "[command failed]\n" else "[command complete]\n");
+            try writeConversationText(tc.io, tc.file, view, preview.text);
+            if (preview.truncated) try writeConversationText(tc.io, tc.file, view, "│ ... (local preview truncated)\n");
+            try writeConversationText(tc.io, tc.file, view, if (result.is_error) "[command failed]\n" else "[command complete]\n");
             if (excluded) {
-                try writeConversationText(io, output, view, "[command output excluded from agent context]\n");
+                try writeConversationText(tc.io, tc.file, view, "[command output excluded from agent context]\n");
                 continue;
             }
             const context_text = try submit.allocator.print("User ran shell command: {s}\nExit outcome and output:\n{s}", .{ command, safe_output });
             defer submit.allocator.free(context_text);
             if (submit.record_user_shell) |record| try record(submit.context, context_text);
-            try writeConversationText(io, output, view, "[output added to conversation context]\n");
+            try writeConversationText(tc.io, tc.file, view, "[output added to conversation context]\n");
+            continue;
+        }
+        if (std.mem.eql(u8, text, "/search")) {
+            if (!submit.fullscreen or submit.conversation_view == null) {
+                try output.writeStreamingAll(io, "/search needs the fullscreen interface (--tui-mode fullscreen).\n");
+                continue;
+            }
+            try eraseSubmittedPromptLine(io, output);
+            pending_search = true;
             continue;
         }
         if (std.mem.eql(u8, text, "/help")) {
             if (color) {
-                try eraseSubmittedPromptLine(io, output);
+                try eraseSubmittedPromptLine(tc.io, tc.file);
                 pending_dialog = .help;
             } else {
-                try output.writeStreamingAll(io, "Enter a task to stream a response and run tools. /exit leaves the session.\nUse --session PATH to reopen; add --branch ENTRY-ID to continue from an earlier point.\nTab completes /commands and @paths; Up/Down navigates history; Alt+Enter or trailing \\ adds a newline.\n");
+                try tc.write("Enter a task to stream a response and run tools. /exit leaves the session.\nUse --session PATH to reopen; add --branch ENTRY-ID to continue from an earlier point.\nTab completes /commands and @paths; Up/Down navigates history; Alt+Enter or trailing \\ adds a newline.\nFullscreen: Ctrl-F or Esc on an empty prompt searches the transcript (/search).\n");
             }
             continue;
         }
         if (std.mem.eql(u8, text, "/hotkeys")) {
             if (color) {
-                try eraseSubmittedPromptLine(io, output);
+                try eraseSubmittedPromptLine(tc.io, tc.file);
                 pending_dialog = .hotkeys;
             } else {
-                try output.writeStreamingAll(io, "Keyboard shortcuts\nEnter     Submit prompt (or queue follow-up while busy)\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\nAlt+Up    Edit queued follow-up messages\nEsc       Clear draft while busy / cancel selector\n/model    Fuzzy model picker (or /model [provider/id] | --list)\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Branch picker (/ filter, p prefill user msg, s summarize, Enter switch)\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+                try tc.write("Keyboard shortcuts\nEnter     Submit prompt (or queue follow-up while busy)\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\nAlt+Up    Edit queued follow-up messages\nCtrl-F    Search transcript (/search, or Esc on an empty prompt)\nCtrl-P/N  Previous/next user message (Alt+Up/Alt+Down)\nEsc       Clear draft while busy / cancel selector / open search when empty\n/model    Fuzzy model picker (or /model [provider/id] | --list)\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Branch picker (/ filter, p prefill user msg, s summarize, Enter switch)\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/search   Search the fullscreen transcript (Ctrl-F)\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
             }
             continue;
         }
@@ -778,15 +857,15 @@ pub fn run(io: std.Io, options: Submit) !void {
                 const arg = if (std.mem.eql(u8, raw_arg, "--list"))
                     ""
                 else if (raw_arg.len == 0 and color and submit.model_source != null) blk: {
-                    try eraseSubmittedPromptLine(io, output);
+                    try eraseSubmittedPromptLine(tc.io, tc.file);
                     var src = (submit.model_source.?(submit.context) catch |err| {
                         var msg: [256]u8 = undefined;
                         const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                        try std.Io.File.stderr().writeStreamingAll(io, line);
+                        try tc.writeStderr(line);
                         continue;
                     }) orelse break :blk "";
                     defer src.deinit(src.context);
-                    const picked = selectModel(submit.allocator, io, input.handle, output, &queue, submit.cancel, src, th) catch |err| switch (err) {
+                    const picked = selectModel(submit.allocator, io, input.handle, tc.file, &queue, submit.cancel, src, th) catch |err| switch (err) {
                         error.Canceled => {
                             queue.start = queue.end;
                             continue;
@@ -801,10 +880,10 @@ pub fn run(io: std.Io, options: Submit) !void {
                 run_switch(submit.context, arg) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                    try tc.writeStderr(line);
                 };
             } else {
-                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /model unavailable\n");
+                try tc.writeStderr("zpi: /model unavailable\n");
             }
             continue;
         }
@@ -814,10 +893,10 @@ pub fn run(io: std.Io, options: Submit) !void {
                 run_thinking(submit.context, arg) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                    try tc.writeStderr(line);
                 };
             } else {
-                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /thinking unavailable\n");
+                try tc.writeStderr("zpi: /thinking unavailable\n");
             }
             continue;
         }
@@ -829,9 +908,9 @@ pub fn run(io: std.Io, options: Submit) !void {
                 var prefill_text: ?[]const u8 = null;
                 var skip_tree_cmd = false;
                 const argument = if (target.len == 0 and color and submit.tree_source != null) blk: {
-                    try eraseSubmittedPromptLine(io, output);
+                    try eraseSubmittedPromptLine(tc.io, tc.file);
                     const tree = submit.tree_source.?(submit.context);
-                    const choice = selectTree(io, input.handle, output, &queue, submit, tree, th) catch |err| switch (err) {
+                    const choice = selectTree(io, input.handle, tc.file, &queue, submit, tree, th) catch |err| switch (err) {
                         error.Canceled => {
                             queue.start = queue.end;
                             const prev_draft = carried_draft;
@@ -857,7 +936,7 @@ pub fn run(io: std.Io, options: Submit) !void {
                     run_tree(submit.context, argument) catch |err| {
                         var msg: [256]u8 = undefined;
                         const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                        try std.Io.File.stderr().writeStreamingAll(io, line);
+                        try tc.writeStderr(line);
                         continue;
                     };
                 }
@@ -866,7 +945,7 @@ pub fn run(io: std.Io, options: Submit) !void {
                     carried_draft = try submit.allocator.dupe(u8, pf);
                 }
             } else {
-                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /tree unavailable\n");
+                try tc.writeStderr("zpi: /tree unavailable\n");
             }
             continue;
         }
@@ -876,11 +955,15 @@ pub fn run(io: std.Io, options: Submit) !void {
                 run_compact(submit.context, focus) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                    try tc.writeStderr(line);
                 };
             } else {
-                try std.Io.File.stderr().writeStreamingAll(io, "zpi: compaction unavailable\n");
+                try tc.writeStderr("zpi: compaction unavailable\n");
             }
+            continue;
+        }
+        if (std.mem.eql(u8, text, "/copy")) {
+            try copyLastReply(submit, tc);
             continue;
         }
         if (std.mem.eql(u8, text, "/session")) {
@@ -893,10 +976,10 @@ pub fn run(io: std.Io, options: Submit) !void {
                 show_jobs(submit.context, arg) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                    try tc.writeStderr(line);
                 };
             } else {
-                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /jobs unavailable\n");
+                try tc.writeStderr("zpi: /jobs unavailable\n");
             }
             continue;
         }
@@ -908,15 +991,15 @@ pub fn run(io: std.Io, options: Submit) !void {
                 const arg = if (std.mem.eql(u8, raw_arg, "--list"))
                     ""
                 else if (raw_arg.len == 0 and color and submit.session_source != null) blk: {
-                    try eraseSubmittedPromptLine(io, output);
+                    try eraseSubmittedPromptLine(tc.io, tc.file);
                     var src = (submit.session_source.?(submit.context) catch |err| {
                         var msg: [256]u8 = undefined;
                         const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                        try std.Io.File.stderr().writeStreamingAll(io, line);
+                        try tc.writeStderr(line);
                         continue;
                     }) orelse break :blk "";
                     defer src.deinit(src.context);
-                    const picked = selectSession(submit.allocator, io, input.handle, output, &queue, submit.cancel, src, th) catch |err| switch (err) {
+                    const picked = selectSession(submit.allocator, io, input.handle, tc.file, &queue, submit.cancel, src, th) catch |err| switch (err) {
                         error.Canceled => {
                             queue.start = queue.end;
                             continue;
@@ -931,15 +1014,15 @@ pub fn run(io: std.Io, options: Submit) !void {
                 run_resume(submit.context, arg) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
-                    try std.Io.File.stderr().writeStreamingAll(io, line);
+                    try tc.writeStderr(line);
                 };
             } else {
-                try std.Io.File.stderr().writeStreamingAll(io, "zpi: /resume unavailable\n");
+                try tc.writeStderr("zpi: /resume unavailable\n");
             }
             continue;
         }
         if (color and submit.set_live_writer != null) {
-            try runTurnWithLiveEditor(io, input.handle, output, &queue, &history, submit, text, &followups, &bg_queue, &carried_draft, use_sgr, th);
+            try runTurnWithLiveEditor(io, input.handle, tc.file, &queue, &history, submit, text, &followups, &bg_queue, &carried_draft, use_sgr, th, tc.painter);
         } else {
             submit.run(submit.context, text) catch |err| try reportTurnError(io, submit.conversation_view, use_sgr, err);
         }
@@ -1411,7 +1494,7 @@ const EditorState = struct {
     }
 };
 
-const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/session", "/resume", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
+const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/search", "/copy", "/session", "/resume", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
 fn handleTab(editor: *EditorState, io: std.Io, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
     // Identify token immediately before cursor (bounded by whitespace).
@@ -1553,6 +1636,171 @@ fn applyAutocomplete(
     }
 }
 
+/// Fullscreen-only prompt navigation: walk marked user messages backward or
+/// forward without touching the draft, queue, steering or active turn.
+fn navigatePromptHistory(view: *ConversationView, forward: bool) bool {
+    return if (forward) view.jumpToNextUserMessage() else view.jumpToPreviousUserMessage();
+}
+
+/// Prompt navigation only takes over an empty, unmodified draft so typed text,
+/// shell mode and completion hints keep their normal editing keys.
+fn promptHistoryIdle(editor: *const EditorState) bool {
+    return editor.buf.items.len == 0 and editor.completion_hint == null and editor.history_idx == null;
+}
+
+const SearchKeyResult = enum { none, refresh, cancel, submit };
+
+/// Capture the current page so Esc can restore exactly the same viewport, then
+/// return to the live tail so the first match search starts from new output too.
+fn beginSearch(state: *components.search.SearchState, view: *ConversationView, popup: *components.autocomplete.Popup) !void {
+    state.clear();
+    state.capturePage(view);
+    view.search_hit_row = null;
+    popup.clear();
+}
+
+fn searchRefresh(state: *components.search.SearchState, view: *ConversationView) !void {
+    try view.collectMatches(state.query.items, &state.matches);
+    if (state.matches.items.len == 0) {
+        state.cursor = 0;
+        view.search_hit_row = null;
+        return;
+    }
+    // Keep the previous focused row when it is still a match.
+    if (view.search_hit_row) |hit| {
+        for (state.matches.items, 0..) |row, index| {
+            if (row == hit) {
+                state.cursor = index;
+                _ = view.jumpToSearchRow(row);
+                return;
+            }
+        }
+    }
+    state.cursor = state.matches.items.len - 1;
+    _ = view.jumpToSearchRow(state.matches.items[state.cursor]);
+}
+
+/// Focus the next (delta > 0) or previous match, wrapping at both ends.
+fn searchStep(state: *components.search.SearchState, view: *ConversationView, forward: bool) void {
+    const total = state.matches.items.len;
+    if (total == 0) return;
+    state.cursor = if (forward) (state.cursor + 1) % total else if (state.cursor == 0) total - 1 else state.cursor - 1;
+    if (!view.jumpToSearchRow(state.matches.items[state.cursor])) {
+        // The focused row was evicted between frames; rebuild from scratch.
+        view.collectMatches(state.query.items, &state.matches) catch return;
+        if (state.matches.items.len == 0) return;
+        if (state.cursor >= state.matches.items.len) state.cursor = state.matches.items.len - 1;
+        _ = view.jumpToSearchRow(state.matches.items[state.cursor]);
+    }
+}
+
+/// Bounded incremental search input. Returns the loop action so the caller can
+/// restore the viewport and exit search mode.
+fn handleSearchKey(
+    state: *components.search.SearchState,
+    view: *ConversationView,
+    io: std.Io,
+    input_fd: std.posix.fd_t,
+    output: std.Io.File,
+    queue: *InputQueue,
+    submit: Submit,
+    cols: usize,
+    first: u8,
+) !SearchKeyResult {
+    var bytes: [4]u8 = undefined;
+    var len: usize = 1;
+    bytes[0] = first;
+    switch (first) {
+        0x03 => return .cancel,
+        0x07 => return .cancel,
+        '\r', '\n' => return .submit,
+        0x7f, 0x08 => {
+            if (state.popByte()) try searchRefresh(state, view);
+            return .refresh;
+        },
+        0x0e => { // Ctrl-N and Down: next match
+            searchStep(state, view, true);
+            return .refresh;
+        },
+        0x10 => { // Ctrl-P and Up: previous match
+            searchStep(state, view, false);
+            return .refresh;
+        },
+        0x1b => {},
+        else => {},
+    }
+    if (first == 0x1b) {
+        const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse return .cancel;
+        switch (next) {
+            // Esc Esc also cancels; the first Esc already restored the page.
+            '\x1b' => return .cancel,
+            'A' => {
+                searchStep(state, view, false);
+                return .refresh;
+            },
+            'B' => {
+                searchStep(state, view, true);
+                return .refresh;
+            },
+            'O' => {
+                const code = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse return .none;
+                switch (code) {
+                    'A' => searchStep(state, view, false),
+                    'B' => searchStep(state, view, true),
+                    else => return .none,
+                }
+                return .refresh;
+            },
+            '[' => {
+                var seq: [32]u8 = undefined;
+                var slen: usize = 0;
+                var final_byte: ?u8 = null;
+                while (slen < seq.len) {
+                    const c = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse break;
+                    if (c >= 0x40 and c <= 0x7e) {
+                        final_byte = c;
+                        break;
+                    }
+                    seq[slen] = c;
+                    slen += 1;
+                }
+                if (final_byte) |fin| switch (fin) {
+                    'A' => searchStep(state, view, false),
+                    'B' => searchStep(state, view, true),
+                    // Wheel scrolling while searching moves the page but keeps
+                    // the query and match list intact.
+                    '~', 'M', 'm' => {
+                        if (mouse.Event.parse(fin, seq[0..slen])) |event| {
+                            if (mouseMatchesFrame(view, terminalSize(output), event)) _ = navigateWithMouse(view, event);
+                        }
+                    },
+                    else => return .none,
+                };
+                return .refresh;
+            },
+            // Alt+<printable> and Alt+Enter are not part of the query.
+            else => return .none,
+        }
+    }
+    if (first >= 0x20 and first < 0x7f) {
+        if (!state.pushByte(first)) return .none;
+    } else if (first >= 0xc2 and first <= 0xf4) {
+        const expected_len = std.unicode.utf8ByteSequenceLength(first) catch return .none;
+        for (1..expected_len) |idx| {
+            const follow = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse return .none;
+            if ((follow & 0xc0) != 0x80) return .none;
+            bytes[idx] = follow;
+        }
+        len = expected_len;
+        if (!std.unicode.utf8ValidateSlice(bytes[0..len])) return .none;
+        if (!state.pushSlice(bytes[0..len])) return .none;
+    } else return .none;
+    _ = io;
+    _ = cols;
+    try searchRefresh(state, view);
+    return .refresh;
+}
+
 const PromptInput = struct {
     text: []u8,
     is_bg_wakeup: bool = false,
@@ -1603,6 +1851,8 @@ fn readPromptLine(
     th: theme.Theme,
     initial: ?[]const u8,
     initial_dialog: ?DialogKind,
+    painter: ?*renderer.FullscreenRenderer,
+    start_search: bool,
 ) anyerror!?PromptInput {
     if (submit.cancel) |token| {
         if (token.isCanceled()) return error.Canceled;
@@ -1617,6 +1867,9 @@ fn readPromptLine(
     defer editor.deinit();
     var popup = components.autocomplete.Popup.init(allocator);
     defer popup.deinit();
+    var search = components.search.SearchState.init(allocator);
+    defer search.deinit();
+    var search_active = false;
 
     const has_footer = (submit.fullscreen or th.mode != .none) and submit.status_info != null;
     var dialog = initial_dialog;
@@ -1631,6 +1884,13 @@ fn readPromptLine(
             try editor.insertSlice(text);
             dirty = true;
         }
+    }
+    // `/search` enters search on the next prompt read without redrawing first.
+    if (start_search and submit.fullscreen and submit.conversation_view != null and editor.buf.items.len == 0 and dialog == null) {
+        try beginSearch(&search, submit.conversation_view.?, &popup);
+        popup.clear();
+        search_active = true;
+        dirty = true;
     }
 
     while (true) {
@@ -1683,7 +1943,9 @@ fn readPromptLine(
             for (dialog_lines, dialog_slices) |dl, *s| s.* = dl;
 
             if (submit.fullscreen and submit.conversation_view != null) {
-                try renderFullscreenConversation(allocator, io, output, submit.conversation_view.?, &editor, "", dialog_slices, popup_slices, footer_slices, &.{}, th);
+                const search_line: ?[]u8 = if (search_active) try components.search.promptLineAlloc(allocator, th, &search, cols) else null;
+                defer if (search_line) |line| allocator.free(line);
+                try renderFullscreenConversation(allocator, io, output, painter.?, submit.conversation_view.?, &editor, "", dialog_slices, popup_slices, footer_slices, &.{}, th, search_line, if (search_active and search.query.items.len > 0) search.query.items else null);
             } else {
                 try editor.renderWithOverlay(io, output, cols, use_sgr, th, dialog_slices, popup_slices, footer_slices, th.mode != .none, isBangMode(editor.buf.items));
             }
@@ -1725,6 +1987,35 @@ fn readPromptLine(
         };
 
         skip_popup_refresh = false;
+        if (search_active) {
+            const result = try handleSearchKey(
+                &search,
+                submit.conversation_view orelse return error.SearchRequiresFullscreen,
+                io,
+                input_fd,
+                output,
+                @constCast(queue),
+                submit,
+                cols,
+                b,
+            );
+            switch (result) {
+                .cancel => {
+                    search.restorePage(submit.conversation_view.?);
+                    search.clear();
+                    search_active = false;
+                },
+                .submit => {
+                    // Keep the focused match and query visible, but return to
+                    // the normal editor so the draft can be submitted.
+                    if (search.count() == 0) search.restorePage(submit.conversation_view.?);
+                    search_active = false;
+                },
+                .refresh, .none => {},
+            }
+            dirty = true;
+            continue;
+        }
         if (dialog != null) {
             dialog = null;
             dirty = true;
@@ -1832,7 +2123,22 @@ fn readPromptLine(
                 editor.moveLeft();
                 dirty = true;
             },
+            0x18 => {
+                if (!in_paste) {
+                    try copyLastReply(submit, .{ .io = io, .file = output, .painter = painter });
+                    dirty = true;
+                }
+            },
             0x06 => {
+                if (submit.fullscreen and submit.conversation_view != null and !in_paste and
+                    editor.buf.items.len == 0 and dialog == null and !popup.isOpen() and !search_active)
+                {
+                    try beginSearch(&search, submit.conversation_view.?, &popup);
+                    popup.clear();
+                    search_active = true;
+                    dirty = true;
+                    continue;
+                }
                 editor.moveRight();
                 dirty = true;
             },
@@ -1842,6 +2148,8 @@ fn readPromptLine(
                 }
                 if (popup.isOpen()) {
                     popup.moveUp();
+                } else if (submit.fullscreen and promptHistoryIdle(&editor) and if (submit.conversation_view) |view| navigatePromptHistory(view, false) else false) {
+                    // Ctrl-P on an empty prompt jumps to the previous user message.
                 } else {
                     try editor.moveUpLineOrHistory(history);
                 }
@@ -1853,6 +2161,8 @@ fn readPromptLine(
                 }
                 if (popup.isOpen()) {
                     popup.moveDown();
+                } else if (submit.fullscreen and promptHistoryIdle(&editor) and if (submit.conversation_view) |view| navigatePromptHistory(view, true) else false) {
+                    // Ctrl-N on an empty prompt jumps to the next user message.
                 } else {
                     try editor.moveDownLineOrHistory(history);
                 }
@@ -1918,6 +2228,18 @@ fn readPromptLine(
             },
             0x1b => {
                 const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse {
+                    // Esc on an empty prompt in fullscreen is the search fallback;
+                    // a draft, dialog, popup or completion hint keeps its meaning.
+                    if (submit.fullscreen and submit.conversation_view != null and !in_paste and
+                        editor.buf.items.len == 0 and dialog == null and !popup.isOpen() and
+                        editor.completion_hint == null)
+                    {
+                        try beginSearch(&search, submit.conversation_view.?, &popup);
+                        popup.clear();
+                        search_active = true;
+                        dirty = true;
+                        continue;
+                    }
                     if (th.mode != .none and !in_paste and dirty) {
                         try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
                     }
@@ -2027,6 +2349,16 @@ fn readPromptLine(
                         };
                         if (final_byte) |fin| switch (fin) {
                             'A' => {
+                                // Alt+Up (CSI 1;3A / 1;5A) walks earlier user
+                                // messages; plain Up keeps history/line editing.
+                                if (submit.fullscreen and promptHistoryIdle(&editor) and th.mode != .none and
+                                    submit.conversation_view != null and !popup.isOpen() and
+                                    (std.mem.eql(u8, params, "1;3") or std.mem.eql(u8, params, "1;5")) and
+                                    navigatePromptHistory(submit.conversation_view.?, false))
+                                {
+                                    dirty = true;
+                                    continue;
+                                }
                                 if (th.mode != .none and !in_paste and dirty) {
                                     try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
                                 }
@@ -2038,6 +2370,14 @@ fn readPromptLine(
                                 dirty = true;
                             },
                             'B' => {
+                                if (submit.fullscreen and promptHistoryIdle(&editor) and th.mode != .none and
+                                    submit.conversation_view != null and !popup.isOpen() and
+                                    (std.mem.eql(u8, params, "1;3") or std.mem.eql(u8, params, "1;5")) and
+                                    navigatePromptHistory(submit.conversation_view.?, true))
+                                {
+                                    dirty = true;
+                                    continue;
+                                }
                                 if (th.mode != .none and !in_paste and dirty) {
                                     try popup.refresh(io, editor.buf.items, editor.cursor, submit.commands, submit.cwd);
                                 }
@@ -2185,6 +2525,7 @@ const LiveScreen = struct {
     color: bool,
     th: theme.Theme,
     conversation_view: ?*ConversationView = null,
+    painter: ?*renderer.FullscreenRenderer = null,
     md: components.markdown.MarkdownStyler = .{},
     loader: components.chrome.Loader = .{},
     mutex: std.Io.Mutex = .init,
@@ -2196,8 +2537,24 @@ const LiveScreen = struct {
 
     const max_pending_line_bytes: usize = 4096;
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, output: std.Io.File, color: bool, th: theme.Theme, conversation_view: ?*ConversationView) LiveScreen {
-        return .{ .allocator = allocator, .io = io, .output = output, .color = color, .th = th, .conversation_view = conversation_view };
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        output: std.Io.File,
+        color: bool,
+        th: theme.Theme,
+        conversation_view: ?*ConversationView,
+        painter: ?*renderer.FullscreenRenderer,
+    ) LiveScreen {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .output = output,
+            .color = color,
+            .th = th,
+            .conversation_view = conversation_view,
+            .painter = painter,
+        };
     }
 
     fn deinit(self: *LiveScreen) void {
@@ -2248,6 +2605,8 @@ const LiveScreen = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.conversation_view) |view| {
+            // Tool text never writes to the terminal directly in fullscreen; the
+            // next retained-row paint shows it.
             try view.appendText(prefix);
             const clean = try terminal.safeUtf8Alloc(self.allocator, safe);
             defer self.allocator.free(clean);
@@ -2403,7 +2762,7 @@ const LiveScreen = struct {
         if (self.conversation_view) |view| {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            try renderFullscreenConversation(self.allocator, self.io, self.output, view, editor, loader_line, &.{}, &.{}, if (footer_lines) |*lines| lines else &.{}, followups, self.th);
+            try renderFullscreenConversation(self.allocator, self.io, self.output, self.painter.?, view, editor, loader_line, &.{}, &.{}, if (footer_lines) |*lines| lines else &.{}, followups, self.th, null, null);
             return;
         }
         const rendered = try renderLiveOverlayFrameWithChrome(
@@ -2668,10 +3027,12 @@ fn runTurnWithLiveEditor(
     carried_draft: *?[]u8,
     use_sgr: bool,
     th: theme.Theme,
+    painter: ?*renderer.FullscreenRenderer,
 ) !void {
     const orig_term = try enterRawMode(input_fd);
     defer terminal.setTermiosNow(input_fd, orig_term) catch {};
 
+    if (painter) |p| p.invalidate();
     defer output.writeStreamingAll(io, if (submit.fullscreen) mouse.disable ++ "\x1b[?2004l" else "\x1b[?2004l") catch {};
     try output.writeStreamingAll(io, if (submit.fullscreen) "\x1b[?2004h" ++ mouse.enable else "\x1b[?2004h");
 
@@ -2680,7 +3041,7 @@ fn runTurnWithLiveEditor(
 
     var cols = terminalColumns(output);
     var last_size = terminalSize(output);
-    var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th, submit.conversation_view);
+    var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th, submit.conversation_view, painter);
     screen.overlay_cols = cols;
     defer screen.deinit();
 

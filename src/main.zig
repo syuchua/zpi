@@ -226,6 +226,7 @@ fn run(init: std.process.Init) !void {
                 .context = &adapter,
                 .run = CliAdapter.submitErased,
                 .session_info = CliAdapter.sessionInfoErased,
+                .copy_last_reply = CliAdapter.copyLastReplyErased,
                 .render_initial_history = CliAdapter.renderInitialHistoryErased,
                 .render_fullscreen_history = CliAdapter.renderFullscreenHistoryErased,
                 .render_saved_session_on_exit = CliAdapter.renderSavedSessionOnExitErased,
@@ -1400,6 +1401,20 @@ const CliAdapter = struct {
         }
     }
 
+    fn copyLastReplyErased(context: *anyopaque) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness orelse return error.SessionUnavailable;
+        const text = try latestAssistantText(self.allocator, &h.store);
+        defer self.allocator.free(text);
+        const clipboard = @import("clipboard");
+        return clipboard.copy(self.io, h.environ, clipboard.spawnRunner, text, .{}) catch |err| switch (err) {
+            error.Unavailable => error.ClipboardUnavailable,
+            error.Failed => error.ClipboardFailed,
+            error.Timeout => error.ClipboardTimeout,
+            error.InvalidPayload => error.InvalidClipboardPayload,
+        };
+    }
+
     fn json(self: *CliAdapter, value: anytype) !void {
         const encoded = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
         defer self.allocator.free(encoded);
@@ -1407,6 +1422,43 @@ const CliAdapter = struct {
         try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
     }
 };
+
+/// Return the newest nonempty assistant text on the active branch. Text
+/// blocks are concatenated as stored, without terminal styling or wrapping.
+fn latestAssistantText(allocator: std.mem.Allocator, store: *const zpi.session.Store) ![]u8 {
+    var cursor = store.active_leaf;
+    while (cursor) |id| {
+        const entry = store.entries.items[store.entryIndex(id) orelse return error.UnknownSessionEntry];
+        cursor = entry.parent_id;
+        if (entry.message.role != .assistant) continue;
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(allocator);
+        for (entry.message.content) |part| if (part == .text) {
+            try text.appendSlice(allocator, part.text);
+        };
+        if (text.items.len > 0) return text.toOwnedSlice(allocator);
+    }
+    return error.NoAssistantReply;
+}
+
+test "copy text follows the active branch and preserves raw Markdown" {
+    const allocator = std.testing.allocator;
+    var store = zpi.session.Store.memory(allocator, std.testing.io);
+    defer store.deinit();
+    try std.testing.expectError(error.NoAssistantReply, latestAssistantText(allocator, &store));
+    const prior = try store.appendMessage(.{ .role = .assistant, .content = &.{
+        .{ .text = "# 标题\n\n" },
+        .{ .thinking = .{ .text = "private thinking" } },
+        .{ .text = "**answer**\n" },
+    } });
+    _ = try store.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "abandoned branch" }} });
+    try store.branch(prior);
+    _ = try store.appendMessage(.{ .role = .assistant, .content = &.{.{ .text = "" }} });
+    _ = try store.appendMessage(.{ .role = .user, .content = &.{.{ .text = "new prompt" }} });
+    const text = try latestAssistantText(allocator, &store);
+    defer allocator.free(text);
+    try std.testing.expectEqualStrings("# 标题\n\n**answer**\n", text);
+}
 
 test {
     _ = args_module;

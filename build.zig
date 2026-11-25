@@ -140,6 +140,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "agent", .module = agent }},
     });
+    const clipboard = b.createModule(.{
+        .root_source_file = b.path("src/clipboard.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const mcp = b.addModule("mcp", .{
         .root_source_file = b.path("src/mcp.zig"),
         .target = target,
@@ -206,11 +211,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zpi", .module = core },
             .{ .name = "harness", .module = harness },
             .{ .name = "tui", .module = tui },
+            .{ .name = "clipboard", .module = clipboard },
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
         } else &.{
             .{ .name = "zpi", .module = core },
             .{ .name = "harness", .module = harness },
+            .{ .name = "clipboard", .module = clipboard },
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
         },
@@ -251,6 +258,7 @@ pub fn build(b: *std.Build) void {
     const skills_tests = b.addTest(.{ .name = "skills-tests", .root_module = skills });
     const tool_selection_tests = b.addTest(.{ .name = "tool-selection-tests", .root_module = tool_selection });
     const tui_tests = b.addTest(.{ .name = "tui-tests", .root_module = tui });
+    const clipboard_tests = b.addTest(.{ .name = "clipboard-tests", .root_module = clipboard });
     const prompt_template_tests = b.addTest(.{ .name = "prompt-template-tests", .root_module = prompt_templates });
     const pi_session_tests = b.addTest(.{ .name = "pi-session-tests", .root_module = pi_session });
     const sse_tests = b.addTest(.{ .name = "sse-tests", .root_module = sse });
@@ -440,6 +448,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(skills_tests).step);
     test_step.dependOn(&b.addRunArtifact(tool_selection_tests).step);
     if (tui_mode == .native) test_step.dependOn(&b.addRunArtifact(tui_tests).step);
+    test_step.dependOn(&b.addRunArtifact(clipboard_tests).step);
     test_step.dependOn(&b.addRunArtifact(sse_tests).step);
     test_step.dependOn(&b.addRunArtifact(http_header_tests).step);
     test_step.dependOn(&b.addRunArtifact(http_transport_tests).step);
@@ -473,6 +482,7 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(skills_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(tool_selection_tests, .{}).step);
     if (tui_mode == .native) test_binaries.dependOn(&b.addInstallArtifact(tui_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(clipboard_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(sse_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(http_header_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(http_transport_tests, .{}).step);

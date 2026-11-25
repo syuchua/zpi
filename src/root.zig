@@ -17,7 +17,7 @@ pub const mcp_tools = @import("mcp_tools");
 pub const context_budget = @import("context_budget");
 pub const compaction = @import("compaction");
 
-pub const VERSION = "0.1.0";
+pub const VERSION = "0.1.1";
 pub const ProviderError = error{
     MissingApiKey,
     HttpRequestFailed,

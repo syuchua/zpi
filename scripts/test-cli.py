@@ -670,12 +670,24 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.queue_requests.append(user)
                 if user == 'fullscreen-read':
                     if messages[-1]['role'] == 'tool':
-                        response = self.text('fullscreen read complete')
-                    else:
-                        response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
-                            'index': 0, 'id': 'live-read', 'type': 'function',
-                            'function': {'name': 'read', 'arguments': json.dumps({'path': 'live-read.txt'})},
-                        }]}, 'finish_reason': 'tool_calls'}]}
+                        # Stream the answer in slow chunks so the PTY can observe
+                        # rows being repainted incrementally.
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/event-stream')
+                        self.end_headers()
+                        for piece in ('fully ', 'split ', 'streamed'):
+                            chunk = {'choices': [{'index': 0, 'delta': {'content': piece}}]}
+                            self.wfile.write(('data: ' + json.dumps(chunk) + '\n\n').encode())
+                            self.wfile.flush()
+                            time.sleep(0.15)
+                        final = {'choices': [{'index': 0, 'delta': {'content': ' fullscreen read complete'}, 'finish_reason': 'stop'}]}
+                        self.wfile.write(('data: ' + json.dumps(final) + '\n\ndata: [DONE]\n\n').encode())
+                        self.wfile.flush()
+                        return
+                    response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'live-read', 'type': 'function',
+                        'function': {'name': 'read', 'arguments': json.dumps({'path': 'live-read.txt'})},
+                    }]}, 'finish_reason': 'tool_calls'}]}
                     data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/event-stream')
@@ -2667,7 +2679,7 @@ def check_resume_picker(root, environment):
         return transcript.find(marker, start)
 
     try:
-        expect(b'v0.1.0')
+        expect(b'v0.1.1')
         expect(b'|__ / |  _ \\|_ _|')
         expect(b'[Tools]')
         expect(b'first task alpha')
@@ -3296,6 +3308,18 @@ def check_fullscreen_viewport(root, environment, server):
     (skill_dir / 'SKILL.md').write_text('---\nname: fullscreen-fixture\ndescription: Fullscreen startup fixture.\n---\nBody.\n')
     env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color', COLORTERM='truecolor')
     env.pop('NO_COLOR', None)
+    clipboard_bin = root / 'clipboard-fixture-bin'
+    clipboard_bin.mkdir()
+    clipboard_names = ('pbcopy',) if sys.platform == 'darwin' else ('wl-copy', 'xclip')
+    clipboard_capture = root / 'clipboard-fixture-output'
+    for clipboard_name in clipboard_names:
+        clipboard_helper = clipboard_bin / clipboard_name
+        clipboard_helper.write_text('#!/bin/sh\nexec /bin/cat > "$ZPI_TEST_CLIPBOARD_CAPTURE"\n')
+        clipboard_helper.chmod(0o700)
+    env['PATH'] = str(clipboard_bin) + os.pathsep + env.get('PATH', os.defpath)
+    env['WAYLAND_DISPLAY'] = 'zpi-test-clipboard'
+    env['DISPLAY'] = 'zpi-test-clipboard'
+    env['ZPI_TEST_CLIPBOARD_CAPTURE'] = str(clipboard_capture)
     server.queue_stream_mid.clear()
     server.queue_stream_release.clear()
     session = root / 'fullscreen-session.jsonl'
@@ -3370,24 +3394,171 @@ def check_fullscreen_viewport(root, environment, server):
                 transcript.extend(chunk)
         return pos
 
-    frame_start = b'\x1b[?2026h\x1b[H\x1b[J'
-    frame_end = b'\x1b[?2026l'
+    sync_begin = b'\x1b[?2026h'
+    sync_end = b'\x1b[?2026l'
+    # Incremental row diffs begin with an absolute row address; out-of-band
+    # selector frames synchronize without one and are matched separately.
+    frame_start = sync_begin + b'\x1b['
+    frame_end = sync_end
+    # The viewport is exactly FULLSCREEN_ROWS tall: a full paint addresses every
+    # row (and may append one erase for the rows a shrink dropped), while an
+    # incremental paint only addresses the rows whose bytes changed.
+    FULLSCREEN_ROWS = 40
+    row_prefix = b'\x1b[0m\x1b[K'
+    full_clear = b'\x1b[H'
+    first_full_paint = b''
+    row_address = re.compile(rb'\x1b\[(\d+);(\d+)H')
+    cursor_move = re.compile(rb'\x1b\[\d+;\d+H')
 
-    def frame_with(marker, start, editor_row=None, pinned=None):
+    # Reconstruct the visible screen from the incremental row-diff frames. A
+    # paint addresses rows absolutely, ends each row with a style reset plus an
+    # erase-to-end-of-line, and closes a shrinking frame with an erase-to-end-
+    # of-screen that drops every row below the last painted one. Full repaints
+    # start with home (and usually a clear), so newer rows never stack on stale
+    # ones.
+    screen = []
+
+    def apply_frame(frame):
+        pos = 0
+        last_row = None
+        pending_truncate = False
+
+        def put(index, row):
+            while len(screen) <= index:
+                screen.append(b'')
+            screen[index] = row
+
+        # The cursor placement at the end of a paint does not change any row.
+        final_cursor = re.search(rb'\x1b\[\d+;\d+H(?:\x1b\[0m)?(?:' + re.escape(sync_end) + rb')?$', frame)
+        if final_cursor is not None:
+            frame = frame[:final_cursor.start()]
+        if frame.endswith(sync_end):
+            frame = frame[:-len(sync_end)]
+        while pos < len(frame):
+            if frame.startswith(b'\x1b[H\x1b[J', pos):
+                screen.clear()
+                last_row = None
+                pos += len(b'\x1b[H\x1b[J')
+                continue
+            if frame.startswith(b'\x1b[H', pos):
+                screen.clear()
+                last_row = None
+                pos += len(b'\x1b[H')
+                # A full repaint may omit the address of its first row.
+                if pos < len(frame) and frame[pos] != 0x1b:
+                    last_row = 0
+                continue
+            address = row_address.match(frame, pos)
+            if address is not None:
+                last_row = int(address.group(1)) - 1
+                assert address.group(2) == b'1', ('row paint must address column 1', frame[pos - 40:pos + 80])
+                pos = address.end()
+                if last_row < len(screen):
+                    screen[last_row] = b''
+                continue
+            if last_row is not None:
+                if frame.startswith(b'\x1b[J', pos):
+                    # A blank row that truncates the canvas.
+                    put(last_row, b'')
+                    del screen[last_row + 1:]
+                    pos += len(b'\x1b[J')
+                    last_row = None
+                    continue
+                # Rows embed their own style resets, so the paint suffix is the
+                # first reset that is immediately followed by the line erase.
+                reset = frame.find(b'\x1b[0m\x1b[K', pos)
+                assert reset >= 0, ('painted row without suffix', frame[pos:pos + 200])
+                put(last_row, frame[pos:reset])
+                pos = reset + len(b'\x1b[0m\x1b[K')
+                if frame.startswith(b'\x1b[J', pos):
+                    # Erase-to-end-of-screen: nothing survives below this row.
+                    pending_truncate = True
+                    pos += len(b'\x1b[J')
+                elif frame.startswith(b'\x1b[0m\x1b[J', pos):
+                    # An empty row keeps the style reset before the erase.
+                    pos += len(b'\x1b[0m\x1b[J')
+                    pending_truncate = True
+                last_row = None
+                continue
+            cursor = cursor_move.match(frame, pos)
+            if cursor is not None:
+                pos = cursor.end()
+                continue
+            raise AssertionError(('unexpected fullscreen byte', frame[pos:pos + 80], frame))
+        if pending_truncate and screen:
+            del screen[-1]
+
+    def screen_rows():
+        return list(screen)
+
+    def frame_with(marker, start, editor_row=None, pinned=None, screen_only=False):
+        """Match the reconstructed fullscreen state; `screen_only` also matches
+        out-of-band selector frames that repaint below the alt-screen."""
+        deadline = time.monotonic() + 10
+        try:
+            while time.monotonic() < deadline:
+                begin = expect(frame_start, start, deadline) + len(sync_begin)
+                end = expect(frame_end, begin, deadline)
+                frame = bytes(transcript[begin:end])
+                start = end + len(frame_end)
+                incremental = frame.startswith(b'\x1b[')
+                if incremental:
+                    apply_frame(frame)
+                elif screen_only:
+                    # Out-of-band frames (autocomplete popups, selectors) repaint
+                    # below the alt-screen rows and are matched on their own bytes.
+                    if marker in frame:
+                        return frame, start
+                    continue
+                if marker not in b'\n'.join(screen_rows()):
+                    continue
+                # The editor cursor is compared by row, not by column: the
+                # prompt is two columns wide unless colour prefixes are off.
+                ed = editor_row
+                if ed is not None and not re.search(rb'\x1b\[%d;\d+H(?:\x1b\[\?2026l)?$' % ed, frame):
+                    continue
+                if pinned is not None:
+                    rows = screen_rows()
+                    if len(rows) < 2 or pinned not in rows[1]:
+                        continue
+                return bytes(b'\n'.join(screen_rows())), start
+        except AssertionError:
+            raise
+        raise AssertionError(('no matching fullscreen frame', marker, editor_row, bytes(transcript[-3000:])))
+
+    def settle(start):
+        """Wait for the next full repaint (first frame, resize, or invalidation)."""
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            begin = expect(frame_start, start, deadline) + len(frame_start)
+            begin = expect(frame_start, start, deadline) + len(sync_begin)
             end = expect(frame_end, begin, deadline)
             frame = bytes(transcript[begin:end])
             start = end + len(frame_end)
-            if marker in frame and (editor_row is None or frame.endswith(f'\x1b[{editor_row};3H'.encode())):
-                if pinned is not None and pinned not in frame.split(b'\n')[1]:
-                    continue
-                return frame, start
-        raise AssertionError(('no matching fullscreen frame', marker, editor_row, bytes(transcript[-3000:])))
+            apply_frame(frame)
+            if frame.startswith(b'\x1b[H'):
+                # A paint that shrinks the height erases rows past the new last
+                # one; that erase is not a row of the reconstructed screen.
+                del screen[frame.count(b'\x1b[0m\x1b[K'):]
+                return start
+        raise AssertionError(('no full repaint', bytes(transcript[-3000:])))
+
+    def frames_between(start, count):
+        """Collect (and apply) `count` incremental frames, then return their bytes."""
+        deadline = time.monotonic() + 10
+        collected = []
+        for _ in range(count):
+            begin = expect(frame_start, start, deadline) + len(sync_begin)
+            end = expect(frame_end, begin, deadline)
+            collected.append(bytes(transcript[begin:end]))
+            start = end + len(frame_end)
+            apply_frame(collected[-1])
+        return collected, start
 
     try:
         expect(b'\x1b[?1049h')
+        paint_begin, paint_end = expect(sync_begin), expect(frame_end, expect(sync_begin))
+        first_full_paint = bytes(transcript[paint_begin:paint_end])
+        assert first_full_paint.startswith(sync_begin + b'\x1b[H'), first_full_paint
         frame, pos = frame_with(b'[Skills]', 0, editor_row=37)
         assert b'____  ____  ___' in frame and b'fullscreen-fixture' in frame, frame
         assert b'Ctrl-C interrupt' in frame and b'[Tools]' in frame, frame
@@ -3422,11 +3593,17 @@ def check_fullscreen_viewport(root, environment, server):
         frame, pos = frame_with(b'(click to collapse)', pos)
         assert b'C' * 15 in frame, frame
 
+        # A resize invalidates the retained rows, so the next paint is a full
+        # repaint of the new geometry; its height is checked on that frame.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 5, 70, 0, 0))
-        frame, pos = frame_with(b'queue-fixture/queue-model', pos, editor_row=3)
+        pos = settle(pos)
+        frame = b'\n'.join(screen_rows())
         assert frame.count(b'\n') == 4, frame
+        assert b'queue-fixture/queue-model' in frame, frame
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 70, 0, 0))
-        _, pos = frame_with(b'queue-fixture/queue-model', pos, editor_row=37)
+        pos = settle(pos)
+        frame = b'\n'.join(screen_rows())
+        assert frame.count(b'\n') == 39, frame
 
         os.write(master, b'/resume ' + os.fsencode(session) + b'\r')
         frame, pos = frame_with(b'restored assistant', pos)
@@ -3476,15 +3653,73 @@ def check_fullscreen_viewport(root, environment, server):
         frame, pos = frame_with(b'Show keyboard shortcuts', pos)
         popup_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'Show keyboard shortcuts' in line)
         os.write(master, f'\x1b[<0;5;{popup_row}M'.encode())
-        input_frame, pos = frame_with(b'/hotkeys ', pos)
+        # Autocomplete popup frames are painted out of band; match them directly.
+        input_frame, pos = frame_with(b'/hotkeys ', pos, screen_only=True)
         assert b'Show keyboard shortcuts' not in input_frame, input_frame
         os.write(master, b'\n')
-        frame, pos = frame_with(b'Keyboard shortcuts', pos)
+        frame, pos = frame_with(b'Keyboard shortcuts', pos, screen_only=True)
         os.write(master, b'\r')
         frame, pos = frame_with(b'restored assistant', pos)
 
-        os.write(master, b'fullscreen-read\n')
+        # -- Incremental rendering under a steady stream -------------------
+        # Typing only repaints the editor row and never clears the viewport.
+        edit_mark = pos
+        os.write(master, b'fullscreen-read')
+        _, pos = frames_between(pos, 1)
+        typing = transcript[edit_mark:pos]
+        assert b'\x1b[?1049h' not in typing and b'\x1b[?1049l' not in typing, typing
+        assert full_clear not in typing, typing
+        names = re.findall(rb'\x1b\[(\d+);1H', typing)
+        assert names and set(names) == {b'37'}, (names, typing)
+        assert b'> \x1b[0mfullscreen-read' in typing, typing
+        # The typed word streamed in one row repaint per keystroke (coalesced
+        # frames may merge a few), never a whole viewport, and far fewer bytes
+        # than a full paint of the same screen.
+        assert 1 <= typing.count(row_prefix) <= len(b'fullscreen-read'), typing
+        assert len(typing) < len(first_full_paint) // 4, (len(typing), len(first_full_paint))
+        typing_mark = pos
+        os.write(master, b'\n')
+        # Three streamed chunks arrive ~150 ms apart; wait for each so several
+        # incremental repaints are captured before the turn settles.
+        for marker in (b'fully', b'split', b'fully split streamed'):
+            _, pos = frame_with(marker, pos)
         frame, pos = frame_with(b'fullscreen read complete', pos)
+        streamed = bytes(transcript[typing_mark:pos])
+        # Streaming output repaints only the transcript rows it changed.
+        # Starting a turn re-enables mouse/paste reporting (fullscreen only) and
+        # invalidates the retained rows once, so exactly one full repaint opens
+        # the turn; the rest of the per-frame bytes are incremental row paints.
+        assert b'\x1b[?1049h' not in streamed and b'\x1b[?1049l' not in streamed, streamed
+        assert streamed.count(full_clear) == 1, streamed
+        streamed = streamed[streamed.index(frame_start):]
+        assert streamed.count(full_clear) == 1, streamed
+        # No autowrapping: each row address is written at most once per frame.
+        for paint in re.findall(rb'\x1b\[\?2026h(.*?)\x1b\[\?2026l', streamed, re.DOTALL):
+            rows = re.findall(rb'\x1b\[(\d+);1H', paint)
+            assert len(rows) == len(set(rows)), (rows, paint)
+        # Every frame after the opening repaint is incremental: no clear, and
+        # far fewer rows than the whole viewport.
+        streaming_frames = re.findall(rb'\x1b\[\?2026h(.*?)\x1b\[\?2026l', streamed, re.DOTALL)
+        assert len(streaming_frames) >= 2, streamed
+        for incremental in streaming_frames[1:]:
+            assert full_clear not in incremental, incremental
+            assert len(re.findall(rb'\x1b\[\d+;1H', incremental)) < FULLSCREEN_ROWS, incremental
+        # The steady stream after its one opening repaint.
+        steady = streamed[streamed.index(frame_start):]
+        steady = steady[steady.index(sync_begin, steady.index(sync_end) + len(sync_end)):]
+        steady_frames = re.findall(rb'\x1b\[\?2026h(.*?)\x1b\[\?2026l', steady, re.DOTALL)
+        assert len(steady_frames) >= 2, steady
+        for paint in steady_frames:
+            assert full_clear not in paint, paint
+            rows = len(re.findall(rb'\x1b\[\d+;1H', paint))
+            assert rows < FULLSCREEN_ROWS, (rows, paint)
+        # Intermediate streamed frames only touch the rows of the growing
+        # transcript, so they cost a fraction of a full repaint, and even the
+        # settled tail costs fewer bytes than repainting the whole screen.
+        sizes = [len(paint) for paint in steady_frames]
+        partial = [size for size in sizes[:-1] if size < len(first_full_paint) // 4]
+        assert len(partial) >= 2, (sizes, len(first_full_paint))
+        assert sum(partial) < len(first_full_paint), (partial, len(first_full_paint))
         assert frame.count(b'live read marker') == 2, frame
         assert b'(click to show more)' in frame, frame
         live_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'live read marker' in line)
@@ -3561,6 +3796,105 @@ def check_fullscreen_viewport(root, environment, server):
         os.write(master, f'\x1b[<0;5;{button_row}M'.encode())
         frame, pos = frame_with(b'fullscreen-new-output', pos, pinned=b'> fullscreen-slow')
         assert b'Jump to latest' not in frame, frame
+        # ---- Transcript search and user-prompt navigation ----
+        # Ctrl-F opens search on an empty prompt; Esc restores the exact page.
+        # The previous step already left the live tail on screen.
+        baseline = frame
+        assert b'fullscreen-new-output' in baseline, baseline
+        os.write(master, b'\x06')
+        frame, pos = frame_with(b'search transcript', pos)
+        search_text = lambda raw: re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b'', raw)
+        assert b'/ search transcript' in search_text(frame), frame
+        os.write(master, b'\x1b')
+        restored, pos = frame_with(b'fullscreen-new-output', pos)
+        assert b'search transcript' not in restored, restored
+        # Esc restores the same page content and pinned message.
+        assert search_text(restored).find(b'fullscreen-new-output') >= 0, restored
+        assert restored.split(b'\n')[1] == baseline.split(b'\n')[1], (baseline, restored)
+
+        # A query without matches reports the count instead of moving the page.
+        os.write(master, b'/search\r')
+        frame, pos = frame_with(b'search transcript', pos)
+        os.write(master, b'zzz-no-such-row')
+        frame, pos = frame_with(b'no matches', pos)
+        assert b'no matches' in frame and b'> fullscreen-slow' in frame.split(b'\n')[1], frame
+        # Ctrl-C cancels and leaves the editor usable.
+        os.write(master, b'\x03')
+        frame, pos = frame_with(b'fullscreen-new-output', pos)
+        assert b'no matches' not in frame, frame
+
+        # Matches, match count and previous/next cycling in both directions.
+        os.write(master, b'\x06')
+        frame, pos = frame_with(b'search transcript', pos)
+        os.write(master, b'restored')
+        # Typing focuses the last match and reports the counter.
+        frame, pos = frame_with(b'2/2', pos)
+        assert b'/ restored' in search_text(frame), frame
+        # Ctrl-P steps to the previous match; Up repeats it, Down and Ctrl-N wrap.
+        os.write(master, b'\x10')
+        frame, pos = frame_with(b'1/2', pos)
+        os.write(master, b'\x1b[A')
+        frame, pos = frame_with(b'2/2', pos)
+        os.write(master, b'\x1b[B')
+        frame, pos = frame_with(b'1/2', pos)
+        os.write(master, b'\x0e')
+        frame, pos = frame_with(b'2/2', pos)
+        os.write(master, b'\x1b')
+        frame, pos = frame_with(b'fullscreen-new-output', pos)
+        assert b'/ restored' not in search_text(frame), frame
+
+        # User-prompt navigation marks every user message and walks both ways.
+        os.write(master, b'\x10')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> fullscreen-slow')
+        os.write(master, b'\x10')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> fullscreen-read')
+        assert b'fullscreen-new-output' not in frame, frame
+        os.write(master, b'\x10')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> restored user')
+        assert b'fullscreen-read' not in search_text(frame), frame
+        # Forward navigation mirrors the backward walk and resumes following.
+        os.write(master, b'\x0e')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> fullscreen-read')
+        os.write(master, b'\x0e')
+        frame, pos = frame_with(b'fullscreen-new-output', pos, pinned=b'> fullscreen-slow')
+        assert b'Jump to latest' not in frame, frame
+
+        # A non-empty draft keeps Ctrl-P/Ctrl-N as history/line editing.
+        os.write(master, b'hello')
+        frame, pos = frame_with(b'fullscreen-new-output', pos)
+        assert b'> hello' in search_text(frame), frame
+        # Ctrl-P with a draft keeps editing rather than jumping to a user
+        # message: the pinned header does not change and the draft stays.
+        os.write(master, b'\x10')
+        frame, pos = frame_with(b'fullscreen-new-output', pos)
+        assert b'> fullscreen-slow' in frame.split(b'\n')[1], frame
+        os.write(master, b'\x15')  # Ctrl-U clears the draft
+        frame, pos = frame_with(b'fullscreen-new-output', pos)
+
+        # /hotkeys documents the new bindings.
+        os.write(master, b'/hotkeys\r')
+        frame, pos = frame_with(b'Keyboard shortcuts', pos)
+        os.write(master, b'q')
+        frame, pos = frame_with(b'fullscreen-new-output', pos)
+        assert b'Keyboard shortcuts' not in search_text(frame), frame
+
+        if sys.platform in ('darwin', 'linux'):
+            saved = session.read_bytes()
+            expected = (''.join(f'older-{i:02d}\n' for i in range(24)) + 'fullscreen-new-output\ndone').encode()
+            for action in (b'/copy\r', b'\x18'):
+                clipboard_capture.unlink(missing_ok=True)
+                os.write(master, action)
+                copied = expect(b'Copied last assistant reply to clipboard.', pos)
+                assert clipboard_capture.read_bytes() == expected
+                frame, pos = frame_with(b'fullscreen-new-output', copied)
+            for clipboard_name in clipboard_names:
+                (clipboard_bin / clipboard_name).write_text('#!/bin/sh\nexit 1\n')
+            clipboard_capture.unlink()
+            os.write(master, b'/copy\r')
+            failed = expect(b'zpi: copy failed.', pos)
+            frame, pos = frame_with(b'fullscreen-new-output', failed)
+            assert not clipboard_capture.exists() and session.read_bytes() == saved
+
         os.write(master, b'/quit\n')
         leave = expect(b'\x1b[?1049l', pos)
         assert b'\x1b[?1000l\x1b[?1006l' in transcript[pos:leave], transcript[pos:leave]
