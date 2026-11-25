@@ -59,7 +59,10 @@ jobs:
         run: |
           test "$(uname -m)" = "$EXPECTED_MACHINE"
           archive="$RUNNER_TEMP/$ZIG_ARCHIVE"
-          curl -fsSL --retry 3 --max-time 180 "https://ziglang.org/download/0.17.0/$ZIG_ARCHIVE" -o "$archive"
+          if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 "https://ziglang.org/download/0.17.0/$ZIG_ARCHIVE" -o "$archive"; then
+            rm -f "$archive"
+            curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 "https://pkg.hexops.org/zig/$ZIG_ARCHIVE" -o "$archive"
+          fi
           printf '%s  %s\n' "$ZIG_SHA256" "$archive" | shasum -a 256 -c
           mkdir "$RUNNER_TEMP/zig"
           tar -xf "$archive" --strip-components=1 -C "$RUNNER_TEMP/zig"
@@ -203,7 +206,10 @@ jobs:
         run: |
           test "$(uname -m)" = "$EXPECTED_MACHINE"
           archive="$RUNNER_TEMP/$ZIG_ARCHIVE"
-          curl -fsSL --retry 3 --max-time 180 "https://ziglang.org/download/0.17.0/$ZIG_ARCHIVE" -o "$archive"
+          if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 "https://ziglang.org/download/0.17.0/$ZIG_ARCHIVE" -o "$archive"; then
+            rm -f "$archive"
+            curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 "https://pkg.hexops.org/zig/$ZIG_ARCHIVE" -o "$archive"
+          fi
           printf '%s  %s\n' "$ZIG_SHA256" "$archive" | shasum -a 256 -c
           mkdir "$RUNNER_TEMP/zig"
           tar -xf "$archive" --strip-components=1 -C "$RUNNER_TEMP/zig"
