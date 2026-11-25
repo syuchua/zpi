@@ -8,6 +8,37 @@ const http_headers = @import("http_headers");
 
 pub const ProxyPolicy = enum { system, none };
 
+pub fn retryHint(err: anyerror, status: ?std.http.Status, retry_after_ms: ?u64) model.RetryHint {
+    return switch (err) {
+        error.HttpRequestFailed => if (status) |code| .{
+            .retryable = http_headers.isRetryableHttpStatus(code),
+            .retry_after_ms = retry_after_ms,
+            .context_overflow = code == .payload_too_large,
+        } else .{ .retryable = false },
+        error.RequestTimeout,
+        error.TruncatedStream,
+        error.ResponseReadFailed,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.TemporaryNameServerFailure,
+        error.UnknownHostName,
+        error.NameServerFailure,
+        error.NoAddressReturned,
+        error.NetworkDown,
+        error.Timeout,
+        error.HttpConnectionClosing,
+        error.HttpRequestTruncated,
+        error.WriteFailed,
+        error.BrokenPipe,
+        error.TlsConnectionTruncated,
+        => .{ .retryable = true },
+        else => .{ .retryable = false },
+    };
+}
+
 pub const Request = struct {
     uri: std.Uri,
     authorization: ?[]const u8 = null,
@@ -111,7 +142,10 @@ pub fn postSse(
     const body_copy = try allocator.dupe(u8, req_opts.payload);
     defer allocator.free(body_copy);
     try req.sendBodyComplete(body_copy);
-    var response = try req.receiveHead(&.{});
+    var response = req.receiveHead(&.{}) catch |err| switch (err) {
+        error.ReadFailed => return if (req.connection) |conn| conn.getReadError() orelse error.ResponseReadFailed else error.ResponseReadFailed,
+        else => |e| return e,
+    };
     out_status.* = response.head.status;
     if (response.head.status != .ok) {
         out_retry_after_ms.* = http_headers.parseRetryAfterMs(response.head);
@@ -234,7 +268,8 @@ fn runTunneledPost(
         .max_head_len = max_head_len,
     };
     const connect_head_bytes = connect_http.receiveHead() catch |err| switch (err) {
-        error.ReadFailed => return error.ProxyConnectFailed,
+        error.ReadFailed => return sock_reader.err orelse error.ResponseReadFailed,
+        error.HttpConnectionClosing, error.HttpRequestTruncated => |e| return e,
         else => return error.ProxyConnectFailed,
     };
     const connect_head = std.http.Client.Response.Head.parse(connect_head_bytes) catch return error.ProxyConnectFailed;

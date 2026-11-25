@@ -14,25 +14,33 @@ pub fn formatStartWithArgAlloc(
     arg_summary: []const u8,
     cols_raw: usize,
 ) ![]u8 {
-    const max_cols = @max(cols_raw, 4) -| 1;
+    return formatHeaderAlloc(allocator, th, tool_name, arg_summary, cols_raw, false);
+}
+
+pub fn formatInputAlloc(allocator: std.mem.Allocator, th: theme.Theme, tool_name: []const u8, arg_summary: []const u8, cols: usize) ![]u8 {
+    return formatHeaderAlloc(allocator, th, tool_name, arg_summary, cols, true);
+}
+
+fn formatHeaderAlloc(allocator: std.mem.Allocator, th: theme.Theme, tool_name: []const u8, arg_summary: []const u8, cols: usize, show_input_title: bool) ![]u8 {
+    const max_cols = @max(cols, 4) -| 1;
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.append(allocator, '\n');
     try th.paint(&out, allocator, theme.Theme.border, "╭─ ");
+    if (show_input_title) {
+        try th.paint(&out, allocator, theme.Theme.tool_input, "Input");
+        try out.appendSlice(allocator, " · ");
+    }
     try th.appendOpen(&out, allocator, theme.Theme.tool_header);
     try out.appendSlice(allocator, "[tool: ");
-    var safe_name: std.ArrayList(u8) = .empty;
-    defer safe_name.deinit(allocator);
-    _ = try terminal.appendClippedText(&safe_name, allocator, tool_name, max_cols -| 14);
-    try out.appendSlice(allocator, safe_name.items);
+    const name_budget = max_cols -| (terminal.visibleWidth(out.items) + 4);
+    _ = try terminal.appendClippedText(&out, allocator, tool_name, name_budget);
     try out.append(allocator, ']');
     try th.appendClose(&out, allocator);
 
-    var arg_w: usize = 0;
     if (arg_summary.len > 0) {
-        const prefix_w = 3 + 7 + terminal.visibleWidth(safe_name.items) + 1;
-        const arg_budget = (max_cols -| prefix_w) -| 4;
+        const arg_budget = max_cols -| (terminal.visibleWidth(out.items) + 4);
         if (arg_budget >= 4) {
             var safe_arg: std.ArrayList(u8) = .empty;
             defer safe_arg.deinit(allocator);
@@ -42,14 +50,12 @@ pub fn formatStartWithArgAlloc(
                 try th.appendOpen(&out, allocator, theme.Theme.accent);
                 try out.appendSlice(allocator, safe_arg.items);
                 try th.appendClose(&out, allocator);
-                arg_w = 1 + terminal.visibleWidth(safe_arg.items);
             }
         }
     }
     try out.append(allocator, ' ');
 
-    const used = 3 + 7 + terminal.visibleWidth(safe_name.items) + 1 + arg_w + 1;
-    const fill = max_cols -| used;
+    const fill = max_cols -| terminal.visibleWidth(out.items);
     if (fill > 0) {
         try th.appendOpen(&out, allocator, theme.Theme.border);
         for (0..fill) |_| try out.appendSlice(allocator, "─");
@@ -95,6 +101,42 @@ pub fn formatBodyBlockAlloc(
         .lines_written = count,
         .truncated = truncated,
     };
+}
+
+/// Format a bounded, terminal-width-aware preview. Truncation is based on
+/// wrapped display rows so an unusually long single line cannot flood scrollback.
+pub fn formatBodyPreviewAlloc(
+    allocator: std.mem.Allocator,
+    th: theme.Theme,
+    text: []const u8,
+    max_lines: usize,
+    cols_raw: usize,
+) !struct { text: []u8, lines_written: usize, truncated: bool } {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const cols = @max(cols_raw, 4) -| 3;
+    var count: usize = 0;
+    var truncated = false;
+    var logical = std.mem.splitScalar(u8, text, '\n');
+    while (logical.next()) |raw_line| {
+        const clean = try terminal.safeUtf8Alloc(allocator, std.mem.trimEnd(u8, raw_line, "\r"));
+        defer allocator.free(clean);
+        const wrapped = try terminal.wrapAnsiAlloc(allocator, clean, cols);
+        defer allocator.free(wrapped);
+        var rows = std.mem.splitScalar(u8, wrapped, '\n');
+        while (rows.next()) |row| {
+            if (count >= max_lines) {
+                truncated = true;
+                break;
+            }
+            try th.paint(&out, allocator, theme.Theme.border, "│ ");
+            try terminal.appendSanitizedText(&out, allocator, row);
+            try out.append(allocator, '\n');
+            count += 1;
+        }
+        if (truncated) break;
+    }
+    return .{ .text = try out.toOwnedSlice(allocator), .lines_written = count, .truncated = truncated };
 }
 
 pub fn formatSpillLineAlloc(allocator: std.mem.Allocator, th: theme.Theme, path: []const u8) ![]u8 {
@@ -181,4 +223,10 @@ test "ToolCard and DiffView preserve tool markers and diff colors" {
     try std.testing.expectEqual(@as(usize, 2), block.lines_written);
     try std.testing.expect(block.truncated);
     try std.testing.expectEqualStrings("│ one\n│ two\n", block.text);
+
+    const preview = try formatBodyPreviewAlloc(a, theme.Theme.init(.none), "012345678901234567890", 2, 8);
+    defer a.free(preview.text);
+    try std.testing.expectEqual(@as(usize, 2), preview.lines_written);
+    try std.testing.expect(preview.truncated);
+    try std.testing.expectEqualStrings("│ 01234\n│ 56789\n", preview.text);
 }

@@ -39,7 +39,26 @@ def run_repo_cli(command, **kwargs):
 
 
 def cli_command(command):
-    return [str(BINARY) if value == str(BINARY) else value for value in command]
+    return [str(BINARY) if value == str(BINARY) else value for value in command] + ['--tui-mode', 'regular']
+
+
+def wait_for_pty_exit(process, master, transcript, timeout=5):
+    deadline = time.monotonic() + timeout
+    while process.poll() is None or select.select([master], [], [], 0)[0]:
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, bytes(transcript[-4096:])
+        if not select.select([master], [], [], min(0.05, remaining))[0]:
+            continue
+        try:
+            chunk = os.read(master, 16384)
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        transcript.extend(chunk)
+    return process.wait(timeout=max(0.01, deadline - time.monotonic()))
 
 
 class Server(ThreadingHTTPServer):
@@ -649,6 +668,21 @@ class Handler(BaseHTTPRequestHandler):
                 messages = request['messages']
                 user = [m['content'] for m in messages if m['role'] == 'user'][-1]
                 self.server.queue_requests.append(user)
+                if user == 'fullscreen-read':
+                    if messages[-1]['role'] == 'tool':
+                        response = self.text('fullscreen read complete')
+                    else:
+                        response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                            'index': 0, 'id': 'live-read', 'type': 'function',
+                            'function': {'name': 'read', 'arguments': json.dumps({'path': 'live-read.txt'})},
+                        }]}, 'finish_reason': 'tool_calls'}]}
+                    data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
                 if user == 'steer-batch':
                     c = {'choices': [{'index': 0, 'delta': {'tool_calls': [
                         {'index': 0, 'id': 'steer-bash', 'type': 'function',
@@ -1815,7 +1849,7 @@ def check_tree_navigation(root, environment, server):
     before = ''.join(json.dumps(record) + '\n' for record in records).encode()
     session.write_bytes(before)
     args = [str(BINARY), '--no-proxy', '--models-file', str(config), '--provider', 'tree-fixture',
-            '--session', str(session), '--no-tools', '--skill', str(skills)]
+            '--session', str(session), '--no-tools', '--skill', str(skills), '--tui-mode', 'regular']
     server.tree_summary_requests = 0
     master, slave = pty.openpty()
 
@@ -1966,8 +2000,11 @@ def check_tree_navigation(root, environment, server):
         assert server.tree_summary_requests == 3
         live_end = command(b'tree-live', b'tree-live complete')
         expect(b'\x1b[?2004l', live_end)
+        exit_start = len(transcript)
         os.write(master, b'/exit\n')
-        assert process.wait(timeout=5) == 0, bytes(transcript)
+        assert wait_for_pty_exit(process, master, transcript) == 0, bytes(transcript[-4096:])
+        assert b'Saved session: ' + os.fsencode(session.name) in transcript[exit_start:], bytes(transcript[-4096:])
+        assert os.fsencode(session) not in transcript[exit_start:] and b'tree-live complete' not in transcript[exit_start:], bytes(transcript[-4096:])
         term_after = termios.tcgetattr(slave)
         term_after[3] &= ~getattr(termios, 'PENDIN', 0)
         term_before[3] &= ~getattr(termios, 'PENDIN', 0)
@@ -1997,7 +2034,7 @@ def check_queued_followup_editing(root, environment, server):
     }}}))
     session = root / 'queue-session.jsonl'
     env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm')
-    args = [str(BINARY), '--no-proxy', '--provider', 'queue-fixture', '--session', str(session)]
+    args = [str(BINARY), '--no-proxy', '--provider', 'queue-fixture', '--session', str(session), '--tui-mode', 'regular']
 
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
@@ -2180,7 +2217,7 @@ def check_tui_components(root, environment, server):
     env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color', COLORTERM='truecolor')
     env.pop('NO_COLOR', None)
     server.shell_context_requests = []
-    args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(comp_dir)]
+    args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(comp_dir), '--tui-mode', 'regular']
 
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
@@ -2229,7 +2266,7 @@ def check_tui_components(root, environment, server):
         expect(b'\xe2\x95\xad\xe2\x94\x80 ', start)
         expect(b'[tool: edit]', start)
         expect(b'comp.txt', start)
-        expect(b'Ctrl+O shows 20 lines', start)
+        expect(b'Ctrl+O to expand', start)
         expect(b'\xe2\x95\xb0\xe2\x94\x80 ', start)
         expect(b'\xe2\x9c\x93', start)
         expect(b'\x1b[1;38;2;103;212;242m## Summary\x1b[0m', start)
@@ -2244,18 +2281,6 @@ def check_tui_components(root, environment, server):
         assert b'\x1b[?1000h' not in transcript and b'\x1b[?1006h' not in transcript, 'mouse capture enabled'
         assert (comp_dir / 'comp.txt').read_text() == 'line1\nnew\nline3\n'
 
-        # /details opens a bounded independent overlay with persisted tool calls and results.
-        details_mark = len(transcript)
-        os.write(master, b'/details\n')
-        expect(b'Tool output ', details_mark)
-        expect(b'tool edit:', details_mark)
-        expect(b'-2 old', details_mark)
-        expect(b'+2 new', details_mark)
-        expect(b'Esc close', details_mark)
-        closed_mark = len(transcript)
-        os.write(master, b'q')
-        expect(b'\x1b[?2004h', closed_mark)
-
         # 2b. Live bash tool_update streaming + Ctrl+O compact/expanded toggle.
         start = len(transcript)
         os.write(master, b's')
@@ -2263,9 +2288,10 @@ def check_tui_components(root, environment, server):
         os.write(master, b'tream-bash\n')
         expect(b'[tool: bash]', start)
         expect(b'B1', start)
-        expect(b'Ctrl+O shows 20 lines', start)
+        expect(b'Ctrl+O to expand', start)
         done1 = expect(b'bash stream done', start)
         expect(b'\x1b[?2004h', done1)
+        assert b'B12' not in transcript[start:done1], transcript[start:done1]
 
         mark_o = len(transcript)
         os.write(master, b'\x0f')
@@ -2277,7 +2303,7 @@ def check_tui_components(root, environment, server):
         expect(b'B12', start)
         done2 = expect(b'bash stream done', start)
         expect(b'\x1b[?2004h', done2)
-        assert b'Ctrl+O shows 20 lines' not in transcript[start:], transcript[start:]
+        assert b'Ctrl+O to expand' not in transcript[start:], transcript[start:]
         os.write(master, b'\x0f')
         time.sleep(0.08)
 
@@ -2414,7 +2440,7 @@ def check_tui_components(root, environment, server):
     # 4. Verify TERM=dumb falls back to plain-text lists for /model and /tree.
     dumb_env = dict(env, TERM='dumb')
     master3, slave3 = pty.openpty()
-    proc3 = subprocess.Popen(args, cwd=comp_dir, env=dumb_env, stdin=slave3, stdout=slave3, stderr=slave3, close_fds=True)
+    proc3 = subprocess.Popen(args[:-2], cwd=comp_dir, env=dumb_env, stdin=slave3, stdout=slave3, stderr=slave3, close_fds=True)
     os.close(slave3)
     t3 = bytearray()
     try:
@@ -2434,6 +2460,7 @@ def check_tui_components(root, environment, server):
                 t3.extend(os.read(master3, 16384))
             assert time.monotonic() < deadline, bytes(t3)
         assert b'Type to filter' not in t3 and b'Up/Down move' not in t3, bytes(t3)
+        assert b'\x1b[?1049h' not in t3 and b'\x1b[?1000h' not in t3, bytes(t3)
         os.write(master3, b'/exit\n')
         assert proc3.wait(timeout=5) == 0
     finally:
@@ -2486,7 +2513,7 @@ def check_settings_and_model_switch(root, environment, server):
     before = termios.tcgetattr(slave)
     transcript = bytearray()
     process = subprocess.Popen(
-        [str(BINARY), '--no-proxy', '--no-session'],
+        [str(BINARY), '--no-proxy', '--no-session', '--tui-mode', 'regular'],
         cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
     )
     os.close(slave)
@@ -2618,7 +2645,7 @@ def check_resume_picker(root, environment):
 
     env = dict(environment, TERM='xterm-256color', PI_CODING_AGENT_SESSION_DIR=str(sessions_dir))
     env.pop('NO_COLOR', None)
-    args = [str(BINARY), '--no-proxy', '--cwd', str(resume_work), '--session', str(alpha)]
+    args = [str(BINARY), '--no-proxy', '--cwd', str(resume_work), '--session', str(alpha), '--tui-mode', 'regular']
 
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
@@ -2697,7 +2724,7 @@ def check_resume_picker(root, environment):
     # TERM=dumb falls back to plain-text /resume listing without SelectList chrome.
     dumb_env = dict(env, TERM='dumb')
     m2, s2_fd = pty.openpty()
-    p2 = subprocess.Popen(args, cwd=resume_work, env=dumb_env, stdin=s2_fd, stdout=s2_fd, stderr=s2_fd, close_fds=True)
+    p2 = subprocess.Popen(args[:-2], cwd=resume_work, env=dumb_env, stdin=s2_fd, stdout=s2_fd, stderr=s2_fd, close_fds=True)
     os.close(s2_fd)
     t2 = bytearray()
     try:
@@ -2739,7 +2766,7 @@ def check_resume_picker(root, environment):
     lazy_dir = root / 'lazy-sessions'
     lazy_dir.mkdir()
     lazy_env = dict(env, PI_CODING_AGENT_SESSION_DIR=str(lazy_dir))
-    lazy_args = [str(BINARY), '--no-proxy', '--cwd', str(resume_work)]
+    lazy_args = [str(BINARY), '--no-proxy', '--cwd', str(resume_work), '--tui-mode', 'regular']
     m3, s3_fd = pty.openpty()
     p3 = subprocess.Popen(lazy_args, cwd=resume_work, env=lazy_env, stdin=s3_fd, stdout=s3_fd, stderr=s3_fd, close_fds=True)
     os.close(s3_fd)
@@ -2790,7 +2817,7 @@ def check_bg_tasks_pty(root, environment, server):
     }))
     env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color')
     env.pop('NO_COLOR', None)
-    args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(bg_dir)]
+    args = [str(BINARY), '--no-proxy', '--no-session', '--cwd', str(bg_dir), '--tui-mode', 'regular']
 
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
@@ -3264,6 +3291,9 @@ def check_fullscreen_viewport(root, environment, server):
         'apiKey': 'queue-key',
         'models': [{'id': 'queue-model'}],
     }}}))
+    skill_dir = agent_dir / 'skills' / 'fullscreen-fixture'
+    skill_dir.mkdir(parents=True)
+    (skill_dir / 'SKILL.md').write_text('---\nname: fullscreen-fixture\ndescription: Fullscreen startup fixture.\n---\nBody.\n')
     env = dict(environment, PI_CODING_AGENT_DIR=str(agent_dir), TERM='xterm-256color', COLORTERM='truecolor')
     env.pop('NO_COLOR', None)
     server.queue_stream_mid.clear()
@@ -3283,19 +3313,40 @@ def check_fullscreen_viewport(root, environment, server):
         }},
         {'type': 'message', 'id': '3', 'parent_id': '2', 'message': {
             'role': 'tool_result', 'tool_call_id': 'fullscreen-read-1', 'tool_name': 'read',
-            'content': [{'text': 'first result marker'}],
+            'content': [{'text': 'first result marker\n' * 12}],
         }},
         {'type': 'message', 'id': '4', 'parent_id': '3', 'message': {
             'role': 'tool_result', 'tool_call_id': 'fullscreen-read-2', 'tool_name': 'read',
-            'content': [{'text': 'second result marker'}],
+            'content': [{'text': 'second result marker\n' * 12}]
         }},
         {'type': 'message', 'id': '5', 'parent_id': '4', 'message': {
             'role': 'assistant', 'content': [{'text': 'restored assistant'}],
         }},
     ]) + '\n')
-    args = [str(BINARY), '--fullscreen', '--no-proxy', '--provider', 'queue-fixture', '--session', str(session)]
+    (root / 'live-read.txt').write_text('live read marker\n' * 12)
+    initial_session = root / 'fullscreen-initial.jsonl'
+    initial_session.write_text(session.read_text().replace('restored user', 'initial user')
+                               .replace('restored assistant', 'initial assistant'))
+    width_session = root / 'fullscreen-width.jsonl'
+    width_text = 'A' * 55 + 'B' * 55 + 'C' * 15
+    width_session.write_text('\n'.join(json.dumps(record) for record in [
+        {'type': 'session', 'cwd': str(root)},
+        {'type': 'message', 'id': '1', 'parent_id': None, 'message': {
+            'role': 'user', 'content': [{'text': 'width user'}],
+        }},
+        {'type': 'message', 'id': '2', 'parent_id': '1', 'message': {
+            'role': 'assistant', 'content': [{'tool_call': {
+                'id': 'wide-line', 'name': 'read', 'arguments': {'path': 'wide.txt'},
+            }}],
+        }},
+        {'type': 'message', 'id': '3', 'parent_id': '2', 'message': {
+            'role': 'tool_result', 'tool_call_id': 'wide-line', 'tool_name': 'read',
+            'content': [{'text': width_text}],
+        }},
+    ]) + '\n')
+    args = [str(BINARY), '--no-proxy', '--provider', 'queue-fixture', '--session', str(initial_session)]
     master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 70, 0, 0))
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 70, 0, 0))
     before = termios.tcgetattr(slave)
     process = subprocess.Popen(args, cwd=root, env=env, stdin=slave, stdout=slave, stderr=slave,
                                close_fds=True, preexec_fn=lambda: (os.setsid(), fcntl.ioctl(slave, termios.TIOCSCTTY, 0)))
@@ -3322,7 +3373,7 @@ def check_fullscreen_viewport(root, environment, server):
     frame_start = b'\x1b[?2026h\x1b[H\x1b[J'
     frame_end = b'\x1b[?2026l'
 
-    def frame_with(marker, start, editor_row=None):
+    def frame_with(marker, start, editor_row=None, pinned=None):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             begin = expect(frame_start, start, deadline) + len(frame_start)
@@ -3330,30 +3381,96 @@ def check_fullscreen_viewport(root, environment, server):
             frame = bytes(transcript[begin:end])
             start = end + len(frame_end)
             if marker in frame and (editor_row is None or frame.endswith(f'\x1b[{editor_row};3H'.encode())):
+                if pinned is not None and pinned not in frame.split(b'\n')[1]:
+                    continue
                 return frame, start
         raise AssertionError(('no matching fullscreen frame', marker, editor_row, bytes(transcript[-3000:])))
 
     try:
         expect(b'\x1b[?1049h')
-        frame, pos = frame_with(b'restored assistant', 0)
-        assert b'> restored user' in frame.splitlines()[0], frame
+        frame, pos = frame_with(b'[Skills]', 0, editor_row=37)
+        assert b'____  ____  ___' in frame and b'fullscreen-fixture' in frame, frame
+        assert b'Ctrl-C interrupt' in frame and b'[Tools]' in frame, frame
+        rows = frame.split(b'\n')
+        assert '─'.encode() * 16 in rows[35] and '─'.encode() * 16 in rows[37], frame
+        assert b'queue-fixture/queue-model' in rows[-1], frame
+        assert frame.count(b'(click to show more)') == 2, frame
+        assert frame.count(b'Input') >= 1 and frame.count(b'Output') == 2, frame
+        assert b'48;2;40;43;50' in frame, frame
+        assert b'> initial user' in rows[1], frame
+        for row in (rows[0], rows[2]):
+            assert b'48;2;25;43;61' in row and not re.sub(rb'\x1b\[[0-9;]*m', b'', row).strip(), frame
+        os.write(master, b'\x0f')
+        frame, pos = frame_with(b'(click to collapse)', pos)
+        assert b'(click to collapse)' in frame, frame
+
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 58, 0, 0))
+        os.write(master, b'/resume ' + os.fsencode(width_session) + b'\r')
+        frame, pos = frame_with(b'(click to show more)', pos)
+        assert b'> width user' in frame.split(b'\n')[1], frame
+        assert b'A' * 55 in frame and b'C' * 15 not in frame, frame
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 132, 0, 0))
+        frame, pos = frame_with(width_text.encode(), pos)
+        assert b'click to show more' not in frame, frame
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 58, 0, 0))
+        frame, pos = frame_with(b'(click to show more)', pos)
+        rows = frame.split(b'\n')
+        assert any(b'A' * 55 in row for row in rows) and any(b'B' * 55 in row for row in rows), frame
+        assert b'C' * 15 not in frame, frame
+        hint_row = next(row for row, line in enumerate(rows, 1) if b'(click to show more)' in line)
+        os.write(master, f'\x1b[<0;5;{hint_row}M'.encode())
+        frame, pos = frame_with(b'(click to collapse)', pos)
+        assert b'C' * 15 in frame, frame
+
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 5, 70, 0, 0))
+        frame, pos = frame_with(b'queue-fixture/queue-model', pos, editor_row=3)
+        assert frame.count(b'\n') == 4, frame
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 70, 0, 0))
+        _, pos = frame_with(b'queue-fixture/queue-model', pos, editor_row=37)
+
+        os.write(master, b'/resume ' + os.fsencode(session) + b'\r')
+        frame, pos = frame_with(b'restored assistant', pos)
+        assert b'initial assistant' not in frame, frame
+        assert frame.count(b'Input') == 2 and frame.count(b'Output') == 2, frame
+        assert frame.count(b'(click to show more)') == 2, frame
+        assert frame.count(b'first result marker') == frame.count(b'second result marker') == 2, frame
+        assert b'> restored user' in frame.split(b'\n')[1], frame
+        assert b'first result marker' in frame and b'second result marker' in frame, frame
+        assert b'click to show more' in frame, frame
         assert b'\x1b[?2004h\x1b[?1006h\x1b[?1000h' in transcript
 
         # Resize while idle: the redraw keeps the pinned message and editor, and
         # subsequent mouse coordinates are calculated using the new geometry.
-        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 16, 60, 0, 0))
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 60, 0, 0))
         resized_mark = len(transcript)
-        frame, pos = frame_with(b'> restored user', resized_mark, editor_row=14)
+        frame, pos = frame_with(b'> restored user', resized_mark, editor_row=37)
         assert b'queue-fixture/queue-model' in frame, frame
-        assert frame.count(b'\n') == 15, frame
+        assert frame.count(b'\n') == 39, frame
 
-        tool_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'second.txt' in line)
-        os.write(master, f'\x1b[<0;5;{tool_row}M'.encode())
-        detail = expect(b'tool read: fullscreen-read-2', pos)
-        detail_end = expect(b'second result marker', detail)
-        assert b'first result marker' not in transcript[pos:detail_end], transcript[pos:detail_end]
-        os.write(master, b'q')
-        frame, pos = frame_with(b'restored assistant', detail_end)
+        first_result_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'first result marker' in line)
+        os.write(master, f'\x1b[<0;5;{first_result_row}M'.encode())
+        frame, pos = frame_with(b'first result marker', pos)
+        assert frame.count(b'first result marker') == 12 and frame.count(b'second result marker') == 2, frame
+        assert frame.count(b'(click to collapse)') == 1 and frame.count(b'(click to show more)') == 1, frame
+
+        second_result_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'second result marker' in line)
+        os.write(master, f'\x1b[<0;5;{second_result_row}M'.encode())
+        frame, pos = frame_with(b'second result marker', pos)
+        assert frame.count(b'first result marker') >= 10 and frame.count(b'second result marker') == 12, frame
+        assert frame.count(b'(click to collapse)') == 2, frame
+
+        second_hint_row = max(row for row, line in enumerate(frame.split(b'\n'), 1) if b'(click to collapse)' in line)
+        os.write(master, f'\x1b[<0;5;{second_hint_row}M'.encode())
+        frame, pos = frame_with(b'(click to show more)', pos)
+        assert frame.count(b'first result marker') == 12 and frame.count(b'second result marker') == 2, frame
+
+        # Ctrl+O applies one global state and clears individual overrides.
+        os.write(master, b'\x0f')
+        frame, pos = frame_with(b'(click to collapse)', pos)
+        assert frame.count(b'first result marker') >= 10 and frame.count(b'second result marker') == 12, frame
+        os.write(master, b'\x0f')
+        frame, pos = frame_with(b'(click to show more)', pos)
+        assert frame.count(b'first result marker') == frame.count(b'second result marker') == 2, frame
 
         os.write(master, b'/hot')
         frame, pos = frame_with(b'Show keyboard shortcuts', pos)
@@ -3366,49 +3483,90 @@ def check_fullscreen_viewport(root, environment, server):
         os.write(master, b'\r')
         frame, pos = frame_with(b'restored assistant', pos)
 
+        os.write(master, b'fullscreen-read\n')
+        frame, pos = frame_with(b'fullscreen read complete', pos)
+        assert frame.count(b'live read marker') == 2, frame
+        assert b'(click to show more)' in frame, frame
+        live_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'live read marker' in line)
+        os.write(master, f'\x1b[<0;5;{live_row}M'.encode())
+        frame, pos = frame_with(b'(click to collapse)', pos)
+        assert frame.count(b'live read marker') == 12, frame
+
         os.write(master, b'fullscreen-slow\n')
         frame, pos = frame_with(b'older-23', pos)
-        assert b'> fullscreen-slow' in frame.splitlines()[0], frame
+        assert b'> fullscreen-slow' in frame.split(b'\n')[1], frame
         assert b'queue-fixture/queue-model' in frame, frame
         # Resize during streaming and wait for the editor cursor on row 8; the
         # height is checked through the frame cursor position, not PTY newlines.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 54, 0, 0))
         resized_live, pos = frame_with(b'older-23', pos, editor_row=8)
         assert b'queue-fixture/queue-model' in resized_live, resized_live
+        pinned_click = next(row for row, line in enumerate(resized_live.split(b'\n'), 1) if b'> fullscreen-slow' in line)
+        os.write(master, f'\x1b[<0;5;{pinned_click}M'.encode())
+        frame, pos = frame_with(b'Jump to latest', pos)
+        assert b'> fullscreen-slow' in frame.split(b'\n')[1], frame
+        assert b'fullscreen-slow' not in frame.split(b'\n')[0], frame
+        assert any(b'> fullscreen-slow' in row for row in frame.split(b'\n')[3:5]), frame
+        assert b'older-23' not in frame, frame
+        button_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'Jump to latest' in line)
+        os.write(master, f'\x1b[<0;5;{button_row}M'.encode())
+        frame, pos = frame_with(b'older-23', pos)
         os.write(master, b'\x1b[<64;10;4M')
-        frame, pos = frame_with(b'Browsing history', pos)
-        # Ten terminal rows leave five transcript rows after the header and chrome.
-        before_body = frame.split(b'\n')[1:6]
-        assert b'older-23' not in frame and b'> fullscreen-slow' not in frame.splitlines()[0], frame
+        frame, pos = frame_with(b'Jump to latest', pos)
+        # The padded header remains fixed while the body scrolls underneath.
+        before_body = frame.split(b'\n')[3:5]
+        assert b'older-23' not in frame and b'> fullscreen-slow' in frame.split(b'\n')[1], frame
+
         server.queue_stream_mid.set()
         # While paused, live frames keep the same transcript. End reveals the
         # second chunk before the server is allowed to finish the turn.
-        paused_frame, pos = frame_with(b'Browsing history', pos)
-        assert paused_frame.split(b'\n')[1:6] == before_body, paused_frame
+        paused_frame, pos = frame_with(b'Jump to latest', pos)
+        assert paused_frame.split(b'\n')[3:5] == before_body, paused_frame
         assert b'fullscreen-new-output' not in paused_frame, paused_frame
         resume_mark = pos
         os.write(master, b'\x1b[F')
         frame, pos = frame_with(b'fullscreen-new-output', resume_mark)
-        assert b'> fullscreen-slow' in frame.split(b'\n')[0], frame
+        assert b'> fullscreen-slow' in frame.split(b'\n')[1], frame
         assert b'\x1b[?2004l' not in transcript[resume_mark:pos]
         os.write(master, b'\x1b[5~')
-        frame, pos = frame_with(b'Browsing history', pos)
-        before_body = frame.split(b'\n')[1:6]
+        frame, pos = frame_with(b'Jump to latest', pos)
+        before_body = frame.split(b'\n')[3:5]
         server.queue_stream_release.set()
         idle = expect(b'\x1b[?2004h', expect(b'\x1b[?2004l', pos))
-        frame, pos = frame_with(b'Browsing history', idle)
-        assert frame.split(b'\n')[1:6] == before_body, frame
+        frame, pos = frame_with(b'Jump to latest', idle)
+        assert frame.split(b'\n')[3:5] == before_body, frame
         assert b'fullscreen-new-output' not in frame, frame
-        os.write(master, b'\x1b[<65;10;4M')
-        frame, pos = frame_with(b'Browsing history', pos)
-        assert frame.split(b'\n')[1:6] != before_body, frame
-        os.write(master, b'\x1b[F')
+        button_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'Jump to latest' in line)
+        os.write(master, f'\x1b[<0;5;{button_row}M'.encode())
         frame, pos = frame_with(b'fullscreen-new-output', pos)
-        assert b'> fullscreen-slow' in frame.splitlines()[0] and b'done' in frame, frame
-        os.write(master, b'/exit\n')
+        assert b'> fullscreen-slow' in frame.split(b'\n')[1] and b'done' in frame, frame
+        assert b'Jump to latest' not in frame, frame
+
+        # Idle navigation crosses two user-message boundaries. The entire padded
+        # header remains clickable, including its top and bottom blank rows.
+        os.write(master, b'\x1b[<0;5;1M')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> fullscreen-slow')
+        os.write(master, b'\x1b[<64;10;4M')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> fullscreen-read')
+        assert b'fullscreen-slow' not in frame, frame
+        for row in (frame.split(b'\n')[0], frame.split(b'\n')[2]):
+            assert b'48;2;25;43;61' in row and not re.sub(rb'\x1b\[[0-9;]*m', b'', row).strip(), frame
+        assert '↑'.encode() not in frame.split(b'\n')[1], frame
+        os.write(master, b'\x1b[<0;5;3M')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> fullscreen-read')
+        assert any(b'> fullscreen-read' in row for row in frame.split(b'\n')[3:5]), frame
+        os.write(master, b'\x1b[<64;10;4M')
+        frame, pos = frame_with(b'Jump to latest', pos, pinned=b'> restored user')
+        button_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'Jump to latest' in line)
+        os.write(master, f'\x1b[<0;5;{button_row}M'.encode())
+        frame, pos = frame_with(b'fullscreen-new-output', pos, pinned=b'> fullscreen-slow')
+        assert b'Jump to latest' not in frame, frame
+        os.write(master, b'/quit\n')
         leave = expect(b'\x1b[?1049l', pos)
         assert b'\x1b[?1000l\x1b[?1006l' in transcript[pos:leave], transcript[pos:leave]
-        assert process.wait(timeout=5) == 0, bytes(transcript[-4096:])
+        assert wait_for_pty_exit(process, master, transcript, timeout=10) == 0, bytes(transcript[-4096:])
+        assert transcript[leave + len(b'\x1b[?1049l'):].splitlines() == [b'Saved session: ' + os.fsencode(session.name)], transcript[leave:]
+        assert transcript.count(b'\x1b[?1049l') == 1, transcript[pos:leave]
         after = termios.tcgetattr(master)
         after[3] &= ~getattr(termios, 'PENDIN', 0)
         before[3] &= ~getattr(termios, 'PENDIN', 0)

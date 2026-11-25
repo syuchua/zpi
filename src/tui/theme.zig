@@ -32,6 +32,10 @@ pub const Theme = struct {
     pub const user_badge = ColorSpec{ .ansi16_fg = 36, .ansi256 = 117, .rgb = .{ .r = 132, .g = 204, .b = 248 }, .bold = true };
     pub const user_panel = ColorSpec{ .ansi16_fg = 39, .ansi16_bg = 44, .ansi256 = 24, .rgb = .{ .r = 25, .g = 43, .b = 61 }, .background = true };
     pub const thinking = ColorSpec{ .ansi16_fg = 90, .ansi256 = 246, .rgb = .{ .r = 156, .g = 163, .b = 175 }, .dim = true, .italic = true };
+    pub const tool_input = ColorSpec{ .ansi16_fg = 36, .ansi256 = 81, .rgb = .{ .r = 103, .g = 212, .b = 242 }, .bold = true };
+    pub const tool_output = ColorSpec{ .ansi16_fg = 32, .ansi256 = 114, .rgb = .{ .r = 152, .g = 195, .b = 121 }, .bold = true };
+    pub const tool_panel = ColorSpec{ .ansi16_fg = 39, .ansi16_bg = 100, .ansi256 = 236, .rgb = .{ .r = 40, .g = 43, .b = 50 }, .background = true };
+    pub const tool_hint = ColorSpec{ .ansi16_fg = 37, .ansi256 = 250, .rgb = .{ .r = 180, .g = 185, .b = 194 } };
     pub const tool_header = ColorSpec{ .ansi16_fg = 33, .ansi256 = 180, .rgb = .{ .r = 229, .g = 192, .b = 123 }, .bold = true };
     pub const warn = ColorSpec{ .ansi16_fg = 33, .ansi256 = 214, .rgb = .{ .r = 229, .g = 192, .b = 123 } };
     pub const tool_ok = ColorSpec{ .ansi16_fg = 32, .ansi256 = 114, .rgb = .{ .r = 152, .g = 195, .b = 121 } };

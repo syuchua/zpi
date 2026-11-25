@@ -24,6 +24,26 @@ const SseCapture = struct {
     }
 };
 
+test "shared retry hints cover transport failures and transient HTTP statuses" {
+    for ([_]anyerror{
+        error.UnknownHostName,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.NetworkUnreachable,
+        error.HttpConnectionClosing,
+        error.TlsConnectionTruncated,
+    }) |err| try std.testing.expect(http_transport.retryHint(err, null, null).retryable);
+    try std.testing.expect(!http_transport.retryHint(error.InvalidEndpoint, null, null).retryable);
+    try std.testing.expect(!http_transport.retryHint(error.ProxyConnectFailed, null, null).retryable);
+    try std.testing.expect(!http_transport.retryHint(error.TlsInitializationFailed, null, null).retryable);
+    try std.testing.expect(http_transport.retryHint(error.HttpRequestFailed, .service_unavailable, 1250).retryable);
+    try std.testing.expectEqual(@as(?u64, 1250), http_transport.retryHint(error.HttpRequestFailed, .service_unavailable, 1250).retry_after_ms);
+    try std.testing.expect(!http_transport.retryHint(error.HttpRequestFailed, .unauthorized, null).retryable);
+    const overflow = http_transport.retryHint(error.HttpRequestFailed, .payload_too_large, null);
+    try std.testing.expect(overflow.context_overflow);
+    try std.testing.expect(!overflow.retryable);
+}
+
 test "NO_PROXY matching supports wildcards, subdomains, ports, and IPv6 literals" {
     var env = std.process.Environ.Map.init(std.testing.allocator);
     defer env.deinit();

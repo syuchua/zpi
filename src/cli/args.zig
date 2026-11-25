@@ -41,7 +41,7 @@ pub const Options = struct {
     no_proxy: bool = false,
     no_tools: bool = false,
     allow_loopback_web_fetch: bool = false,
-    fullscreen: bool = false,
+    fullscreen: bool = true,
     print_version: bool = false,
     print_help: bool = false,
 };
@@ -105,10 +105,6 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
             result.allow_loopback_web_fetch = true;
             continue;
         }
-        if (!positional_only and std.mem.eql(u8, arg, "--fullscreen")) {
-            result.fullscreen = true;
-            continue;
-        }
         if (!positional_only and (std.mem.eql(u8, arg, "--no-tools") or std.mem.eql(u8, arg, "-nt"))) {
             result.no_tools = true;
             continue;
@@ -141,8 +137,10 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
             result.trust_project_skills = true;
             continue;
         }
-        if (!positional_only and (std.mem.eql(u8, arg, "--skill") or std.mem.eql(u8, arg, "-s") or std.mem.startsWith(u8, arg, "--skill="))) {
-            const value = if (std.mem.startsWith(u8, arg, "--skill=")) arg[8..] else try takeValue(args, &i);
+        if (!positional_only and (std.mem.eql(u8, arg, "--skill") or std.mem.eql(u8, arg, "--skills") or std.mem.eql(u8, arg, "-s") or
+            std.mem.startsWith(u8, arg, "--skill=") or std.mem.startsWith(u8, arg, "--skills=")))
+        {
+            const value = if (std.mem.indexOfScalar(u8, arg, '=')) |offset| arg[offset + 1 ..] else try takeValue(args, &i);
             if (value.len == 0) return error.EmptySkillPath;
             try result.skills.append(allocator, value);
             continue;
@@ -206,6 +204,15 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
             const value = if (std.mem.startsWith(u8, arg, "--native-plugin=")) arg[16..] else try takeValue(args, &i);
             if (value.len == 0) return error.EmptyPluginPath;
             try result.native_plugins.append(allocator, value);
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--tui-mode") or std.mem.startsWith(u8, arg, "--tui-mode="))) {
+            const value = if (std.mem.eql(u8, arg, "--tui-mode")) try takeValue(args, &i) else arg[11..];
+            if (std.mem.eql(u8, value, "fullscreen")) {
+                result.fullscreen = true;
+            } else if (std.mem.eql(u8, value, "regular")) {
+                result.fullscreen = false;
+            } else return error.InvalidTuiMode;
             continue;
         }
         if (!positional_only and std.mem.startsWith(u8, arg, "--")) {
@@ -316,6 +323,13 @@ test "CLI parses modes, overrides, positionals and conflicts" {
     var text_tty = try parse(std.testing.allocator, &.{ "--mode", "text", "hello" }, true, true);
     defer text_tty.prompt.deinit(std.testing.allocator);
     try std.testing.expectEqual(OutputMode.interactive, text_tty.mode);
+    try std.testing.expect(text_tty.fullscreen);
+    const regular = try parse(std.testing.allocator, &.{ "--tui-mode", "regular" }, true, true);
+    try std.testing.expect(!regular.fullscreen);
+    var fullscreen = try parse(std.testing.allocator, &.{"--tui-mode=fullscreen"}, true, true);
+    try std.testing.expect(fullscreen.fullscreen);
+    fullscreen.prompt.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidTuiMode, parse(std.testing.allocator, &.{ "--tui-mode", "unknown" }, true, true));
     try std.testing.expectError(error.EmptyPrompt, parse(std.testing.allocator, &.{"-p"}, true, true));
     var selected_tools = try parse(std.testing.allocator, &.{ "-nbt", "--tools=read,echo_*", "-xt", "write", "hi" }, false, false);
     defer selected_tools.prompt.deinit(std.testing.allocator);
@@ -348,11 +362,15 @@ test "CLI parses modes, overrides, positionals and conflicts" {
     try std.testing.expectError(error.InvalidMode, parse(std.testing.allocator, &c, false, false));
     const d = [_][:0]const u8{ "-p", "--mode=json", "hi" };
     try std.testing.expectError(error.ConflictingMode, parse(std.testing.allocator, &d, false, false));
-    var skills = try parse(std.testing.allocator, &.{ "--skill=./skills/one", "-s", "./skills/two/SKILL.md", "--no-skills", "--trust-project-skills", "hi" }, false, false);
+    var skills = try parse(std.testing.allocator, &.{ "--skill=./skills/one", "-s", "./skills/two/SKILL.md", "--skills", "three", "--skills=four", "--no-skills", "--trust-project-skills", "hi" }, false, false);
     defer skills.prompt.deinit(std.testing.allocator);
     defer skills.skills.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), skills.skills.items.len);
+    try std.testing.expectEqual(@as(usize, 4), skills.skills.items.len);
     try std.testing.expectEqualStrings("./skills/one", skills.skills.items[0]);
+    try std.testing.expectEqualStrings("./skills/two/SKILL.md", skills.skills.items[1]);
+    try std.testing.expectEqualStrings("three", skills.skills.items[2]);
+    try std.testing.expectEqualStrings("four", skills.skills.items[3]);
+    try std.testing.expectError(error.MissingValue, parse(std.testing.allocator, &.{"--skills"}, false, false));
     try std.testing.expect(skills.no_skills and skills.trust_project_skills);
     var mcp = try parse(std.testing.allocator, &.{ "-p", "prompt", "--mcp-stdio", "demo", "--", "/bin/fixture", "--", "@literal" }, true, true);
     defer mcp.prompt.deinit(std.testing.allocator);

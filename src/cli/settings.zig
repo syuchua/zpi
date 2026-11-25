@@ -32,6 +32,7 @@ pub const Settings = struct {
     retry: zpi.agent.RetryPolicy = .{},
     session_dir: ?[]const u8 = null,
     hide_thinking_block: bool = false,
+    tool_outputs_expanded: bool = false,
     quiet_startup: bool = false,
 
     pub fn thinkingFor(self: Settings, allocator: std.mem.Allocator, provider: []const u8, model_id: []const u8) !?zpi.model.ThinkingLevel {
@@ -138,6 +139,10 @@ fn parseObject(allocator: std.mem.Allocator, root: std.json.Value) !Settings {
         if (v != .bool) return error.InvalidSettings;
         out.hide_thinking_block = v.bool;
     }
+    if (obj.get("toolOutputsExpanded")) |v| {
+        if (v != .bool) return error.InvalidSettings;
+        out.tool_outputs_expanded = v.bool;
+    }
     if (obj.get("quietStartup")) |v| {
         switch (v) {
             .bool => |b| out.quiet_startup = b,
@@ -214,6 +219,7 @@ test "settings loads defaults, per-model overrides, tools, compaction, and retry
         \\  "defaultTools": ["-bash", "+grep"],
         \\  "sessionDir": "~/custom-sessions",
         \\  "hideThinkingBlock": true,
+        \\  "toolOutputsExpanded": true,
         \\  "quietStartup": true,
         \\  "compaction": {
         \\    "enabled": true,
@@ -245,6 +251,7 @@ test "settings loads defaults, per-model overrides, tools, compaction, and retry
     try std.testing.expectEqualStrings("-bash", s.default_tools.?[0]);
     try std.testing.expectEqualStrings("~/custom-sessions", s.session_dir.?);
     try std.testing.expect(s.hide_thinking_block);
+    try std.testing.expect(s.tool_outputs_expanded);
     try std.testing.expect(s.quiet_startup);
 
     const comp_default = try s.compactionFor(arena.allocator(), "anthropic", "claude-sonnet-4-5");

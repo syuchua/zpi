@@ -503,6 +503,21 @@ test "configured OpenAI headers override authorization and are sent once" {
     try std.testing.expectEqual(model.StopReason.stop, capture.reason.?);
 }
 
+test "OpenAI retry hints include transient connection failures but not auth errors" {
+    var client = openai.Client{ .io = std.testing.io, .config = .{ .endpoint = "https://example.invalid", .model_id = "fixture", .api_key = "" } };
+    for ([_]anyerror{
+        error.UnknownHostName,
+        error.ConnectionRefused,
+        error.HttpConnectionClosing,
+        error.TlsConnectionTruncated,
+    }) |err| try std.testing.expect(client.retryHint(err).retryable);
+    try std.testing.expect(!client.retryHint(error.InvalidCredential).retryable);
+    client.status = .service_unavailable;
+    try std.testing.expect(client.retryHint(error.HttpRequestFailed).retryable);
+    client.status = .unauthorized;
+    try std.testing.expect(!client.retryHint(error.HttpRequestFailed).retryable);
+}
+
 test "OpenAI client aborts stalled stream promptly on interrupt" {
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(std.testing.io, .{ .reuse_address = true });

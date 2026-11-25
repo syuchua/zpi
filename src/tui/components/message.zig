@@ -4,8 +4,8 @@ const terminal = @import("../terminal.zig");
 const theme = @import("../theme.zig");
 
 /// Render a user message in a full-width semantic panel that wraps to the
-/// available terminal width. Colored panels include bottom padding and a line
-/// break. The caller terminates the message, leaving a blank line after it.
+/// available terminal width. Colored panels include a padding row on each side
+/// of the content. The caller can add a blank row after the panel.
 pub fn formatUserEchoAlloc(allocator: std.mem.Allocator, th: theme.Theme, text: []const u8, terminal_cols: usize) ![]u8 {
     const safe = try terminal.safeUtf8Alloc(allocator, text);
     defer allocator.free(safe);
@@ -25,6 +25,7 @@ pub fn formatUserEchoAlloc(allocator: std.mem.Allocator, th: theme.Theme, text: 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var lines = std.mem.splitScalar(u8, wrapped, '\n');
+    try appendPanelPadding(&out, allocator, th, width);
     var first = true;
     while (lines.next()) |line| {
         if (!first) try out.append(allocator, '\n');
@@ -35,13 +36,16 @@ pub fn formatUserEchoAlloc(allocator: std.mem.Allocator, th: theme.Theme, text: 
         try th.appendClose(&out, allocator);
         first = false;
     }
-    // Pad the bottom of the panel, then leave space for a plain spacer row.
     try out.append(allocator, '\n');
-    try th.appendOpen(&out, allocator, theme.Theme.user_panel);
-    try out.appendNTimes(allocator, ' ', width);
-    try th.appendClose(&out, allocator);
-    try out.append(allocator, '\n');
+    try appendPanelPadding(&out, allocator, th, width);
     return out.toOwnedSlice(allocator);
+}
+
+fn appendPanelPadding(out: *std.ArrayList(u8), allocator: std.mem.Allocator, th: theme.Theme, width: usize) !void {
+    try th.appendOpen(out, allocator, theme.Theme.user_panel);
+    try out.appendNTimes(allocator, ' ', width);
+    try th.appendClose(out, allocator);
+    try out.append(allocator, '\n');
 }
 
 pub fn formatThinkingHeaderAlloc(allocator: std.mem.Allocator, th: theme.Theme) ![]u8 {
@@ -77,6 +81,8 @@ test "user panel wraps to terminal cells and closes its background on every row"
             try std.testing.expect(std.mem.startsWith(u8, row, background));
             try std.testing.expect(std.mem.endsWith(u8, row, reset));
             try std.testing.expect(std.mem.indexOfScalar(u8, row, '\t') == null);
+            if (count == 0) try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, row[background.len .. row.len - reset.len], " ").len);
+            if (count == 1) try std.testing.expect(std.mem.startsWith(u8, row[background.len..], "> "));
             last = row;
             count += 1;
         }

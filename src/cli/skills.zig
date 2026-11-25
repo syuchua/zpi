@@ -34,6 +34,11 @@ pub fn discover(
         result.deinit(a);
     }
     var remaining: usize = max_entries;
+    if (enabled and home != null) {
+        const agents_dir = try std.fs.path.join(a, &.{ home.?, ".agents", "skills" });
+        defer a.free(agents_dir);
+        try scanDirectory(a, io, agents_dir, 0, &remaining, &result);
+    }
     if (enabled and ((agent_dir_env != null and agent_dir_env.?.len > 0) or home != null)) {
         if (agent_dir_env) |raw| if (raw.len > 0 and (!std.unicode.utf8ValidateSlice(raw) or std.mem.indexOfScalar(u8, raw, 0) != null)) return error.InvalidSkillPath;
         const agent_dir = try resolveAgentDir(a, launch_cwd, home, agent_dir_env);
@@ -288,11 +293,16 @@ test "skills discover bounded frontmatter and format visible entries" {
     defer a.free(root);
     try tmp.dir.createDirPath(std.testing.io, "skills/pdf-tools");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "skills/pdf-tools/SKILL.md", .data = "---\nname: pdf-tools\ndescription: Read PDF files & tables.\n---\nUse the read tool.\n" });
+    try tmp.dir.createDirPath(std.testing.io, "home/.agents/skills/user-agent-skill");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "home/.agents/skills/user-agent-skill/SKILL.md", .data = "---\nname: user-agent-skill\ndescription: Automatically loaded user skill.\n---\n" });
     try tmp.dir.createDirPath(std.testing.io, "skills/hidden");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "skills/hidden/SKILL.md", .data = "---\nname: hidden\ndescription: hidden\ndisable-model-invocation: true\n---\n" });
-    const found = try discover(a, std.testing.io, root, root, root, null, &.{"skills"}, false, true);
+    const home = try std.fs.path.join(a, &.{ root, "home" });
+    defer a.free(home);
+    const found = try discover(a, std.testing.io, root, root, home, null, &.{"skills"}, false, true);
     defer freeSkills(a, found);
-    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqual(@as(usize, 3), found.len);
+    try std.testing.expectEqualStrings("user-agent-skill", found[0].name);
     const prompt = try formatPrompt(a, found);
     defer a.free(prompt);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "pdf-tools") != null);

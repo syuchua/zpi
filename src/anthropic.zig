@@ -29,24 +29,7 @@ pub const Client = struct {
         return self.retryHint(err);
     }
     pub fn retryHint(self: *const Client, err: anyerror) model.RetryHint {
-        return switch (err) {
-            error.HttpRequestFailed => if (self.status) |st| blk: {
-                if (st == .payload_too_large) break :blk .{ .retryable = false, .context_overflow = true };
-                if (http_headers.isRetryableHttpStatus(st)) break :blk .{ .retryable = true, .retry_after_ms = self.retry_after_ms };
-                break :blk .{ .retryable = false };
-            } else .{ .retryable = false },
-            error.RequestTimeout,
-            error.TruncatedStream,
-            error.ResponseReadFailed,
-            error.ConnectionRefused,
-            error.ConnectionResetByPeer,
-            error.ConnectionTimedOut,
-            error.NetworkUnreachable,
-            error.HostUnreachable,
-            error.TemporaryNameServerFailure,
-            => .{ .retryable = true },
-            else => .{ .retryable = false },
-        };
+        return http_transport.retryHint(err, self.status, self.retry_after_ms);
     }
     pub fn run(self: *Client, allocator: std.mem.Allocator, messages: []const model.Message, tools: []const model.ToolDefinition, sink: model.EventSink) !void {
         if (self.config.timeout_ms <= 0) return error.InvalidTimeout;

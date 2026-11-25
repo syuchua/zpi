@@ -13,11 +13,11 @@ const help =
     \\zpi - Zig coding agent (experimental)
     \\
     \\Usage: zpi [options] [--] [@files...] PROMPT...
-    \\       zpi [options]                 Interactive regular terminal UI
+    \\       zpi [options]                 Interactive full-screen terminal UI
     \\       zpi --import-pi-session SOURCE --session DESTINATION
     \\
     \\  -p, --print            Print final response and exit
-    \\  --fullscreen           Enable optional fullscreen conversation viewport
+    \\  --tui-mode <mode>      Interactive TUI mode: fullscreen (default) or regular
     \\  --mode text            Text output; print when stdin/stdout is redirected
     \\  --mode json            Write Zpi JSONL events and exit
     \\  --mode rpc             Serve experimental JSONL commands over stdin/stdout
@@ -37,8 +37,8 @@ const help =
     \\  /tree                  Pick an entry in the active session tree
     \\  --system-prompt TEXT|PATH Replace the system prompt
     \\  --append-system-prompt TEXT|PATH Append instructions (repeatable)
-    \\  -s, --skill PATH       Load a skill directory or SKILL.md (repeatable)
-    \\  --no-skills            Disable discovery and explicit skill loading
+    \\  -s, --skills PATH      Load an additional skill directory or SKILL.md (repeatable)
+    \\  --no-skills            Disable automatic discovery and explicit skill loading
     \\  --trust-project-skills Load project skills from .agents/skills and .zpi/agent/skills
     \\  --prompt-template PATH Load a Markdown /command template (repeatable)
     \\  -np, --no-prompt-templates Disable default template discovery
@@ -205,6 +205,7 @@ fn run(init: std.process.Init) !void {
     if (comptime build_options.enable_tui) {
         const out_color = std.Io.File.stdout().supportsAnsiEscapeCodes(init.io) catch false;
         adapter.tui_theme = tui.theme.Theme.init(tui.theme.Theme.detect(init.environ_map, out_color));
+        adapter.expanded_details = h.settings.tool_outputs_expanded;
         adapter.refreshCachedStats();
     }
 
@@ -227,13 +228,14 @@ fn run(init: std.process.Init) !void {
                 .session_info = CliAdapter.sessionInfoErased,
                 .render_initial_history = CliAdapter.renderInitialHistoryErased,
                 .render_fullscreen_history = CliAdapter.renderFullscreenHistoryErased,
+                .render_saved_session_on_exit = CliAdapter.renderSavedSessionOnExitErased,
                 .jobs_info = CliAdapter.jobsErased,
                 .cancel = cancel_token,
                 .reset_cancel = CliAdapter.resetCancelErased,
                 .trigger_cancel = CliAdapter.triggerCancelErased,
                 .set_live_writer = CliAdapter.setLiveWriterErased,
                 .allocator = init.gpa,
-                .fullscreen = options.fullscreen,
+                .fullscreen = options.fullscreen and !std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb"),
                 .cwd = status.cwd,
                 .commands = slash_commands,
                 .compact = CliAdapter.compactErased,
@@ -247,7 +249,7 @@ fn run(init: std.process.Init) !void {
                 .session_source = if (std.mem.eql(u8, init.environ_map.get("TERM") orelse "", "dumb")) null else CliAdapter.sessionSourceErased,
                 .status_info = CliAdapter.statusInfoErased,
                 .toggle_expand = CliAdapter.toggleExpandErased,
-                .tool_details = CliAdapter.toolDetailsErased,
+                .tool_outputs_expanded = h.settings.tool_outputs_expanded,
                 .run_user_shell = CliAdapter.runUserShellErased,
                 .record_user_shell = CliAdapter.recordUserShellResultErased,
                 .push_steering = CliAdapter.pushSteeringErased,
@@ -351,6 +353,15 @@ const CliAdapter = struct {
         if (suffix.len > 0) try stderr.writeStreamingAll(self.io, suffix);
     }
 
+    fn toolSegment(self: *CliAdapter, text: []const u8, id: []const u8) !void {
+        if (comptime build_options.enable_tui) {
+            if (self.live_writer) |writer| {
+                if (writer.write_tool_text) |write_tool| return write_tool(writer.context, text, id);
+            }
+        }
+        try self.errSegment(text, "", "");
+    }
+
     fn refreshCachedStats(self: *CliAdapter) void {
         if (self.mode != .interactive) return;
         const h = self.harness orelse return;
@@ -387,9 +398,10 @@ const CliAdapter = struct {
     fn toggleExpandErased(context: *anyopaque) bool {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         self.status_mutex.lockUncancelable(self.io);
-        defer self.status_mutex.unlock(self.io);
         self.expanded_details = !self.expanded_details;
-        return self.expanded_details;
+        const expanded = self.expanded_details;
+        self.status_mutex.unlock(self.io);
+        return expanded;
     }
 
     fn pushSteeringErased(context: *anyopaque, text: []const u8) anyerror!void {
@@ -494,61 +506,6 @@ const CliAdapter = struct {
         return self.harness.?.recordUserShellResult(text);
     }
 
-    fn toolDetailsErased(context: *anyopaque, allocator: std.mem.Allocator, filter_id: ?[]const u8) anyerror![]tui.ToolDetailItem {
-        const self: *CliAdapter = @ptrCast(@alignCast(context));
-        const h = self.harness orelse return try allocator.alloc(tui.ToolDetailItem, 0);
-        var items: std.ArrayList(tui.ToolDetailItem) = .empty;
-        errdefer {
-            for (items.items) |item| {
-                allocator.free(item.name);
-                allocator.free(item.text);
-            }
-            items.deinit(allocator);
-        }
-        for (h.runtime.messages.items) |message| switch (message.role) {
-            .assistant => for (message.content) |part| switch (part) {
-                .tool_call => |call| {
-                    if (filter_id) |id| if (!std.mem.eql(u8, id, call.id)) continue;
-                    const label = try std.fmt.allocPrint(allocator, "tool {s}: {s}", .{ call.name, call.id });
-                    errdefer allocator.free(label);
-                    const arguments = try std.json.Stringify.valueAlloc(allocator, call.arguments, .{});
-                    defer allocator.free(arguments);
-                    const bounded = if (arguments.len > 16 * 1024) arguments[0 .. 16 * 1024] else arguments;
-                    try items.append(allocator, .{ .name = label, .text = try allocator.dupe(u8, bounded) });
-                },
-                else => {},
-            },
-            .tool_result => {
-                if (filter_id) |id| if (!std.mem.eql(u8, id, message.tool_call_id orelse "")) continue;
-                const label = try allocator.print("{s} ({s})", .{ message.tool_name orelse "tool", message.tool_call_id orelse "result" });
-                errdefer allocator.free(label);
-                var body: std.ArrayList(u8) = .empty;
-                errdefer body.deinit(allocator);
-                for (message.content, 0..) |part, index| switch (part) {
-                    .text => |text| {
-                        if (index > 0) try body.append(allocator, '\n');
-                        try body.appendSlice(allocator, text);
-                    },
-                    else => {},
-                };
-                if (message.details) |details| {
-                    if (details == .object) {
-                        if (details.object.get("diff")) |diff| {
-                            if (diff == .string and diff.string.len > 0) {
-                                try body.append(allocator, '\n');
-                                try body.appendSlice(allocator, diff.string);
-                            }
-                        }
-                    }
-                }
-                if (body.items.len > 64 * 1024) body.items.len = 64 * 1024;
-                try items.append(allocator, .{ .name = label, .text = try body.toOwnedSlice(allocator) });
-            },
-            else => {},
-        };
-        return try items.toOwnedSlice(allocator);
-    }
-
     fn modelSourceErased(context: *anyopaque) anyerror!?tui.ModelSource {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
         const outcome = try self.harness.?.switchModel("");
@@ -620,7 +577,7 @@ const CliAdapter = struct {
                     const active = std.mem.eql(u8, choice.provider, listed.active_provider) and std.mem.eql(u8, choice.id, listed.active_model);
                     try out.print(self.allocator, "{s} {s}/{s} ({s})\n", .{ if (active) "*" else " ", choice.provider, choice.id, @tagName(choice.api) });
                 }
-                try writeSafe(self.io, .stdout(), out.items);
+                try self.historyText(out.items, false);
             },
             .switched => |status| {
                 self.refreshCachedStats();
@@ -631,7 +588,7 @@ const CliAdapter = struct {
                     @tagName(status.thinking_level),
                 });
                 defer self.allocator.free(notice);
-                try writeSafe(self.io, .stdout(), notice);
+                try self.historyText(notice, false);
             },
         }
     }
@@ -645,7 +602,7 @@ const CliAdapter = struct {
         else
             try std.fmt.allocPrint(self.allocator, "[thinking: {s}]\n", .{@tagName(level)});
         defer self.allocator.free(msg);
-        try writeSafe(self.io, .stdout(), msg);
+        try self.historyText(msg, false);
     }
 
     fn compactErased(context: *anyopaque, focus: []const u8) anyerror!void {
@@ -700,14 +657,15 @@ const CliAdapter = struct {
                 }
                 if (page.earlier_id) |id| try output.print(self.allocator, "Earlier entries: /tree --older {s}\n", .{id});
                 try output.appendSlice(self.allocator, "Use /tree ENTRY-ID or /tree --summary ENTRY-ID.\n");
-                try writeSafe(self.io, .stdout(), output.items);
+                try self.historyText(output.items, false);
             },
-            .already_active => try std.Io.File.stdout().writeStreamingAll(self.io, "[already at this entry]\n"),
+            .already_active => try self.historyText("[already at this entry]\n", false),
             .branched => |b| {
                 self.resetLiveUsageAndRefresh();
+                if (self.fullscreen_view != null) _ = try self.renderSessionHistory();
                 const line = try std.fmt.allocPrint(self.allocator, "[branched to {s}{s}]\n", .{ b.target, if (b.summarized) " with summary" else "" });
                 defer self.allocator.free(line);
-                try writeSafe(self.io, .stdout(), line);
+                try self.historyText(line, false);
             },
         }
     }
@@ -717,8 +675,8 @@ const CliAdapter = struct {
         const h = self.harness orelse return;
         const text = try h.bgStatusText(self.allocator, if (arg.len > 0) arg else null);
         defer self.allocator.free(text);
-        try writeSafe(self.io, .stdout(), text);
-        try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+        try self.historyText(text, false);
+        try self.historyText("\n", false);
     }
 
     fn resetBgWakeErased(context: *anyopaque) void {
@@ -764,7 +722,7 @@ const CliAdapter = struct {
             .{ stats.file_path orelse "In-memory", stats.provider, stats.model, @tagName(stats.api), @tagName(stats.thinking_level), stats.total_messages, stats.user_messages, stats.assistant_messages, stats.tool_calls, stats.tool_results, stats.active_leaf orelse "root" },
         );
         defer self.allocator.free(info);
-        try writeSafe(self.io, .stdout(), info);
+        try self.historyText(info, false);
     }
 
     fn sessionSourceErased(context: *anyopaque) anyerror!?tui.SessionSource {
@@ -844,6 +802,16 @@ const CliAdapter = struct {
         return self.renderSessionHistory();
     }
 
+    fn renderSavedSessionOnExitErased(context: *anyopaque) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness orelse return;
+        if (h.store.pending_create) return;
+        const session_path = h.store.file_path orelse return;
+        try std.Io.File.stdout().writeStreamingAll(self.io, "Saved session: ");
+        try writeSafe(self.io, .stdout(), std.fs.path.basename(session_path));
+        try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+    }
+
     fn historyText(self: *CliAdapter, text: []const u8, styled: bool) !void {
         if (comptime build_options.enable_tui) {
             if (self.fullscreen_view) |view| {
@@ -855,6 +823,17 @@ const CliAdapter = struct {
         }
         if (styled) return std.Io.File.stdout().writeStreamingAll(self.io, text);
         return writeSafe(self.io, .stdout(), text);
+    }
+
+    fn historyToolText(self: *CliAdapter, text: []const u8, id: ?[]const u8) !void {
+        if (comptime build_options.enable_tui) if (self.fullscreen_view) |view| {
+            if (id) |call_id| {
+                const normalized = std.mem.trim(u8, text, "\r\n");
+                if (normalized.len > 0) return view.appendToolText(normalized, call_id);
+                return;
+            }
+        };
+        try self.historyText(text, true);
     }
 
     fn renderSessionHistory(self: *CliAdapter) anyerror!bool {
@@ -901,8 +880,9 @@ const CliAdapter = struct {
                             if (comptime build_options.enable_tui) {
                                 const echo = try tui.components.message.formatUserEchoAlloc(self.allocator, self.tui_theme, txt, cols);
                                 defer self.allocator.free(echo);
-                                if (self.fullscreen_view) |view| try view.setPinnedUser(txt);
-                                try self.historyText(echo, true);
+                                if (self.fullscreen_view) |view| {
+                                    try view.appendUserMessage(txt, echo, if (self.tui_theme.mode == .none or cols < 5) 0 else 1);
+                                } else try self.historyText(echo, true);
                                 try self.historyText("\n\n", true);
                             } else {
                                 try stdout.writeStreamingAll(self.io, "> ");
@@ -954,11 +934,16 @@ const CliAdapter = struct {
                         .tool_call => |call| {
                             if (comptime build_options.enable_tui) {
                                 const arg_summary = extractToolArgSummary(call);
-                                const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
-                                defer self.allocator.free(header);
                                 if (self.fullscreen_view) |view| {
-                                    try view.appendToolHeader(header, call.id);
-                                } else try self.historyText(header, true);
+                                    const input = try tui.components.tool_card.formatInputAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
+                                    defer self.allocator.free(input);
+                                    const line = std.mem.trim(u8, input, "\r\n");
+                                    if (line.len > 0) try view.appendToolText(line, call.id);
+                                } else {
+                                    const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
+                                    defer self.allocator.free(header);
+                                    try self.historyToolText(header, call.id);
+                                }
                             } else {
                                 try stdout.writeStreamingAll(self.io, "[tool: ");
                                 try writeSafe(self.io, stdout, call.name);
@@ -971,6 +956,36 @@ const CliAdapter = struct {
                 },
                 .tool_result => {
                     if (comptime build_options.enable_tui) {
+                        var result_text: std.ArrayList(u8) = .empty;
+                        defer result_text.deinit(self.allocator);
+                        for (entry.message.content, 0..) |part, index| switch (part) {
+                            .text => |txt| {
+                                if (index > 0) try result_text.append(self.allocator, '\n');
+                                try result_text.appendSlice(self.allocator, txt);
+                            },
+                            else => {},
+                        };
+                        if (result_text.items.len > 0) {
+                            if (self.fullscreen_view) |view| {
+                                const id = entry.message.tool_call_id orelse "";
+                                try view.appendToolBody(result_text.items, id);
+                            } else {
+                                const body = try tui.components.tool_card.formatBodyPreviewAlloc(
+                                    self.allocator,
+                                    self.tui_theme,
+                                    result_text.items,
+                                    if (self.isExpanded()) 20 else tui.ConversationView.compact_tool_rows,
+                                    cols,
+                                );
+                                defer self.allocator.free(body.text);
+                                try self.historyToolText(body.text, entry.message.tool_call_id);
+                                if (body.truncated) {
+                                    const hint = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, if (self.isExpanded()) "... (Ctrl+O to collapse)" else "... (Ctrl+O to expand)");
+                                    defer self.allocator.free(hint);
+                                    try self.historyToolText(hint, entry.message.tool_call_id);
+                                }
+                            }
+                        }
                         if (entry.message.is_error) {
                             var first_text: []const u8 = "";
                             for (entry.message.content) |part| switch (part) {
@@ -982,11 +997,17 @@ const CliAdapter = struct {
                             };
                             const err_line = try tui.components.tool_card.formatEndErrorAlloc(self.allocator, self.tui_theme, first_text);
                             defer self.allocator.free(err_line);
-                            try self.historyText(err_line, true);
+                            if (self.fullscreen_view) |view| {
+                                const id = entry.message.tool_call_id orelse "";
+                                try view.appendToolText(std.mem.trim(u8, err_line, "\r\n"), id);
+                            } else try self.historyToolText(err_line, entry.message.tool_call_id);
                         } else {
                             const ok_line = try tui.components.tool_card.formatEndOkAlloc(self.allocator, self.tui_theme);
                             defer self.allocator.free(ok_line);
-                            try self.historyText(ok_line, true);
+                            if (self.fullscreen_view) |view| {
+                                const id = entry.message.tool_call_id orelse "";
+                                try view.appendToolText(std.mem.trim(u8, ok_line, "\r\n"), id);
+                            } else try self.historyToolText(ok_line, entry.message.tool_call_id);
                         }
                     }
                 },
@@ -1003,7 +1024,7 @@ const CliAdapter = struct {
             const candidates = try h.listSessions(self.allocator);
             defer harness.freeSessionList(self.allocator, candidates);
             if (candidates.len == 0) {
-                try std.Io.File.stdout().writeStreamingAll(self.io, "No matching sessions found.\n");
+                try self.historyText("No matching sessions found.\n", false);
                 return;
             }
             var out: std.ArrayList(u8) = .empty;
@@ -1018,17 +1039,27 @@ const CliAdapter = struct {
                     cand.preview,
                 });
             }
-            try writeSafe(self.io, .stdout(), out.items);
+            try self.historyText(out.items, false);
             return;
         }
         _ = try h.resumeSession(arg);
+        self.status_mutex.lockUncancelable(self.io);
+        self.expanded_details = h.settings.tool_outputs_expanded;
+        const tools_expanded = self.expanded_details;
+        self.status_mutex.unlock(self.io);
+        if (self.fullscreen_view) |view| view.setToolsExpanded(tools_expanded);
         self.resetLiveUsageAndRefresh();
         const notice = try std.fmt.allocPrint(self.allocator, "[resumed: {s}]\n", .{std.fs.path.basename(arg)});
         defer self.allocator.free(notice);
-        try writeSafe(self.io, .stdout(), notice);
-        if (self.mode == .interactive) {
-            try std.Io.File.stdout().writeStreamingAll(self.io, "\n");
+        if (self.fullscreen_view != null) {
             _ = try self.renderSessionHistory();
+            try self.historyText(notice, false);
+        } else {
+            try self.historyText(notice, false);
+            if (self.mode == .interactive) {
+                try self.historyText("\n", false);
+                _ = try self.renderSessionHistory();
+            }
         }
     }
 
@@ -1177,15 +1208,12 @@ const CliAdapter = struct {
                             }
                             const cols = tui.terminal.terminalColumns(.stdout());
                             const arg_summary = extractToolArgSummary(call);
-                            const header = try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
+                            const header = if (self.fullscreen_view != null)
+                                try tui.components.tool_card.formatInputAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols)
+                            else
+                                try tui.components.tool_card.formatStartWithArgAlloc(self.allocator, self.tui_theme, call.name, arg_summary, cols);
                             defer self.allocator.free(header);
-                            if (self.live_writer) |writer| {
-                                if (writer.write_tool_header) |write_header| {
-                                    try write_header(writer.context, header, call.id);
-                                    return;
-                                }
-                            }
-                            try self.errSegment(header, "", "");
+                            try self.toolSegment(header, call.id);
                         } else {
                             try self.errSegment("\n[tool: ", call.name, "]\n");
                         }
@@ -1196,28 +1224,25 @@ const CliAdapter = struct {
                         try self.json(.{ .type = "tool_execution_update", .id = update.call.id, .name = update.call.name, .result = update.result });
                     } else if (self.mode == .interactive) {
                         if (comptime build_options.enable_tui) {
-                            const max_lines: usize = if (self.isExpanded()) 20 else 1;
-                            if (self.live_tool_lines < max_lines) {
-                                const block = try tui.components.tool_card.formatBodyBlockAlloc(
-                                    self.allocator,
-                                    self.tui_theme,
-                                    update.result.text,
-                                    max_lines - self.live_tool_lines,
-                                );
-                                defer self.allocator.free(block.text);
-                                if (block.text.len > 0) try self.errSegment(block.text, "", "");
-                                self.live_tool_lines += block.lines_written;
-                                if (block.truncated and !self.live_tool_truncated) {
-                                    self.live_tool_truncated = true;
-                                    const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (/details for full output; Ctrl+O shows 20 lines)");
-                                    defer self.allocator.free(note);
-                                    try self.errSegment(note, "", "");
-                                }
-                            } else if (!self.live_tool_truncated) {
+                            // Fullscreen stores the final result as one foldable preview.
+                            if (self.fullscreen_view != null or update.result.text.len == 0) return;
+                            const expanded = self.isExpanded();
+                            const max_lines: usize = if (expanded) 512 else tui.ConversationView.compact_tool_rows;
+                            const block = try tui.components.tool_card.formatBodyBlockAlloc(
+                                self.allocator,
+                                self.tui_theme,
+                                update.result.text,
+                                max_lines -| self.live_tool_lines,
+                            );
+                            defer self.allocator.free(block.text);
+                            if (block.text.len > 0) try self.toolSegment(block.text, update.call.id);
+                            self.live_tool_lines += block.lines_written;
+                            if (block.truncated and !self.live_tool_truncated) {
                                 self.live_tool_truncated = true;
-                                const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, "... (/details for full output; Ctrl+O shows 20 lines)");
+                                const hint = if (expanded) "... (preview truncated)" else "... (Ctrl+O to expand)";
+                                const note = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, hint);
                                 defer self.allocator.free(note);
-                                try self.errSegment(note, "", "");
+                                try self.toolSegment(note, update.call.id);
                             }
                         } else {
                             try self.errSegment("", update.result.text, "\n");
@@ -1232,17 +1257,24 @@ const CliAdapter = struct {
                             if (self.live_writer) |writer| {
                                 if (writer.set_phase) |set_phase| set_phase(writer.context, .streaming, "");
                             }
+                            if (self.live_writer) |writer| {
+                                if (writer.write_tool_body) |write_body| {
+                                    if (ended.result.text.len > 0 and !ended.result.is_error) {
+                                        try write_body(writer.context, ended.result.text, ended.call.id);
+                                    }
+                                }
+                            }
                             if (ended.result.is_error) {
                                 const err_line = try tui.components.tool_card.formatEndErrorAlloc(self.allocator, self.tui_theme, ended.result.text);
                                 defer self.allocator.free(err_line);
-                                try self.errSegment(err_line, "", "");
+                                try self.toolSegment(err_line, ended.call.id);
                             } else {
                                 if (ended.result.details) |details_val| {
                                     if (details_val == .object) {
                                         if (std.mem.eql(u8, ended.call.name, "edit")) {
                                             if (details_val.object.get("diff")) |diff_val| {
                                                 if (diff_val == .string and diff_val.string.len > 0) {
-                                                    try self.writeDiffPreview(diff_val.string);
+                                                    try self.writeDiffPreview(diff_val.string, ended.call.id);
                                                 }
                                             }
                                         } else if (std.mem.eql(u8, ended.call.name, "bash")) {
@@ -1250,7 +1282,7 @@ const CliAdapter = struct {
                                                 if (path_val == .string and path_val.string.len > 0) {
                                                     const spill = try tui.components.tool_card.formatSpillLineAlloc(self.allocator, self.tui_theme, path_val.string);
                                                     defer self.allocator.free(spill);
-                                                    try self.errSegment(spill, "", "");
+                                                    try self.toolSegment(spill, ended.call.id);
                                                 }
                                             }
                                         }
@@ -1258,7 +1290,7 @@ const CliAdapter = struct {
                                 }
                                 const ok_line = try tui.components.tool_card.formatEndOkAlloc(self.allocator, self.tui_theme);
                                 defer self.allocator.free(ok_line);
-                                try self.errSegment(ok_line, "", "");
+                                try self.toolSegment(ok_line, ended.call.id);
                             }
                         } else {
                             if (ended.result.is_error) {
@@ -1268,7 +1300,7 @@ const CliAdapter = struct {
                                     if (std.mem.eql(u8, ended.call.name, "edit")) {
                                         if (details_val.object.get("diff")) |diff_val| {
                                             if (diff_val == .string and diff_val.string.len > 0) {
-                                                try self.writeDiffPreview(diff_val.string);
+                                                try self.writeDiffPreview(diff_val.string, ended.call.id);
                                             }
                                         }
                                     } else if (std.mem.eql(u8, ended.call.name, "bash")) {
@@ -1333,17 +1365,17 @@ const CliAdapter = struct {
         }
     }
 
-    fn writeDiffPreview(self: *CliAdapter, diff: []const u8) !void {
+    fn writeDiffPreview(self: *CliAdapter, diff: []const u8, id: []const u8) !void {
         const limit: usize = if (comptime build_options.enable_tui) (if (self.isExpanded()) 20 else 1) else 40;
         var lines = std.mem.splitScalar(u8, diff, '\n');
         var count: usize = 0;
         while (lines.next()) |line| {
             if (count >= limit) {
                 if (comptime build_options.enable_tui) {
-                    const msg = if (self.isExpanded()) "... (preview truncated; /details for full output)" else "... (/details for full output; Ctrl+O shows 20 lines)";
+                    const msg = if (self.isExpanded()) "... (preview truncated)" else "... (Ctrl+O to expand)";
                     const trunc = try tui.components.tool_card.formatBodyLineAlloc(self.allocator, self.tui_theme, msg);
                     defer self.allocator.free(trunc);
-                    try self.errSegment(trunc, "", "");
+                    try self.toolSegment(trunc, id);
                 } else {
                     try self.errSegment(if (self.stderr_color) "\x1b[2m... (preview truncated)\x1b[0m\n" else "... (preview truncated)\n", "", "");
                 }
@@ -1352,7 +1384,7 @@ const CliAdapter = struct {
             if (comptime build_options.enable_tui) {
                 const formatted = try tui.components.tool_card.formatDiffLineAlloc(self.allocator, self.tui_theme, line);
                 defer self.allocator.free(formatted);
-                try self.errSegment(formatted, "", "");
+                try self.toolSegment(formatted, id);
             } else if (self.stderr_color) {
                 const prefix = if (std.mem.startsWith(u8, line, "+"))
                     "\x1b[32m"

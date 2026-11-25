@@ -414,7 +414,8 @@ pub const Harness = struct {
                 if (options.branch != null or continuing) return error.FileNotFound;
                 break :blk try zpi.session.Store.deferred(gpa, io, path, cwd);
             };
-            if (options.cwd == null and opened.cwd.len > 0) cwd = opened.cwd;
+            // The execution directory outlives the store selected at startup.
+            if (options.cwd == null and opened.cwd.len > 0) cwd = try a.dupe(u8, opened.cwd);
             break :blk opened;
         };
         errdefer self.store.deinit();
