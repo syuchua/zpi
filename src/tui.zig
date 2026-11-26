@@ -21,10 +21,6 @@ pub const components = struct {
 
 const DialogKind = enum { help, hotkeys };
 
-fn eraseSubmittedPromptLine(io: std.Io, output: std.Io.File) !void {
-    try output.writeStreamingAll(io, "\x1b[1A\r\x1b[J");
-}
-
 /// Terminal output for the prompt loop. In fullscreen mode every direct write
 /// invalidates the retained row diff first, because the renderer can no longer
 /// assume the screen still matches its last painted frame.
@@ -40,6 +36,11 @@ const ScreenIo = struct {
     fn write(self: ScreenIo, bytes: []const u8) !void {
         self.invalidate();
         try self.file.writeStreamingAll(self.io, bytes);
+    }
+
+    fn eraseSubmittedPromptLine(self: ScreenIo) !void {
+        if (self.painter != null) return;
+        try self.write("\x1b[1A\r\x1b[J");
     }
 
     fn writeStderr(self: ScreenIo, bytes: []const u8) !void {
@@ -115,12 +116,15 @@ fn renderFullscreenConversation(
     // Search and Jump to latest share a row below the transcript.
     const search_rows: usize = @intFromBool(search_line != null and chrome_budget > 0 and width > 0 and dialog.len == 0);
     const jump_latest_rows: usize = @intFromBool(search_rows == 0 and !view.isFollowing() and chrome_budget > 0 and popup.len == 0 and width > 0 and dialog.len == 0);
-    const chrome_rows = @min(footer.len, chrome_budget - (if (jump_latest_rows > 0 or search_rows > 0) @as(usize, 1) else 0));
-    const reserved_below_body: usize = @intFromBool(jump_latest_rows > 0 or search_rows > 0);
-    const extra_rows = chrome_budget - reserved_below_body - chrome_rows;
-    const loader_rows: usize = @intFromBool(rows >= 5 and extra_rows > 0);
-    const rule_rows: usize = if (rows >= 9 and width >= 4 and extra_rows >= 4) 2 else 0;
-    const popup_budget = extra_rows - loader_rows - rule_rows;
+    const reserved_below_body = jump_latest_rows + search_rows;
+    const chrome_available = chrome_budget - reserved_below_body;
+    // Keep room for the transcript and scrolling controls on short terminals.
+    const footer_limit: usize = if (rows < 12) 2 else 4;
+    const chrome_rows = @min(footer.len, @min(chrome_available, footer_limit));
+    const loader_rows: usize = @intFromBool(rows >= 5 and chrome_available > chrome_rows);
+    const extra_rows = chrome_available - chrome_rows - loader_rows;
+    const rule_rows: usize = @intFromBool(rows >= 12 and width >= 4 and extra_rows > 0);
+    const popup_budget = extra_rows - rule_rows;
     const popup_rows = @min(popup.len, popup_budget / 2);
     const queued_rows = @min(@min(queued.len, 4), popup_budget - popup_rows);
     const body_rows = rows -| (1 + header_rows + chrome_rows + loader_rows + popup_rows + queued_rows + rule_rows + reserved_below_body);
@@ -226,7 +230,7 @@ fn renderFullscreenConversation(
         _ = try EditorState.appendRuleLine(&rule, a, th, size.col, isBangMode(editor.buf.items));
         try rows_out.append(a, rule.items);
     }
-    const editor_row = rows - chrome_rows - @min(rule_rows, 1);
+    const editor_row = rows_out.items.len;
 
     const text = editor.buf.items;
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..editor.cursor], '\n')) |nl| nl + 1 else 0;
@@ -251,20 +255,19 @@ fn renderFullscreenConversation(
     }
     _ = try terminal.appendClippedText(&editor_line, a, text[start..line_end], cursor_budget);
     try rows_out.append(a, editor_line.items);
-    if (rule_rows > 0) {
-        var rule: std.ArrayList(u8) = .empty;
-        _ = try EditorState.appendRuleLine(&rule, a, th, size.col, isBangMode(editor.buf.items));
-        try rows_out.append(a, rule.items);
-    }
-    for (footer[footer.len - chrome_rows ..]) |line| {
-        var footer_line: std.ArrayList(u8) = .empty;
-        _ = try terminal.appendTruncatedAnsi(&footer_line, a, line, width, "");
-        try rows_out.append(a, footer_line.items);
+    if (footer.len > 0) {
+        const indices: []const usize = switch (chrome_rows) {
+            4 => &.{ 0, 1, 2, 3 },
+            3 => &.{ 1, 2, 3 },
+            2 => &.{ 1, 2 },
+            1 => &.{2},
+            else => &.{},
+        };
+        for (indices) |index| try appendFullscreenRow(&rows_out, a, footer[index], width);
     }
     // Diff against the retained frame so steady streaming only repaints edited
     // rows; the cursor is left on the editor row.
-    const cursor_row = if (editor_row > 0) editor_row - 1 else 0;
-    try painter.render(io, output, rows_out.items, .{ .row = cursor_row, .col = prefix_width + cursor_width }, size.col);
+    try painter.render(io, output, rows_out.items, .{ .row = editor_row, .col = prefix_width + cursor_width }, size.col);
 }
 
 fn appendPinnedUserRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize) !void {
@@ -437,6 +440,7 @@ pub const StartupInfo = struct {
 pub const Submit = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque, []const u8) anyerror!void,
+    new_session: ?*const fn (*anyopaque) anyerror!void = null,
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
     copy_last_reply: ?*const fn (*anyopaque) anyerror!void = null,
     render_initial_history: ?*const fn (*anyopaque) anyerror!bool = null,
@@ -679,7 +683,7 @@ pub fn run(io: std.Io, options: Submit) !void {
     }
     if (!submit.fullscreen and !had_initial_history and !submit.quiet_startup and th.mode != .none) {
         const sz = terminalSize(output);
-        const editor_chrome_rows: usize = 5;
+        const editor_chrome_rows: usize = 6;
         if (sz.row > header_lines + editor_chrome_rows) {
             const pad = @min(@as(usize, sz.row) - header_lines - editor_chrome_rows, 80);
             var pad_buf: [80]u8 = undefined;
@@ -768,6 +772,13 @@ pub fn run(io: std.Io, options: Submit) !void {
             continue;
         }
         if (!is_bg_wakeup) {
+            if (std.mem.eql(u8, text, "/new")) {
+                try tc.eraseSubmittedPromptLine();
+                if (submit.new_session) |new_session| {
+                    new_session(submit.context) catch |err| try reportTurnError(io, submit.conversation_view, use_sgr, err);
+                } else try tc.writeStderr("zpi: /new unavailable\n");
+                continue;
+            }
             if (std.mem.eql(u8, text, "/exit") or std.mem.eql(u8, text, "/quit")) {
                 const saved_output = alternate_screen and submit.render_saved_session_on_exit != null;
                 if (saved_output) {
@@ -827,13 +838,13 @@ pub fn run(io: std.Io, options: Submit) !void {
                 try output.writeStreamingAll(io, "/search needs the fullscreen interface (--tui-mode fullscreen).\n");
                 continue;
             }
-            try eraseSubmittedPromptLine(io, output);
+            try tc.eraseSubmittedPromptLine();
             pending_search = true;
             continue;
         }
         if (std.mem.eql(u8, text, "/help")) {
             if (color) {
-                try eraseSubmittedPromptLine(tc.io, tc.file);
+                try tc.eraseSubmittedPromptLine();
                 pending_dialog = .help;
             } else {
                 try tc.write("Enter a task to stream a response and run tools. /exit leaves the session.\nUse --session PATH to reopen; add --branch ENTRY-ID to continue from an earlier point.\nTab completes /commands and @paths; Up/Down navigates history; Alt+Enter or trailing \\ adds a newline.\nFullscreen: Ctrl-F or Esc on an empty prompt searches the transcript (/search).\n");
@@ -842,10 +853,10 @@ pub fn run(io: std.Io, options: Submit) !void {
         }
         if (std.mem.eql(u8, text, "/hotkeys")) {
             if (color) {
-                try eraseSubmittedPromptLine(tc.io, tc.file);
+                try tc.eraseSubmittedPromptLine();
                 pending_dialog = .hotkeys;
             } else {
-                try tc.write("Keyboard shortcuts\nEnter     Submit prompt (or queue follow-up while busy)\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\nAlt+Up    Edit queued follow-up messages\nCtrl-F    Search transcript (/search, or Esc on an empty prompt)\nCtrl-P/N  Previous/next user message (Alt+Up/Alt+Down)\nEsc       Clear draft while busy / cancel selector / open search when empty\n/model    Fuzzy model picker (or /model [provider/id] | --list)\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Branch picker (/ filter, p prefill user msg, s summarize, Enter switch)\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/search   Search the fullscreen transcript (Ctrl-F)\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
+                try tc.write("Keyboard shortcuts\nEnter     Submit prompt (or queue follow-up while busy)\nCtrl-C    Cancel current turn or clear prompt\nCtrl-D    Exit on empty line / delete char\nUp/Down   Navigate history or lines\nLeft/Right Move cursor (Ctrl-A/E home/end)\nCtrl-W/U/K Delete word / to start / to end\nTab       Complete /command or @path\nAlt+Enter Insert newline (or trailing \\)\nAlt+Up    Edit queued follow-up messages\nCtrl-F    Search transcript (/search, or Esc on an empty prompt)\nCtrl-P/N  Previous/next user message (Alt+Up/Alt+Down)\nEsc       Clear draft while busy / cancel selector / open search when empty\n/model    Fuzzy model picker (or /model [provider/id] | --list)\n/thinking Show or set thinking level (/thinking [off|minimal|low|medium|high|xhigh|max])\n/tree     Branch picker (/ filter, p prefill user msg, s summarize, Enter switch)\n/new      Start a fresh session\n/compact  Summarize older context (/compact [focus])\n/exit     Exit (/quit)\n/help     Show help\n/search   Search the fullscreen transcript (Ctrl-F)\n/session  Show current session summary\n/hotkeys  Show shortcuts\n");
             }
             continue;
         }
@@ -857,7 +868,8 @@ pub fn run(io: std.Io, options: Submit) !void {
                 const arg = if (std.mem.eql(u8, raw_arg, "--list"))
                     ""
                 else if (raw_arg.len == 0 and color and submit.model_source != null) blk: {
-                    try eraseSubmittedPromptLine(tc.io, tc.file);
+                    tc.invalidate();
+                    try tc.eraseSubmittedPromptLine();
                     var src = (submit.model_source.?(submit.context) catch |err| {
                         var msg: [256]u8 = undefined;
                         const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
@@ -908,7 +920,8 @@ pub fn run(io: std.Io, options: Submit) !void {
                 var prefill_text: ?[]const u8 = null;
                 var skip_tree_cmd = false;
                 const argument = if (target.len == 0 and color and submit.tree_source != null) blk: {
-                    try eraseSubmittedPromptLine(tc.io, tc.file);
+                    tc.invalidate();
+                    try tc.eraseSubmittedPromptLine();
                     const tree = submit.tree_source.?(submit.context);
                     const choice = selectTree(io, input.handle, tc.file, &queue, submit, tree, th) catch |err| switch (err) {
                         error.Canceled => {
@@ -952,6 +965,10 @@ pub fn run(io: std.Io, options: Submit) !void {
         if (std.mem.eql(u8, text, "/compact") or std.mem.startsWith(u8, text, "/compact ")) {
             const focus = if (text.len > "/compact".len) std.mem.trim(u8, text["/compact".len..], " \t") else "";
             if (submit.compact) |run_compact| {
+                if (color and submit.set_live_writer != null) {
+                    try runTurnWithLiveEditor(io, input.handle, tc.file, &queue, &history, submit, run_compact, focus, .compacting, &followups, &bg_queue, &carried_draft, use_sgr, th, tc.painter);
+                    continue;
+                }
                 run_compact(submit.context, focus) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
@@ -967,12 +984,16 @@ pub fn run(io: std.Io, options: Submit) !void {
             continue;
         }
         if (std.mem.eql(u8, text, "/session")) {
-            if (submit.session_info) |show| try show(submit.context);
+            if (submit.session_info) |show| {
+                tc.invalidate();
+                try show(submit.context);
+            }
             continue;
         }
         if (std.mem.eql(u8, text, "/jobs") or std.mem.startsWith(u8, text, "/jobs ")) {
             const arg = if (text.len > "/jobs".len) std.mem.trim(u8, text["/jobs".len..], " \t") else "";
             if (submit.jobs_info) |show_jobs| {
+                tc.invalidate();
                 show_jobs(submit.context, arg) catch |err| {
                     var msg: [256]u8 = undefined;
                     const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
@@ -991,7 +1012,8 @@ pub fn run(io: std.Io, options: Submit) !void {
                 const arg = if (std.mem.eql(u8, raw_arg, "--list"))
                     ""
                 else if (raw_arg.len == 0 and color and submit.session_source != null) blk: {
-                    try eraseSubmittedPromptLine(tc.io, tc.file);
+                    tc.invalidate();
+                    try tc.eraseSubmittedPromptLine();
                     var src = (submit.session_source.?(submit.context) catch |err| {
                         var msg: [256]u8 = undefined;
                         const line = try std.fmt.bufPrint(&msg, "zpi: {s}\n", .{@errorName(err)});
@@ -1022,7 +1044,7 @@ pub fn run(io: std.Io, options: Submit) !void {
             continue;
         }
         if (color and submit.set_live_writer != null) {
-            try runTurnWithLiveEditor(io, input.handle, tc.file, &queue, &history, submit, text, &followups, &bg_queue, &carried_draft, use_sgr, th, tc.painter);
+            try runTurnWithLiveEditor(io, input.handle, tc.file, &queue, &history, submit, submit.run, text, .streaming, &followups, &bg_queue, &carried_draft, use_sgr, th, tc.painter);
         } else {
             submit.run(submit.context, text) catch |err| try reportTurnError(io, submit.conversation_view, use_sgr, err);
         }
@@ -1445,7 +1467,7 @@ const EditorState = struct {
 
         var total_end_row = layout.end_row;
         var total_end_col = layout.end_col;
-        if (show_rules) {
+        if (show_rules and footer_lines.len != 4) {
             try out.appendSlice(self.allocator, "\r\n");
             const rule_w = try appendRuleLine(&out, self.allocator, th, cols, shell_mode);
             total_end_row += 1;
@@ -1494,7 +1516,7 @@ const EditorState = struct {
     }
 };
 
-const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/search", "/copy", "/session", "/resume", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
+const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/search", "/copy", "/session", "/new", "/resume", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
 fn handleTab(editor: *EditorState, io: std.Io, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
     // Identify token immediately before cursor (bounded by whitespace).
@@ -1915,15 +1937,14 @@ fn readPromptLine(
             defer allocator.free(popup_slices);
             for (popup_lines, popup_slices) |pl, *s| s.* = pl;
 
-            var footer_buf: ?[2][]u8 = null;
+            var footer_buf: ?[4][]u8 = null;
             if (has_footer) {
                 var info = submit.status_info.?(submit.context);
                 info.queued_count = 0;
-                footer_buf = try components.chrome.Footer.renderLinesAlloc(allocator, th, info, @max(1, cols -| 1));
+                footer_buf = try components.chrome.Footer.renderFramedLinesAlloc(allocator, th, info, @max(1, cols -| 1), null);
             }
             defer if (footer_buf) |fb| {
-                allocator.free(fb[0]);
-                allocator.free(fb[1]);
+                for (fb) |line| allocator.free(line);
             };
             const footer_slices: []const []const u8 = if (footer_buf) |*fb| fb else &.{};
 
@@ -1974,7 +1995,7 @@ fn readPromptLine(
                 continue;
             }
             popup.clear();
-            if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
+            if (!submit.fullscreen and (dialog_on_screen or editor.completion_hint != null or th.mode != .none)) {
                 editor.resetCompletionTrack();
                 editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false, isBangMode(editor.buf.items)) catch {};
                 dialog_on_screen = false;
@@ -2031,7 +2052,7 @@ fn readPromptLine(
         switch (b) {
             0x03 => {
                 popup.clear();
-                if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
+                if (!submit.fullscreen and (dialog_on_screen or editor.completion_hint != null or th.mode != .none)) {
                     editor.resetCompletionTrack();
                     editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false, false) catch {};
                     dialog_on_screen = false;
@@ -2041,7 +2062,7 @@ fn readPromptLine(
             0x04 => {
                 if (editor.buf.items.len == 0) {
                     popup.clear();
-                    if (dialog_on_screen or editor.completion_hint != null or th.mode != .none) {
+                    if (!submit.fullscreen and (dialog_on_screen or editor.completion_hint != null or th.mode != .none)) {
                         editor.resetCompletionTrack();
                         editor.renderWithOverlay(io, output, cols, use_sgr, th, &.{}, &.{}, &.{}, false, isBangMode(editor.buf.items)) catch {};
                         dialog_on_screen = false;
@@ -2097,6 +2118,8 @@ fn readPromptLine(
                     }
                     return .{ .text = try editor.buf.toOwnedSlice(allocator) };
                 }
+                // The retained renderer owns the fullscreen editor and its footer.
+                if (submit.fullscreen) return .{ .text = try editor.buf.toOwnedSlice(allocator) };
                 const had_hint = editor.completion_hint != null or popup.isOpen();
                 popup.clear();
                 editor.resetCompletionTrack();
@@ -2534,6 +2557,18 @@ const LiveScreen = struct {
     overlay_cursor_row: usize = 0,
     overlay_cols: usize = 80,
     overlay_active: bool = false,
+    event_wake: ?*agent.model.Interrupt = null,
+    started_ms: i64 = 0,
+
+    fn elapsedMs(self: *const LiveScreen) u64 {
+        const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        return @intCast(@max(0, now - self.started_ms));
+    }
+
+    // Called with the screen mutex held, including when the consumer resets it.
+    fn notifyLocked(self: *LiveScreen) void {
+        if (self.event_wake) |wake| if (!wake.isCanceled()) wake.trigger();
+    }
 
     const max_pending_line_bytes: usize = 4096;
 
@@ -2587,7 +2622,7 @@ const LiveScreen = struct {
         const self: *LiveScreen = @ptrCast(@alignCast(context));
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.loader.setPhase(phase, detail);
+        if (self.loader.setPhase(phase, detail, self.elapsedMs())) self.notifyLocked();
     }
 
     fn handleScrollKey(self: *LiveScreen, final: u8, params: []const u8) bool {
@@ -2612,6 +2647,7 @@ const LiveScreen = struct {
             defer self.allocator.free(clean);
             try view.appendText(clean);
             try view.appendText(suffix);
+            self.notifyLocked();
             return;
         }
 
@@ -2666,6 +2702,7 @@ const LiveScreen = struct {
                 rest = rest[nl + 1 ..];
             }
             try view.appendText(rest);
+            self.notifyLocked();
             return;
         }
 
@@ -2731,24 +2768,26 @@ const LiveScreen = struct {
         }
     }
 
-    fn loaderTickAndRender(
+    fn renderLive(
         self: *LiveScreen,
         editor: *const EditorState,
         followups: []const []const u8,
         submit: Submit,
         cols: usize,
-        delta_ms: u64,
     ) !void {
         const max_cols = @max(1, cols -| 1);
-        const loader_line = blk: {
+        const activity = blk: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (delta_ms > 0) self.loader.tick(delta_ms);
-            break :blk try self.loader.renderLineAlloc(self.allocator, self.th, max_cols);
+            if (self.event_wake) |wake| if (wake.isCanceled()) wake.reset();
+            var snapshot = self.loader;
+            snapshot.elapsed_ms = self.elapsedMs();
+            break :blk snapshot;
         };
+        const loader_line = try activity.renderLineAlloc(self.allocator, self.th, max_cols);
         defer self.allocator.free(loader_line);
 
-        var footer_lines: ?[2][]u8 = null;
+        var footer_lines: ?[4][]u8 = null;
         defer if (footer_lines) |lines| {
             for (lines) |line| self.allocator.free(line);
         };
@@ -2756,7 +2795,7 @@ const LiveScreen = struct {
             if (submit.status_info) |get_info| {
                 var info = get_info(submit.context);
                 info.queued_count = followups.len;
-                footer_lines = try components.chrome.Footer.renderLinesAlloc(self.allocator, self.th, info, max_cols);
+                footer_lines = try components.chrome.Footer.renderFramedLinesAlloc(self.allocator, self.th, info, max_cols, activity);
             }
         }
         if (self.conversation_view) |view| {
@@ -2832,6 +2871,7 @@ const LiveScreen = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.conversation_view.?.appendToolText(text, id);
+        self.notifyLocked();
     }
 
     fn writeToolBodyErased(context: *anyopaque, text: []const u8, id: []const u8) anyerror!void {
@@ -2839,6 +2879,7 @@ const LiveScreen = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.conversation_view.?.appendToolBody(text, id);
+        self.notifyLocked();
     }
 
     fn setToolsExpanded(self: *LiveScreen, expanded: bool) void {
@@ -2952,7 +2993,7 @@ fn renderLiveOverlayFrameWithChrome(
         try appendSafeTerminalBytes(&out, allocator, editor.buf.items);
         var bottom_row = layout.end_row;
         var bottom_col = layout.end_col;
-        if (th.mode != .none) {
+        if (th.mode != .none and footer_lines.len != 4) {
             try out.appendSlice(allocator, "\r\n");
             bottom_col = try EditorState.appendRuleLine(&out, allocator, th, cols, shell_mode);
             bottom_row += 1;
@@ -3021,7 +3062,9 @@ fn runTurnWithLiveEditor(
     queue: *InputQueue,
     history: *History,
     submit: Submit,
+    run_worker: *const fn (*anyopaque, []const u8) anyerror!void,
     text: []const u8,
+    initial_phase: components.chrome.Phase,
     followups: *std.ArrayList([]u8),
     bg_queue: *std.ArrayList([]u8),
     carried_draft: *?[]u8,
@@ -3042,6 +3085,11 @@ fn runTurnWithLiveEditor(
     var cols = terminalColumns(output);
     var last_size = terminalSize(output);
     var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th, submit.conversation_view, painter);
+    var event_wake = try agent.model.Interrupt.init();
+    defer event_wake.deinit(io);
+    screen.event_wake = &event_wake;
+    screen.started_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    screen.loader.phase = initial_phase;
     screen.overlay_cols = cols;
     defer screen.deinit();
 
@@ -3057,20 +3105,21 @@ fn runTurnWithLiveEditor(
     }
 
     const WorkerState = struct {
-        submit: Submit,
+        context: *anyopaque,
+        callback: *const fn (*anyopaque, []const u8) anyerror!void,
         text: []const u8,
         done: *agent.model.Interrupt,
         err: ?anyerror = null,
         fn run(state: *@This()) void {
-            state.submit.run(state.submit.context, state.text) catch |e| {
+            state.callback(state.context, state.text) catch |e| {
                 state.err = e;
             };
             state.done.trigger();
         }
     };
     errdefer screen.clearOverlay() catch {};
-    try screen.loaderTickAndRender(&editor, followups.items, submit, cols, 0);
-    var worker = WorkerState{ .submit = submit, .text = text, .done = &done };
+    try screen.renderLive(&editor, followups.items, submit, cols);
+    var worker = WorkerState{ .context = submit.context, .callback = run_worker, .text = text, .done = &done };
     var thread = try std.Thread.spawn(.{}, WorkerState.run, .{&worker});
     var joined = false;
     errdefer if (!joined) {
@@ -3081,31 +3130,42 @@ fn runTurnWithLiveEditor(
     var in_paste = false;
     var dirty = false;
     const wake = done.cancel();
-    var last_tick_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const update_interval_ms = 16;
+    const animation_interval_ms = components.chrome.Loader.frame_ms;
+    var last_paint_ms = screen.elapsedMs();
 
-    while (true) {
-        if (done.isCanceled()) break;
-        const current_size = terminalSize(output);
-        const current_cols = @as(usize, current_size.col);
-        if ((dirty or current_cols != cols or current_size.row != last_size.row) and !queue.hasBuffered()) {
-            cols = current_cols;
-            last_size = current_size;
-            try screen.loaderTickAndRender(&editor, followups.items, submit, cols, 0);
-            dirty = false;
-        }
-        const b_opt = try queue.readByteWithWake(input_fd, wake, 120);
-        if (done.isCanceled()) break;
-        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-        if (b_opt == null) {
-            const elapsed: u64 = @intCast(@max(@as(i64, 0), now_ms - last_tick_ms));
-            if (elapsed >= 120 and !queue.hasBuffered()) {
-                last_tick_ms = now_ms;
-                cols = terminalColumns(output);
-                try screen.loaderTickAndRender(&editor, followups.items, submit, cols, elapsed);
+    while (!done.isCanceled()) {
+        const now = screen.elapsedMs();
+        const update_pending = event_wake.isCanceled();
+        const animation_deadline = (now / animation_interval_ms + 1) * animation_interval_ms;
+        const update_deadline = last_paint_ms + update_interval_ms;
+        const buffered = queue.hasBuffered();
+        if (!buffered) {
+            const current_size = terminalSize(output);
+            const resized = !std.meta.eql(current_size, last_size);
+            const animate = now / animation_interval_ms != last_paint_ms / animation_interval_ms;
+            if (dirty or resized or animate or (update_pending and now >= update_deadline)) {
+                cols = current_size.col;
+                last_size = current_size;
+                try screen.renderLive(&editor, followups.items, submit, cols);
+                last_paint_ms = now;
+                dirty = false;
+                continue;
             }
+        }
+        // Leave throttled updates latched until paint. Exclude their pipe from
+        // the wait so keystrokes and completion can still interrupt the delay.
+        const deadline = if (update_pending) @min(update_deadline, animation_deadline) else animation_deadline;
+        const update_wake = if (update_pending or buffered) null else event_wake.cancel();
+        if (queue.eof) {
+            _ = try queue.readByteWithWake(input_fd, wake, @intCast(deadline -| now));
             continue;
         }
-        const b = b_opt.?;
+        const b = (queue.readByteWithCancelAndWake(input_fd, wake, update_wake, @intCast(deadline -| now)) catch |err| switch (err) {
+            error.Canceled => break,
+            else => return err,
+        }) orelse continue;
+        if (done.isCanceled()) break;
 
         switch (b) {
             0x03 => {

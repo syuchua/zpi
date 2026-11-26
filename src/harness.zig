@@ -68,6 +68,7 @@ pub const Event = union(enum) {
     extension_event: std.json.Value,
     turn_error: anyerror,
     compaction_empty,
+    performance: struct { phase: []const u8, elapsed_ns: u64 },
 };
 
 pub const Sink = struct {
@@ -213,6 +214,7 @@ pub const Harness = struct {
     host_cwd: []const u8,
     home: ?[]const u8,
     session_dir_override: ?[]const u8,
+    session_enabled: bool,
     cwd: []const u8,
     settings: Settings,
     selection: Selection,
@@ -268,6 +270,7 @@ pub const Harness = struct {
             .host_cwd = "",
             .home = null,
             .session_dir_override = null,
+            .session_enabled = !options.no_session,
             .cwd = "",
             .settings = .{},
             .selection = .{},
@@ -479,8 +482,8 @@ pub const Harness = struct {
         }
         self.native_plugin_names = plugin_names;
 
-        const previous = try self.store.projectedPathFrom(a, options.branch orelse self.store.active_leaf);
-        defer a.free(previous);
+        const previous = try self.store.projectedPathFrom(gpa, options.branch orelse self.store.active_leaf);
+        defer gpa.free(previous);
         const instructions_update: ?[]const u8 = if (replacement != null or additions.len > 0) blk: {
             var base: []const u8 = system_prompt.default_prompt;
             var prior: std.ArrayList([]const u8) = .empty;
@@ -579,7 +582,7 @@ pub const Harness = struct {
             host.on_event = extensionEventErased;
         }
 
-        for (previous) |entry| try self.runtime.append(entry.message);
+        try loadStoredMessages(&self.runtime, previous);
         if (options.branch) |id| try self.store.branch(id);
         if (self.runtime.messages.items.len == 0) {
             try self.runtime.append(.{ .role = .system, .content = &.{.{ .text = system_prompt.default_prompt }} });
@@ -649,6 +652,19 @@ pub const Harness = struct {
 
     pub fn setSink(self: *Harness, sink: ?Sink) void {
         self.sink = sink;
+    }
+
+    pub fn setTimings(self: *Harness, enabled: bool) void {
+        const observer: ?zpi.model.Timing = if (enabled) .{ .context = self, .emit = emitTimingErased } else null;
+        self.runtime.timing = observer;
+        self.openai_client.timing = observer;
+        self.responses_client.timing = observer;
+        self.anthropic_client.timing = observer;
+    }
+
+    fn emitTimingErased(context: *anyopaque, phase: []const u8, elapsed_ns: u64) void {
+        const self: *Harness = @ptrCast(@alignCast(context));
+        self.emitEvent(.{ .performance = .{ .phase = phase, .elapsed_ns = elapsed_ns } }) catch {};
     }
 
     pub fn statusSummary(self: *const Harness) StatusSummary {
@@ -777,6 +793,49 @@ pub const Harness = struct {
         return try recent_session.list(allocator, self.io, directory, self.cwd, 50);
     }
 
+    pub fn newSession(self: *Harness) !StatusSummary {
+        if (self.runtime.running) return error.AgentBusy;
+        if (self.store.pending_create and self.store.entries.items.len == 0) return self.statusSummary();
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var next = if (self.session_enabled) blk: {
+            const env_dir = self.environ.get("PI_CODING_AGENT_SESSION_DIR");
+            const fallback = if (env_dir != null and env_dir.?.len > 0) env_dir else self.settings.session_dir;
+            const directory = try recent_session.resolveDirectory(a, self.host_cwd, self.home, self.session_dir_override, fallback);
+            var random: [16]u8 = undefined;
+            self.io.random(&random);
+            const name = try std.fmt.allocPrint(a, "{x}.jsonl", .{&random});
+            const path = try std.fs.path.join(a, &.{ directory, name });
+            break :blk try zpi.session.Store.deferred(self.gpa, self.io, path, self.cwd);
+        } else zpi.session.Store.memory(self.gpa, self.io);
+        errdefer next.deinit();
+        var staged = agent.Agent.init(self.gpa, self.io, self.provider, self.enabled_tools, self.cwd);
+        staged.timing = self.runtime.timing;
+        errdefer staged.deinit();
+        staged.cancel = self.runtime.cancel;
+        staged.retry = self.runtime.retry;
+        staged.compaction_hook = self.runtime.compaction_hook;
+        staged.steering_hook = self.runtime.steering_hook;
+        const history = try self.store.projectedActivePath(a);
+        for (history) |entry| {
+            if (entry.message.role != .system) continue;
+            try staged.append(entry.message);
+        }
+        if (staged.messages.items.len == 0) try staged.append(.{ .role = .system, .content = &.{.{ .text = system_prompt.default_prompt }} });
+        for (staged.messages.items) |message| _ = try next.appendMessage(message);
+        try self.attachSkills(&staged);
+        self.runtime.deinit();
+        self.store.deinit();
+        self.store = next;
+        self.runtime = staged;
+        self.steering_mutex.lockUncancelable(self.io);
+        for (self.steering_queue.items) |item| self.gpa.free(item);
+        self.steering_queue.clearRetainingCapacity();
+        self.steering_mutex.unlock(self.io);
+        return self.statusSummary();
+    }
+
     pub fn resumeSession(self: *Harness, path_input: []const u8) !StatusSummary {
         if (self.runtime.running) return error.AgentBusy;
         if (path_input.len == 0 or std.mem.indexOfScalar(u8, path_input, 0) != null or !std.unicode.utf8ValidateSlice(path_input)) {
@@ -803,29 +862,32 @@ pub const Harness = struct {
         }
 
         var next_store = try zpi.session.Store.open(self.gpa, self.io, resolved);
-        errdefer next_store.deinit();
+        var installed = false;
+        errdefer if (!installed) next_store.deinit();
 
         const projected = try next_store.projectedActivePath(self.gpa);
         defer self.gpa.free(projected);
 
         var staged = agent.Agent.init(self.gpa, self.io, self.provider, self.enabled_tools, self.runtime.cwd);
-        errdefer staged.deinit();
+        staged.timing = self.runtime.timing;
+        errdefer if (!installed) staged.deinit();
         staged.cancel = self.runtime.cancel;
         staged.retry = self.runtime.retry;
         staged.compaction_hook = self.runtime.compaction_hook;
         staged.steering_hook = self.runtime.steering_hook;
 
-        for (projected) |entry| try staged.append(entry.message);
+        try loadStoredMessages(&staged, projected);
         if (staged.messages.items.len == 0) {
             try staged.append(.{ .role = .system, .content = &.{.{ .text = system_prompt.default_prompt }} });
             _ = try next_store.appendMessage(staged.messages.items[0]);
         }
         try self.attachSkills(&staged);
 
+        self.runtime.deinit();
         self.store.deinit();
         self.store = next_store;
-        self.runtime.deinit();
         self.runtime = staged;
+        installed = true;
         try self.runtime.reconcile(.{ .context = self, .emit = agentEmitErased });
         return self.statusSummary();
     }
@@ -917,8 +979,9 @@ pub const Harness = struct {
         const projected = try self.store.projectedPathFrom(self.gpa, target);
         defer self.gpa.free(projected);
         var staged = agent.Agent.init(self.gpa, self.io, self.provider, self.enabled_tools, self.runtime.cwd);
+        staged.timing = self.runtime.timing;
         defer staged.deinit();
-        for (projected) |entry| try staged.append(entry.message);
+        try loadStoredMessages(&staged, projected);
         const Guard = struct {
             fn reject(_: *anyopaque, _: agent.Event) anyerror!void {
                 return error.IncompleteBranchToolBatch;
@@ -1078,10 +1141,43 @@ pub const Harness = struct {
     }
 
     pub fn submit(self: *Harness, prompt: []const u8) !SubmitResult {
+        return self.submitWithImages(prompt, &.{});
+    }
+
+    pub fn submitWithImages(self: *Harness, prompt: []const u8, images: []const zpi.model.Image) !SubmitResult {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
-        const effective = try self.preparePrompt(scratch.allocator(), prompt, "interactive") orelse return .{ .handled = true };
-        return self.submitPrepared(effective);
+        const a = scratch.allocator();
+        const effective = try self.preparePrompt(a, prompt, "interactive") orelse return .{ .handled = true };
+        if (images.len == 0) return self.submitPrepared(effective);
+        if (images.len > zpi.model.Image.max_message_images) return error.TooManyImages;
+        const parts = try a.alloc(zpi.model.Content, images.len + @intFromBool(effective.len > 0));
+        if (effective.len > 0) parts[0] = .{ .text = effective };
+        for (parts[parts.len - images.len ..], images) |*part, image| part.* = .{ .image = image };
+        return self.submitPreparedMessage(.{ .role = .user, .content = parts });
+    }
+
+    pub fn submitPrepared(self: *Harness, effective: []const u8) !SubmitResult {
+        return self.submitPreparedMessage(.{ .role = .user, .content = &.{.{ .text = effective }} });
+    }
+
+    fn submitPreparedMessage(self: *Harness, message: zpi.model.Message) !SubmitResult {
+        const preparation_started = zpi.model.Timing.start(self.runtime.timing, self.io);
+        self.runtime.promptMessage(message, .{ .context = self, .emit = agentEmitErased }) catch |err| {
+            try self.runtime.reconcile(.{ .context = self, .emit = agentEmitErased });
+            try self.emitEvent(.{ .turn_error = err });
+            return err;
+        };
+        zpi.model.Timing.finish(self.runtime.timing, self.io, preparation_started, "prompt_to_settlement_including_turn");
+        var final_text: []const u8 = "";
+        if (self.runtime.messages.items.len > 0) {
+            const last = self.runtime.messages.items[self.runtime.messages.items.len - 1];
+            for (last.content) |part| if (part == .text) {
+                final_text = part.text;
+                break;
+            };
+        }
+        return .{ .handled = false, .final_text = final_text };
     }
 
     /// Returns null when an extension handles the prompt. The returned text
@@ -1106,27 +1202,6 @@ pub const Harness = struct {
         if (try skills.expandCommand(scratch, self.io, effective, self.discovered_skills)) |text| effective = text;
         if (try prompt_templates.expand(scratch, effective, self.discovered_templates)) |text| effective = text;
         return effective;
-    }
-
-    pub fn submitPrepared(self: *Harness, effective: []const u8) !SubmitResult {
-        self.runtime.prompt(effective, .{ .context = self, .emit = agentEmitErased }) catch |err| {
-            try self.runtime.reconcile(.{ .context = self, .emit = agentEmitErased });
-            try self.emitEvent(.{ .turn_error = err });
-            return err;
-        };
-
-        var final_text: []const u8 = "";
-        if (self.runtime.messages.items.len > 0) {
-            const last = self.runtime.messages.items[self.runtime.messages.items.len - 1];
-            for (last.content) |part| switch (part) {
-                .text => |text| {
-                    final_text = text;
-                    break;
-                },
-                else => {},
-            };
-        }
-        return .{ .handled = false, .final_text = final_text };
     }
 
     fn syncClients(self: *Harness) void {
@@ -1224,11 +1299,17 @@ pub const Harness = struct {
 
     fn agentEmitErased(context: *anyopaque, event: agent.Event) anyerror!void {
         const self: *Harness = @ptrCast(@alignCast(context));
-        switch (event) {
-            .message_appended => |message| {
-                _ = try self.store.appendMessage(message);
-            },
-            else => {},
+        if (event == .message_appended) {
+            const message = event.message_appended;
+            const timing = self.runtime.timing;
+            const started = zpi.model.Timing.start(timing, self.io);
+            _ = try self.store.appendMessage(message);
+            zpi.model.Timing.finish(timing, self.io, started, switch (message.role) {
+                .system => "session_append_system",
+                .user => "session_append_user",
+                .assistant => "session_append_assistant",
+                .tool_result => "session_append_tool_result",
+            });
         }
         try self.emitEvent(.{ .agent = event });
     }
@@ -1301,8 +1382,15 @@ pub const Harness = struct {
         defer self.gpa.free(reprojected);
         self.runtime.messages.clearRetainingCapacity();
         _ = self.runtime.arena.reset(.retain_capacity);
-        for (reprojected) |entry| try self.runtime.append(entry.message);
+        try loadStoredMessages(&self.runtime, reprojected);
         try self.attachSkills(&self.runtime);
+    }
+
+    /// Store payloads are validated, immutable and arena-backed. The harness
+    /// discards the runtime message list before closing or replacing its store.
+    fn loadStoredMessages(runtime: *agent.Agent, entries: []const zpi.session.EntryView) !void {
+        try runtime.messages.ensureUnusedCapacity(runtime.allocator, entries.len);
+        for (entries) |entry| runtime.messages.appendAssumeCapacity(entry.message);
     }
 
     fn attachSkills(self: *const Harness, runtime: *agent.Agent) !void {

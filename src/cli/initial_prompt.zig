@@ -1,12 +1,44 @@
-//! Initial text prompt: piped stdin, explicit @files, then positional text.
-//! Paths use the launching directory, independent of tool/session cwd.
+//! Initial prompt text and validated image attachments, resolved from launch cwd.
 const std = @import("std");
+const model = @import("zpi").model;
 
 pub const max_file_bytes = 1024 * 1024;
 pub const max_prompt_bytes = 4 * 1024 * 1024;
+pub const max_image_bytes = model.Image.max_message_bytes;
 
-/// Caller owns the returned buffer. Attachments are UTF-8 regular files only.
-/// Matches pi's text wrapper and BOM stripping; binary/image input is rejected.
+pub fn buildImages(a: std.mem.Allocator, io: std.Io, cwd: []const u8, home: ?[]const u8, paths: []const []const u8) ![]model.Image {
+    if (paths.len > model.Image.max_message_images) return error.TooManyImages;
+    var images: std.ArrayList(model.Image) = .empty;
+    errdefer {
+        for (images.items) |image| a.free(image.bytes);
+        images.deinit(a);
+    }
+    var remaining: usize = model.Image.max_message_bytes;
+    for (paths) |input| {
+        if (input.len == 0 or std.mem.indexOfScalar(u8, input, 0) != null or !std.unicode.utf8ValidateSlice(input)) return error.InvalidImagePath;
+        const expanded = if (std.mem.eql(u8, input, "~")) home orelse return error.MissingHome else if (std.mem.startsWith(u8, input, "~/")) try std.fs.path.join(a, &.{ home orelse return error.MissingHome, input[2..] }) else input;
+        defer if (std.mem.startsWith(u8, input, "~/")) a.free(expanded);
+        const path = try std.fs.path.resolveAlloc(a, &.{ cwd, expanded });
+        defer a.free(path);
+        const dir = std.Io.Dir.cwd();
+        const handle = try std.posix.openat(dir.handle, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = true } };
+        defer file.close(io);
+        const stat = try file.stat(io);
+        if (stat.kind != .file) return error.ImageNotRegularFile;
+        if (stat.size == 0 or stat.size > model.Image.max_message_bytes) return error.InvalidImageSize;
+        if (stat.size > remaining) return error.ImageAttachmentsTooLarge;
+        const bytes = try a.alloc(u8, @intCast(stat.size));
+        errdefer a.free(bytes);
+        if (try file.readPositionalAll(io, bytes, 0) != bytes.len or try file.length(io) != stat.size) return error.ImageFileChanged;
+        const mime_type = model.Image.detectMime(bytes) orelse return error.UnsupportedImageType;
+        try images.append(a, .{ .bytes = bytes, .mime_type = mime_type });
+        remaining -= bytes.len;
+    }
+    return images.toOwnedSlice(a);
+}
+
+/// Caller owns the returned text. Paths use the launch directory, independently of --cwd.
 pub fn build(a: std.mem.Allocator, io: std.Io, cwd: []const u8, home: ?[]const u8, stdin_text: []const u8, files: []const []const u8, words: []const []const u8) ![]u8 {
     if (files.len > 64) return error.TooManyInputFiles;
     var out: std.ArrayList(u8) = .empty;
@@ -35,7 +67,7 @@ pub fn build(a: std.mem.Allocator, io: std.Io, cwd: []const u8, home: ?[]const u
         defer a.free(bytes);
         if (bytes.len > max_file_bytes) return error.InputFileTooLarge;
         if (bytes.len == 0) continue;
-        if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null or isImage(bytes)) return error.UnsupportedInputFile;
+        if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null or model.Image.detectMime(bytes) != null) return error.UnsupportedInputFile;
         const text = if (std.mem.startsWith(u8, bytes, "\xef\xbb\xbf")) bytes[3..] else bytes;
         for ([_][]const u8{ "<file name=\"", path, "\">\n", text, "\n</file>\n" }) |part| try append(a, &out, part);
     }
@@ -64,13 +96,6 @@ fn normalizeSpaces(a: std.mem.Allocator, text: []const u8) ![]u8 {
 fn append(a: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
     if (text.len > max_prompt_bytes - out.items.len) return error.InitialPromptTooLarge;
     try out.appendSlice(a, text);
-}
-
-fn isImage(bytes: []const u8) bool {
-    return std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n") or
-        std.mem.startsWith(u8, bytes, "\xff\xd8\xff") or
-        std.mem.startsWith(u8, bytes, "GIF87a") or std.mem.startsWith(u8, bytes, "GIF89a") or
-        (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP"));
 }
 
 test "initial prompt preserves attachment order BOM and exact text wrappers" {
@@ -115,5 +140,10 @@ test "initial prompt rejects binary input and bounds combined payload before dis
     const at_limit = try build(a, std.testing.io, dir, null, "", &.{"large"}, &.{});
     defer a.free(at_limit);
     try std.testing.expect(at_limit.len > max_file_bytes);
+    try std.testing.expectEqualStrings("image/png", model.Image.detectMime("\x89PNG\r\n\x1a\nbytes").?);
+    try std.testing.expectEqualStrings("image/jpeg", model.Image.detectMime("\xff\xd8\xffbytes").?);
+    try std.testing.expectEqualStrings("image/gif", model.Image.detectMime("GIF89a").?);
+    try std.testing.expectEqualStrings("image/webp", model.Image.detectMime("RIFF1234WEBP").?);
+    try std.testing.expect(model.Image.detectMime("not an image") == null);
     try std.testing.expectError(error.InitialPromptTooLarge, build(a, std.testing.io, dir, null, "", &.{ "large", "large", "large", "large" }, &.{}));
 }

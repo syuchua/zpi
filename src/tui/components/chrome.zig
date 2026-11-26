@@ -12,35 +12,61 @@ pub const Phase = enum {
 };
 
 pub const Loader = struct {
-    frame: usize = 0,
+    pub const frame_ms = 80;
     phase: Phase = .streaming,
     detail: [64]u8 = undefined,
     detail_len: usize = 0,
     elapsed_ms: u64 = 0,
+    phase_started_ms: u64 = 0,
 
     const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
     const ascii_frames = [_][]const u8{ "|", "/", "-", "\\" };
 
-    pub fn setPhase(self: *Loader, phase: Phase, detail: []const u8) void {
-        self.phase = phase;
+    pub fn setPhase(self: *Loader, phase: Phase, detail: []const u8, elapsed_ms: u64) bool {
         const n = @min(detail.len, self.detail.len);
+        if (phase == self.phase and std.mem.eql(u8, self.detail[0..self.detail_len], detail[0..n])) return false;
+        if (phase != self.phase) self.phase_started_ms = elapsed_ms;
+        self.phase = phase;
         @memcpy(self.detail[0..n], detail[0..n]);
         self.detail_len = n;
+        return true;
     }
 
-    pub fn tick(self: *Loader, delta_ms: u64) void {
-        self.frame +%= 1;
-        self.elapsed_ms +|= delta_ms;
+    pub fn appendProgressRule(self: Loader, out: *std.ArrayList(u8), allocator: std.mem.Allocator, th: theme.Theme, width: usize) !void {
+        if (width == 0) return;
+        const span = @min(width, @max(1, width / 8));
+        const travel = width - span;
+        const step = ((self.elapsed_ms -| self.phase_started_ms) / frame_ms * 3) % @max(1, 2 * travel);
+        const start: usize = @intCast(@min(step, 2 * travel - step));
+        const role = switch (self.phase) {
+            .thinking => theme.Theme.user_badge,
+            .streaming => theme.Theme.accent,
+            .tool => theme.Theme.tool_ok,
+            .retrying, .compacting => theme.Theme.warn,
+        };
+        const base = if (th.mode == .none) "-" else "─";
+        const active = if (th.mode == .none) "=" else "━";
+        try appendRule(out, allocator, th, theme.Theme.border, base, start);
+        try appendRule(out, allocator, th, role, active, span);
+        try appendRule(out, allocator, th, theme.Theme.border, base, width - start - span);
+    }
+
+    fn appendRule(out: *std.ArrayList(u8), allocator: std.mem.Allocator, th: theme.Theme, role: theme.ColorSpec, glyph: []const u8, count: usize) !void {
+        if (count == 0) return;
+        try th.appendOpen(out, allocator, role);
+        for (0..count) |_| try out.appendSlice(allocator, glyph);
+        try th.appendClose(out, allocator);
     }
 
     pub fn renderLineAlloc(self: *const Loader, allocator: std.mem.Allocator, th: theme.Theme, max_cols: usize) ![]u8 {
         var raw: std.ArrayList(u8) = .empty;
         defer raw.deinit(allocator);
 
+        const frame = self.elapsed_ms / frame_ms;
         const icon = if (th.mode == .none)
-            ascii_frames[self.frame % ascii_frames.len]
+            ascii_frames[frame % ascii_frames.len]
         else
-            spinner_frames[self.frame % spinner_frames.len];
+            spinner_frames[frame % spinner_frames.len];
 
         try th.paint(&raw, allocator, theme.Theme.accent, icon);
         try raw.append(allocator, ' ');
@@ -177,17 +203,35 @@ pub const Footer = struct {
     pub fn renderLinesAlloc(allocator: std.mem.Allocator, th: theme.Theme, info: FooterInfo, max_cols: usize) ![2][]u8 {
         const line1 = try renderTopLineAlloc(allocator, th, info, max_cols);
         errdefer allocator.free(line1);
-        const line2 = try renderBottomLineAlloc(allocator, th, info, max_cols);
-        return .{ line1, line2 };
+        return .{ line1, try renderBottomLineAlloc(allocator, th, info, max_cols) };
+    }
+
+    pub fn renderFramedLinesAlloc(allocator: std.mem.Allocator, th: theme.Theme, info: FooterInfo, max_cols: usize, loader: ?Loader) ![4][]u8 {
+        var top: std.ArrayList(u8) = .empty;
+        defer top.deinit(allocator);
+        const glyph = if (th.mode == .none) "-" else "─";
+        if (loader) |activity| {
+            try activity.appendProgressRule(&top, allocator, th, max_cols);
+        } else {
+            try Loader.appendRule(&top, allocator, th, theme.Theme.border, glyph, max_cols);
+        }
+        const top_rule = try top.toOwnedSlice(allocator);
+        errdefer allocator.free(top_rule);
+        const lines = try renderLinesAlloc(allocator, th, info, max_cols);
+        errdefer {
+            allocator.free(lines[0]);
+            allocator.free(lines[1]);
+        }
+        var bottom: std.ArrayList(u8) = .empty;
+        defer bottom.deinit(allocator);
+        try Loader.appendRule(&bottom, allocator, th, theme.Theme.border, glyph, max_cols);
+        return .{ top_rule, lines[0], lines[1], try bottom.toOwnedSlice(allocator) };
     }
 
     pub fn renderLineAlloc(allocator: std.mem.Allocator, th: theme.Theme, info: FooterInfo, max_cols: usize) ![]u8 {
         const lines = try renderLinesAlloc(allocator, th, info, max_cols);
-        defer {
-            allocator.free(lines[0]);
-            allocator.free(lines[1]);
-        }
-        return try std.fmt.allocPrint(allocator, "{s}\r\n{s}", .{ lines[0], lines[1] });
+        defer for (lines) |line| allocator.free(line);
+        return try allocator.print("{s}\r\n{s}", .{ lines[0], lines[1] });
     }
 
     fn renderTopLineAlloc(allocator: std.mem.Allocator, th: theme.Theme, info: FooterInfo, max_cols: usize) ![]u8 {
@@ -341,8 +385,8 @@ test "Loader and Footer clip to width and format model, thinking, git branch, us
     const th = theme.Theme.init(.ansi16);
 
     var loader = Loader{};
-    loader.setPhase(.tool, "bash");
-    loader.tick(400);
+    _ = loader.setPhase(.tool, "bash", 0);
+    loader.elapsed_ms = 400;
     const l_line = try loader.renderLineAlloc(a, th, 40);
     defer a.free(l_line);
     try std.testing.expect(std.mem.indexOf(u8, l_line, "Running bash...") != null);
@@ -363,10 +407,7 @@ test "Loader and Footer clip to width and format model, thinking, git branch, us
         .bg_running_count = 1,
         .expanded = true,
     }, 80);
-    defer {
-        a.free(lines[0]);
-        a.free(lines[1]);
-    }
+    defer for (lines) |line| a.free(line);
     try std.testing.expect(std.mem.indexOf(u8, lines[0], "workspace/zpi (feat/tui)") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines[0], "2 queued") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines[0], "1 bg") != null);
@@ -383,10 +424,7 @@ test "Loader and Footer clip to width and format model, thinking, git branch, us
         .cwd = "/Users/dev/workspace/zpi",
         .git_branch = "main",
     }, 18);
-    defer {
-        a.free(f_narrow[0]);
-        a.free(f_narrow[1]);
-    }
+    defer for (f_narrow) |line| a.free(line);
     try std.testing.expect(terminal.visibleWidth(f_narrow[0]) <= 18);
     try std.testing.expect(terminal.visibleWidth(f_narrow[1]) <= 18);
 
@@ -396,10 +434,7 @@ test "Loader and Footer clip to width and format model, thinking, git branch, us
         .context_tokens = 75000,
         .context_window = 100000,
     }, 80);
-    defer {
-        a.free(f_warn[0]);
-        a.free(f_warn[1]);
-    }
+    defer for (f_warn) |line| a.free(line);
     try std.testing.expect(std.mem.indexOf(u8, f_warn[1], "\x1b[38;2;229;192;123m75k/100k (75%)\x1b[0m") != null);
 
     const f_crit = try Footer.renderLinesAlloc(a, theme.Theme.init(.truecolor), .{
@@ -408,10 +443,7 @@ test "Loader and Footer clip to width and format model, thinking, git branch, us
         .context_tokens = 95000,
         .context_window = 100000,
     }, 80);
-    defer {
-        a.free(f_crit[0]);
-        a.free(f_crit[1]);
-    }
+    defer for (f_crit) |line| a.free(line);
     try std.testing.expect(std.mem.indexOf(u8, f_crit[1], "\x1b[38;2;224;108;117m95k/100k (95%)\x1b[0m") != null);
 
     // Hermetic Git branch detection works inside parent directories without depending on repo .git.

@@ -94,6 +94,21 @@ test "Anthropic rejects unsupported thinking and closed block deltas" {
     try tool(&other, 0, "call", "{}");
     try std.testing.expectError(error.UnknownBlock, feed(&other, "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}"));
 }
+test "Anthropic encodes user image blocks and validates detected MIME type" {
+    const allocator = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nfixture";
+    const messages = [_]model.Message{.{ .role = .user, .content = &.{ .{ .text = "describe" }, .{ .image = .{ .bytes = png, .mime_type = "image/png" } } } }};
+    const body = try anthropic.encodeRequest(allocator, .{ .endpoint = "unused", .api_key = "", .model_id = "fixture" }, &messages, &.{});
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("image", content[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("image/png", content[1].object.get("source").?.object.get("media_type").?.string);
+    const invalid = [_]model.Message{.{ .role = .user, .content = &.{.{ .image = .{ .bytes = "bad", .mime_type = "image/png" } }} }};
+    try std.testing.expectError(error.UnsupportedImageType, anthropic.encodeRequest(allocator, .{ .endpoint = "unused", .api_key = "", .model_id = "fixture" }, &invalid, &.{}));
+}
 test "Anthropic request lifts leading system and groups consecutive tool results" {
     const messages = [_]model.Message{
         .{ .role = .system, .content = &.{.{ .text = "instructions" }} },

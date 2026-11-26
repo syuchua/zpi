@@ -29,6 +29,7 @@ pub const Client = struct {
     environ: ?*const std.process.Environ.Map = null,
     proxy_policy: ProxyPolicy = .system,
     cancel: ?model.Cancel = null,
+    timing: ?model.Timing = null,
     status: ?std.http.Status = null,
     retry_after_ms: ?u64 = null,
 
@@ -107,10 +108,13 @@ pub const Client = struct {
             extra_headers[extra_count] = header;
             extra_count += 1;
         }
+        const encoding_started = model.Timing.start(self.timing, self.io);
         const payload = try encodeRequest(allocator, self.config, messages, tools);
+        model.Timing.finish(self.timing, self.io, encoding_started, "request_encode");
         defer allocator.free(payload);
         var decoder = Decoder.init(allocator, sink);
         defer decoder.deinit();
+        const transport_started = model.Timing.start(self.timing, self.io);
         try http_transport.postSse(allocator, self.io, .{
             .uri = uri,
             .authorization = if (auth_override) |value| value else if (self.config.api_key.len == 0) null else authorization,
@@ -119,13 +123,16 @@ pub const Client = struct {
             .environ = self.environ,
             .proxy_policy = self.proxy_policy,
             .cancel_socket = cancel_socket,
+            .timing = self.timing,
         }, decoder.sseSink(), &decoder.done, &self.status, &self.retry_after_ms);
+        model.Timing.finish(self.timing, self.io, transport_started, "http_sse_transport");
     }
 };
 
 pub fn encodeRequest(allocator: std.mem.Allocator, config: Config, messages: []const model.Message, tools: []const model.ToolDefinition) ![]u8 {
     const projected = try model.projectSystemPrompt(allocator, messages);
     defer allocator.free(projected);
+    try model.validateRequestImages(projected);
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
     var json: std.json.Stringify = .{ .writer = &out.writer };
@@ -182,22 +189,27 @@ pub fn encodeRequest(allocator: std.mem.Allocator, config: Config, messages: []c
             .user => {
                 var text = std.ArrayList(u8).empty;
                 defer text.deinit(allocator);
+                var has_image = false;
                 for (message.content) |part| switch (part) {
                     .text => |value| try text.appendSlice(allocator, value),
                     .tool_call => return error.InvalidToolCallRole,
-                    .image, .thinking => return error.UnsupportedContent,
+                    .image => has_image = true,
+                    .thinking => return error.UnsupportedContent,
                 };
                 try json.beginObject();
                 try json.objectField("role");
                 try json.write("user");
                 try json.objectField("content");
                 try json.beginArray();
-                try json.beginObject();
-                try json.objectField("type");
-                try json.write("input_text");
-                try json.objectField("text");
-                try json.write(text.items);
-                try json.endObject();
+                if (text.items.len > 0 or !has_image) {
+                    try json.beginObject();
+                    try json.objectField("type");
+                    try json.write("input_text");
+                    try json.objectField("text");
+                    try json.write(text.items);
+                    try json.endObject();
+                }
+                for (message.content) |part| if (part == .image) try writeImagePart(&json, part.image);
                 try json.endArray();
                 try json.endObject();
                 msg_index += 1;
@@ -315,6 +327,18 @@ pub fn encodeRequest(allocator: std.mem.Allocator, config: Config, messages: []c
     }
     try json.endObject();
     return out.toOwnedSlice();
+}
+
+fn writeImagePart(json: *std.json.Stringify, image: anytype) !void {
+    try image.validate();
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("input_image");
+    try json.objectField("detail");
+    try json.write("auto");
+    try json.objectField("image_url");
+    try image.writeBase64(json, true);
+    try json.endObject();
 }
 
 const max_slots = 64;

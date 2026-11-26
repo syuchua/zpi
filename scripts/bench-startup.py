@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare fresh-process --version startup for Zpi and a pi CLI executable."""
+"""Compare fresh-process --version startup for Zpi, pi, and optionally rpi."""
 import argparse
 import hashlib
 import json
@@ -51,6 +51,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--zpi', type=Path, required=True)
     parser.add_argument('--pi', default='pi', help='pi executable path or PATH name (default: pi)')
+    parser.add_argument('--rpi', help='optional rpi executable path or PATH name')
     parser.add_argument('--samples', type=int, default=20)
     args = parser.parse_args()
     if not 1 <= args.samples <= 100:
@@ -58,6 +59,7 @@ def main():
 
     zpi = args.zpi.resolve(strict=True)
     pi = Path(shutil.which(args.pi) or args.pi).resolve(strict=True)
+    rpi = Path(shutil.which(args.rpi) or args.rpi).resolve(strict=True) if args.rpi else None
     signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
     node = shutil.which('node')
     path = os.defpath if node is None else os.pathsep.join((os.defpath, str(Path(node).parent)))
@@ -67,6 +69,8 @@ def main():
             'zpi': [str(zpi), '--version'],
             'pi': [str(pi), '--version'],
         }
+        if rpi is not None:
+            version_commands['rpi'] = [str(rpi), '--version']
         versions = {
             name: subprocess.check_output(command, cwd=home, env=environment,
                                           stdin=subprocess.DEVNULL, timeout=30).decode().strip()
@@ -79,8 +83,10 @@ def main():
             'python': platform.python_version(),
             'zpi_version': versions['zpi'],
             'pi_version': versions['pi'],
+            **({'rpi_version': versions['rpi']} if rpi is not None else {}),
             'zpi_sha256': hashlib.sha256(zpi.read_bytes()).hexdigest(),
             'pi_executable_sha256': hashlib.sha256(pi.read_bytes()).hexdigest(),
+            **({'rpi_executable_sha256': hashlib.sha256(rpi.read_bytes()).hexdigest()} if rpi is not None else {}),
             'measurement': 'fresh process --version; elapsed wall time includes Python wait4 harness and process launch',
             'results': {
                 name: run_samples(command, args.samples, home, environment)

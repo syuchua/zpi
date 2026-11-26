@@ -48,6 +48,12 @@ const Record = struct {
     from_id: ?[]const u8 = null,
 };
 
+fn messageVersion(message: model.Message) !u32 {
+    try model.validateSystemCheckpoint(message);
+    if (try model.validateMessageImages(message) > 0) return 3;
+    return if (message.system_prompt_replace) 2 else 1;
+}
+
 /// Publish a linear transcript under a new path after all records are written.
 pub fn writeTranscript(allocator: std.mem.Allocator, io: std.Io, path: []const u8, cwd: []const u8, messages: []const model.Message) !void {
     var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{ .permissions = .fromMode(0o600) });
@@ -55,12 +61,12 @@ pub fn writeTranscript(allocator: std.mem.Allocator, io: std.Io, path: []const u
     var offset: u64 = 0;
     try writeRecordAt(allocator, io, atomic.file, &offset, .{ .type = .session, .cwd = cwd });
     for (messages, 0..) |message, i| {
-        try model.validateSystemCheckpoint(message);
+        const version = try messageVersion(message);
         var id: [16]u8 = undefined;
         var parent_id: [16]u8 = undefined;
         try writeRecordAt(allocator, io, atomic.file, &offset, .{
             .type = .message,
-            .version = if (message.system_prompt_replace) 2 else 1,
+            .version = version,
             .id = try std.fmt.bufPrint(&id, "{x:0>16}", .{i + 1}),
             .parent_id = if (i == 0) null else try std.fmt.bufPrint(&parent_id, "{x:0>16}", .{i}),
             .message = message,
@@ -138,7 +144,7 @@ pub const Store = struct {
             } else if (entry.compaction) |comp| {
                 try self.writeRecord(.{ .type = .compaction, .version = 1, .id = entry.id, .parent_id = entry.parent_id, .summary = comp.summary, .first_kept_id = comp.first_kept_id, .tokens_before = comp.tokens_before });
             } else {
-                try self.writeRecord(.{ .type = .message, .version = if (entry.message.system_prompt_replace) 2 else 1, .id = entry.id, .parent_id = entry.parent_id, .message = entry.message });
+                try self.writeRecord(.{ .type = .message, .version = try messageVersion(entry.message), .id = entry.id, .parent_id = entry.parent_id, .message = entry.message });
             }
         }
         self.pending_create = false;
@@ -183,12 +189,12 @@ pub const Store = struct {
         if (self.next_id == std.math.maxInt(u64)) return error.SessionIdExhausted;
         const a = self.arena.allocator();
         const id = try std.fmt.allocPrint(a, "{x:0>16}", .{self.next_id});
-        try model.validateSystemCheckpoint(message);
+        const version = try messageVersion(message);
         const owned = try agent.cloneMessage(a, message);
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.id_index.ensureUnusedCapacity(self.allocator, 1);
         if (owned.role != .system) try self.ensureMaterialized();
-        try self.writeRecord(.{ .type = .message, .version = if (owned.system_prompt_replace) 2 else 1, .id = id, .parent_id = self.active_leaf, .message = owned });
+        try self.writeRecord(.{ .type = .message, .version = version, .id = id, .parent_id = self.active_leaf, .message = owned });
         self.entries.appendAssumeCapacity(.{ .id = id, .parent_id = self.active_leaf, .message = owned });
         self.id_index.putAssumeCapacityNoClobber(id, self.entries.items.len - 1);
         self.next_id += 1;
@@ -378,25 +384,27 @@ pub const Store = struct {
         var offset: usize = 0;
         var line_no: usize = 0;
         var header_seen = false;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
         while (offset < bytes.len) {
+            _ = scratch.reset(.retain_capacity);
             const lf = std.mem.indexOfScalarPos(u8, bytes, offset, '\n') orelse break;
             line_no += 1;
             self.corrupt_line = line_no;
             const line = std.mem.trimEnd(u8, bytes[offset..lf], "\r");
             if (line.len > max_record_bytes) return error.SessionRecordTooLarge;
-            const parsed = std.json.parseFromSlice(Record, self.allocator, line, .{
+            const record = std.json.parseFromSliceLeaky(Record, scratch.allocator(), line, .{
                 .max_value_len = max_record_bytes,
                 .parse_numbers = false,
             }) catch return error.CorruptSessionEntry;
-            defer parsed.deinit();
-            const record = parsed.value;
             if (!std.mem.eql(u8, record.format, "zpi")) return error.UnsupportedSessionVersion;
             switch (record.type) {
                 .session, .leaf, .compaction, .branch_summary => if (record.version != 1) return error.UnsupportedSessionVersion,
                 .message => {
-                    if (record.version != 1 and record.version != 2) return error.UnsupportedSessionVersion;
-                    if (record.message != null and record.message.?.system_prompt_replace != (record.version == 2)) return error.UnsupportedSystemPromptCheckpointVersion;
-                    if (record.message) |message| try model.validateSystemCheckpoint(message);
+                    if (record.version < 1 or record.version > 3) return error.UnsupportedSessionVersion;
+                    const message = record.message orelse return error.InvalidSessionEntry;
+                    if (message.system_prompt_replace != (record.version == 2)) return error.UnsupportedSystemPromptCheckpointVersion;
+                    if (try messageVersion(message) != record.version) return error.UnsupportedImageSessionVersion;
                 },
             }
             switch (record.type) {

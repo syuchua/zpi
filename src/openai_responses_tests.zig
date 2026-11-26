@@ -122,9 +122,23 @@ test "responses request encodes system prompt, assistant items, function calls, 
     try std.testing.expect(!req_tools[0].object.get("strict").?.bool);
 }
 
-test "responses request rejects unsupported image/thinking content and missing tool_call_id" {
+test "Responses request encodes a user image as input_image data URL" {
     const a = std.testing.allocator;
-    try std.testing.expectError(error.UnsupportedContent, openai_responses.encodeRequest(a, .{ .endpoint = "http://127.0.0.1/", .model_id = "m", .api_key = "" }, &.{
+    const png = "\x89PNG\r\n\x1a\nfixture";
+    const messages = [_]model.Message{.{ .role = .user, .content = &.{ .{ .text = "describe" }, .{ .image = .{ .bytes = png, .mime_type = "image/png" } } } }};
+    const body = try openai_responses.encodeRequest(a, .{ .endpoint = "unused", .model_id = "fixture", .api_key = "" }, &messages, &.{});
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("input").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("input_text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("input_image", content[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings("auto", content[1].object.get("detail").?.string);
+}
+
+test "responses request rejects unsupported thinking content and missing tool_call_id" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidImageSize, openai_responses.encodeRequest(a, .{ .endpoint = "http://127.0.0.1/", .model_id = "m", .api_key = "" }, &.{
         .{ .role = .user, .content = &.{.{ .image = .{ .bytes = "", .mime_type = "image/png" } }} },
     }, &.{}));
     try std.testing.expectError(error.UnsupportedContent, openai_responses.encodeRequest(a, .{ .endpoint = "http://127.0.0.1/", .model_id = "m", .api_key = "" }, &.{

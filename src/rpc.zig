@@ -8,7 +8,8 @@ const max_frame_bytes = 1024 * 1024;
 const max_depth = 32;
 const max_tokens = 4096;
 
-pub fn run(h: *harness.Harness, interrupt: *zpi.model.Interrupt) !void {
+pub fn run(h: *harness.Harness, interrupt: *zpi.model.Interrupt, timings_enabled: bool) !void {
+    h.setTimings(timings_enabled);
     var server: Server = .{
         .h = h,
         .interrupt = interrupt,
@@ -219,13 +220,21 @@ const Server = struct {
         self.mutex.lockUncancelable(self.h.io);
         defer self.mutex.unlock(self.h.io);
         switch (event) {
+            .performance => |measurement| try self.writeLocked(.{ .type = "zpi_performance", .phase = measurement.phase, .elapsed_ns = measurement.elapsed_ns }),
             .extension_event => |ext| try self.writeLocked(.{ .type = "extension_event", .event = ext }),
             .agent => |ev| switch (ev) {
                 .message_appended => |msg| try self.writeLocked(.{ .type = "message_end", .message = msg }),
                 .provider => |provider| try self.writeLocked(.{ .type = "provider_event", .event = provider }),
                 .tool_start => |call| try self.writeLocked(.{ .type = "tool_execution_start", .id = call.id, .name = call.name }),
                 .tool_update => |update| try self.writeLocked(.{ .type = "tool_execution_update", .id = update.call.id, .name = update.call.name, .result = update.result }),
-                .tool_end => |ended| try self.writeLocked(.{ .type = "tool_execution_end", .id = ended.call.id, .result = ended.result }),
+                .tool_end => |ended| {
+                    const started = zpi.model.Timing.start(self.h.runtime.timing, self.h.io);
+                    try self.writeLocked(.{ .type = "tool_execution_end", .id = ended.call.id, .result = ended.result });
+                    if (started) |from| {
+                        const to = std.Io.Clock.Timestamp.now(self.h.io, .awake);
+                        try self.writeLocked(.{ .type = "zpi_performance", .phase = "rpc_tool_result_write", .elapsed_ns = from.durationTo(to).raw.nanoseconds });
+                    }
+                },
                 .retry_scheduled => |r| try self.writeLocked(.{ .type = "auto_retry_start", .attempt = r.attempt, .max_attempts = r.max_attempts, .delay_ms = r.delay_ms, .error_code = r.error_code }),
                 .retry_finished => |r| try self.writeLocked(.{ .type = "auto_retry_end", .success = r.success, .attempt = r.attempt, .error_code = r.error_code }),
                 .compacted => |c| try self.writeLocked(.{ .type = "compaction", .tokens_before = c.tokens_before, .first_kept_id = c.first_kept_id, .automatic = c.automatic }),

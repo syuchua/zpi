@@ -87,6 +87,21 @@ test "incomplete or malformed tool calls never become executable" {
     try std.testing.expectEqual(@as(usize, 0), capture.finishes);
 }
 
+test "request serializes image input as OpenAI data URL and rejects invalid bytes" {
+    const a = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nfixture";
+    const messages = [_]model.Message{.{ .role = .user, .content = &.{ .{ .text = "describe" }, .{ .image = .{ .bytes = png, .mime_type = "image/png" } } } }};
+    const body = try openai.encodeRequest(a, .{ .endpoint = "unused", .model_id = "fixture", .api_key = "" }, &messages, &.{});
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const content = parsed.value.object.get("messages").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqualStrings("describe", content[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgpmaXh0dXJl", content[1].object.get("image_url").?.object.get("url").?.string);
+    const invalid = [_]model.Message{.{ .role = .user, .content = &.{.{ .image = .{ .bytes = "bad", .mime_type = "image/png" } }} }};
+    try std.testing.expectError(error.UnsupportedImageType, openai.encodeRequest(a, .{ .endpoint = "unused", .model_id = "fixture", .api_key = "" }, &invalid, &.{}));
+}
+
 test "request serializes text, schemas and tool result IDs" {
     var schema = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"object\"}", .{});
     defer schema.deinit();

@@ -40,6 +40,7 @@ pub const Client = struct {
     environ: ?*const std.process.Environ.Map = null,
     proxy_policy: ProxyPolicy = .system,
     cancel: ?model.Cancel = null,
+    timing: ?model.Timing = null,
     status: ?std.http.Status = null,
     retry_after_ms: ?u64 = null,
 
@@ -118,11 +119,14 @@ pub const Client = struct {
             extra_headers[extra_count] = header;
             extra_count += 1;
         }
+        const encoding_started = model.Timing.start(self.timing, self.io);
         const payload = try encodeRequest(allocator, self.config, messages, tools);
+        model.Timing.finish(self.timing, self.io, encoding_started, "request_encode");
         defer allocator.free(payload);
         var decoder = Decoder.init(allocator, sink);
         decoder.supports_finish_reason = self.config.compat.supports_finish_reason;
         defer decoder.deinit();
+        const transport_started = model.Timing.start(self.timing, self.io);
         try http_transport.postSse(allocator, self.io, .{
             .uri = uri,
             .authorization = if (auth_override) |value| value else if (self.config.api_key.len == 0) null else authorization,
@@ -131,13 +135,16 @@ pub const Client = struct {
             .environ = self.environ,
             .proxy_policy = self.proxy_policy,
             .cancel_socket = cancel_socket,
+            .timing = self.timing,
         }, decoder.sseSink(), &decoder.done, &self.status, &self.retry_after_ms);
+        model.Timing.finish(self.timing, self.io, transport_started, "http_sse_transport");
     }
 };
 
 pub fn encodeRequest(allocator: std.mem.Allocator, config: Config, messages: []const model.Message, tools: []const model.ToolDefinition) ![]u8 {
     const projected = try model.projectSystemPrompt(allocator, messages);
     defer allocator.free(projected);
+    try model.validateRequestImages(projected);
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
     var json: std.json.Stringify = .{ .writer = &out.writer };
@@ -194,17 +201,31 @@ pub fn encodeRequest(allocator: std.mem.Allocator, config: Config, messages: []c
         defer text.deinit(allocator);
         var calls = std.ArrayList(model.ToolCall).empty;
         defer calls.deinit(allocator);
+        var has_image = false;
         for (message.content) |content| switch (content) {
             .text => |part| try text.appendSlice(allocator, part),
             .tool_call => |call| {
                 if (message.role != .assistant) return error.InvalidToolCallRole;
                 try calls.append(allocator, call);
             },
-            // Later adapters may handle these blocks. Never silently drop them.
-            .image, .thinking => return error.UnsupportedContent,
+            .image => has_image = true,
+            .thinking => return error.UnsupportedContent,
         };
+        if (has_image and message.role != .user) return error.InvalidImageRole;
         try json.objectField("content");
-        if (calls.items.len > 0 and text.items.len == 0 and !config.compat.requires_non_null_assistant_content and !config.compat.requires_assistant_after_tool_result) try json.write(null) else try json.write(text.items);
+        if (has_image) {
+            try json.beginArray();
+            if (text.items.len > 0) {
+                try json.beginObject();
+                try json.objectField("type");
+                try json.write("text");
+                try json.objectField("text");
+                try json.write(text.items);
+                try json.endObject();
+            }
+            for (message.content) |content| if (content == .image) try writeImagePart(&json, content.image);
+            try json.endArray();
+        } else if (calls.items.len > 0 and text.items.len == 0 and !config.compat.requires_non_null_assistant_content and !config.compat.requires_assistant_after_tool_result) try json.write(null) else try json.write(text.items);
         if (calls.items.len > 0) {
             try json.objectField("tool_calls");
             try json.beginArray();
@@ -254,6 +275,19 @@ pub fn encodeRequest(allocator: std.mem.Allocator, config: Config, messages: []c
     }
     try json.endObject();
     return out.toOwnedSlice();
+}
+
+fn writeImagePart(json: *std.json.Stringify, image: anytype) !void {
+    try image.validate();
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("image_url");
+    try json.objectField("image_url");
+    try json.beginObject();
+    try json.objectField("url");
+    try image.writeBase64(json, true);
+    try json.endObject();
+    try json.endObject();
 }
 
 fn writeAssistantBridge(json: *std.json.Stringify) !void {

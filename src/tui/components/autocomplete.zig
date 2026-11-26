@@ -28,6 +28,7 @@ pub const builtin_commands = [_]BuiltinCommandDesc{
     .{ .name = "/search", .description = "Search transcript (Ctrl-F / Esc)" },
     .{ .name = "/session", .description = "Show session info" },
     .{ .name = "/resume", .description = "Switch session" },
+    .{ .name = "/new", .description = "Start a fresh session" },
     .{ .name = "/tree", .description = "Browse session branches" },
     .{ .name = "/model", .description = "Switch model" },
     .{ .name = "/thinking", .description = "Set thinking level" },

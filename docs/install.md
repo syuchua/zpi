@@ -2,6 +2,8 @@
 
 Use an existing source tree to build Zpi with Zig **0.17.0**, or install an archive built for your OS, CPU architecture and C library. The build script can produce local development archives.
 
+For release tags, CI first completes the four-platform native test matrix, then creates or verifies the tagged GitHub Release. Each of the six archive matrix jobs independently builds, smoke-tests, checksum-verifies and uploads its archive and `.sha256` file. A failed platform can be rerun from its job without rebuilding or removing the other platforms' assets. `workflow_dispatch` with `refresh_release` reruns all six archive jobs against an existing version tag; uploads use `--clobber` only for identically named assets, and the annotated tag is not moved.
+
 Install `rg` and `fd` (or `fdfind`) separately if you use the corresponding search tools. To run existing pi TypeScript extensions, provide Node and your own pi SDK (**1.5.2** or **1.6.0**) installation. The default installation includes the Zpi extension host scripts and native ABI headers. [TypeScript extension setup](spec/typescript-extension-host.md)
 
 ## Install a release archive

@@ -14,8 +14,64 @@ pub const ToolCall = struct {
 pub const Content = union(enum) {
     text: []const u8,
     thinking: struct { text: []const u8, signature: ?[]const u8 = null },
-    image: struct { bytes: []const u8, mime_type: []const u8 },
+    image: Image,
     tool_call: ToolCall,
+};
+
+pub const Image = struct {
+    bytes: []const u8,
+    mime_type: []const u8,
+
+    pub const max_message_bytes = 2 * 1024 * 1024;
+    pub const max_message_images = 8;
+    pub const max_request_bytes = 16 * 1024 * 1024;
+    const encoder = std.base64.standard.Encoder;
+    const decoder = std.base64.standard.Decoder;
+    const Wire = struct { mime_type: []const u8, data: []const u8 };
+
+    pub fn detectMime(bytes: []const u8) ?[]const u8 {
+        if (std.mem.startsWith(u8, bytes, "\x89PNG\r\n\x1a\n")) return "image/png";
+        if (std.mem.startsWith(u8, bytes, "\xff\xd8\xff")) return "image/jpeg";
+        if (std.mem.startsWith(u8, bytes, "GIF87a") or std.mem.startsWith(u8, bytes, "GIF89a")) return "image/gif";
+        if (bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP")) return "image/webp";
+        return null;
+    }
+
+    pub fn validate(self: Image) !void {
+        if (self.bytes.len == 0 or self.bytes.len > max_message_bytes) return error.InvalidImageSize;
+        const detected = detectMime(self.bytes) orelse return error.UnsupportedImageType;
+        if (!std.mem.eql(u8, detected, self.mime_type)) return error.ImageMimeMismatch;
+    }
+
+    pub fn jsonStringify(self: Image, json: *std.json.Stringify) !void {
+        try json.beginObject();
+        try json.objectField("mime_type");
+        try json.write(self.mime_type);
+        try json.objectField("data");
+        try self.writeBase64(json, false);
+        try json.endObject();
+    }
+
+    /// The data URL prefix uses a MIME type verified by validateMessageImages.
+    pub fn writeBase64(self: Image, json: *std.json.Stringify, data_url: bool) !void {
+        try json.beginWriteRaw();
+        try json.writer.writeByte('"');
+        if (data_url) try json.writer.print("data:{s};base64,", .{self.mime_type});
+        try encoder.encodeWriter(json.writer, self.bytes);
+        try json.writer.writeByte('"');
+        json.endWriteRaw();
+    }
+
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Image {
+        const wire = try std.json.innerParse(Wire, a, source, options);
+        const size = decoder.calcSizeForSlice(wire.data) catch return error.UnexpectedToken;
+        if (size == 0 or size > max_message_bytes) return error.UnexpectedToken;
+        const bytes = try a.alloc(u8, size);
+        decoder.decode(bytes, wire.data) catch return error.UnexpectedToken;
+        const image: Image = .{ .bytes = bytes, .mime_type = wire.mime_type };
+        image.validate() catch return error.UnexpectedToken;
+        return image;
+    }
 };
 pub const Usage = struct {
     input_tokens: u64 = 0,
@@ -33,6 +89,28 @@ pub const Message = struct {
     /// single leading system message; raw session history keeps every update.
     system_prompt_replace: bool = false,
 };
+
+pub fn validateMessageImages(message: Message) !usize {
+    var size: usize = 0;
+    var count: usize = 0;
+    for (message.content) |part| if (part == .image) {
+        if (message.role != .user) return error.InvalidImageRole;
+        try part.image.validate();
+        count += 1;
+        size += part.image.bytes.len;
+        if (count > Image.max_message_images) return error.TooManyImages;
+        if (size > Image.max_message_bytes) return error.ImageAttachmentsTooLarge;
+    };
+    return size;
+}
+
+pub fn validateRequestImages(messages: []const Message) !void {
+    var bytes: usize = 0;
+    for (messages) |message| {
+        bytes += try validateMessageImages(message);
+        if (bytes > Image.max_request_bytes) return error.ImageHistoryTooLarge;
+    }
+}
 
 pub fn validateSystemCheckpoint(message: Message) !void {
     if (!message.system_prompt_replace) return;
@@ -112,6 +190,23 @@ pub const Event = union(enum) {
 pub const EventSink = struct {
     context: *anyopaque,
     emit: *const fn (*anyopaque, Event) anyerror!void,
+};
+
+/// Optional, synchronous timing observer. Only phase names and durations are reported.
+pub const Timing = struct {
+    context: *anyopaque,
+    emit: *const fn (*anyopaque, []const u8, u64) void,
+
+    pub fn start(observer: ?Timing, io: std.Io) ?std.Io.Clock.Timestamp {
+        return if (observer != null) std.Io.Clock.Timestamp.now(io, .awake) else null;
+    }
+
+    pub fn finish(observer: ?Timing, io: std.Io, started: ?std.Io.Clock.Timestamp, phase: []const u8) void {
+        const from = started orelse return;
+        const to = std.Io.Clock.Timestamp.now(io, .awake);
+        const sink = observer.?;
+        sink.emit(sink.context, phase, @intCast(@max(0, to.raw.nanoseconds - from.raw.nanoseconds)));
+    }
 };
 
 pub const ToolDefinition = struct {
@@ -335,6 +430,7 @@ pub const Provider = struct {
     context: *anyopaque,
     run_fn: *const fn (*anyopaque, std.mem.Allocator, []const Message, []const ToolDefinition, EventSink) anyerror!void,
     retry_info_fn: ?*const fn (*anyopaque, anyerror) ?RetryHint = null,
+    timing: ?Timing = null,
 
     pub fn run(self: Provider, allocator: std.mem.Allocator, messages: []const Message, tools: []const ToolDefinition, sink: EventSink) !void {
         return self.run_fn(self.context, allocator, messages, tools, sink);

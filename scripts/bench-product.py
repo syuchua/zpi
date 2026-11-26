@@ -22,7 +22,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 READY = b'\x1b[?2004h'
+ALT_SCREEN = b'\x1b[?1049h'
 FRAME_END = b'\x1b[?2026l'
+PASTE_OFF = b'\x1b[?2004l'
 PICKER = b'Up/Down move  Enter switch  s summarize  Esc cancel'
 STREAM_TEXT = ('x' * 63 + '\n') * 4096
 
@@ -69,6 +71,8 @@ class Terminal:
     def __init__(self, command, directory, environment):
         self.master, slave = pty.openpty()
         self.pending = bytearray()
+        self.bytes_read = 0
+        self.read_at = None
         try:
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
             self.started = time.perf_counter_ns()
@@ -85,7 +89,10 @@ class Terminal:
         if remaining <= 0 or not select.select([self.master], [], [], remaining)[0]:
             raise TimeoutError(f'PTY read deadline: {bytes(self.pending[-300:])!r}')
         try:
-            return os.read(self.master, 65536)
+            data = os.read(self.master, 65536)
+            self.bytes_read += len(data)
+            self.read_at = time.perf_counter_ns()
+            return data
         except OSError as error:
             if error.errno == errno.EIO:
                 return b''
@@ -99,11 +106,16 @@ class Terminal:
                 raise RuntimeError(f'PTY closed before {marker!r}: {bytes(self.pending[-500:])!r}')
             self.pending.extend(chunk)
         del self.pending[:offset + len(marker)]
-        return time.perf_counter_ns()
+        return self.read_at
 
     def ready(self):
         self.expect(READY)
         return self.expect(FRAME_END)
+
+    def idle_after_turn(self):
+        # Ignore the busy editor's enable marker, which precedes the reply.
+        self.expect(PASTE_OFF)
+        return self.ready()
 
     def send(self, data):
         pending = memoryview(data)
@@ -177,12 +189,12 @@ def measure(command, root, env, server, history, compact, count):
         first = tty.expect(b'BenchFirstToken')
         values['launch_to_first_text'] = first - tty.started
         values['submit_to_first_text'] = first - started
-        tty.ready()
+        tty.idle_after_turn()
         tty.finish()
     with terminal(command, root, env) as tty:
         tty.ready()
         values['stream_completion'] = tty.elapsed(b'benchmark long stream\n', b'BenchStreamDone')
-        tty.ready()
+        tty.idle_after_turn()
         values['stream_peak_rss'] = tty.finish()
     original = history.read_bytes()
     with terminal(command, root, env, history) as tty:
@@ -210,7 +222,7 @@ def measure(command, root, env, server, history, compact, count):
         started = time.perf_counter_ns()
         tty.send(b'benchmark context\n')
         tty.expect(b'BenchContextReply')
-        values['before_compaction_turn'] = tty.ready() - started
+        values['before_compaction_turn'] = tty.idle_after_turn() - started
         started = time.perf_counter_ns()
         tty.send(b'/compact benchmark\n')
         tty.expect(b'[compacted:')
@@ -218,7 +230,7 @@ def measure(command, root, env, server, history, compact, count):
         started = time.perf_counter_ns()
         tty.send(b'benchmark context\n')
         tty.expect(b'BenchContextReply')
-        values['after_compaction_turn'] = tty.ready() - started
+        values['after_compaction_turn'] = tty.idle_after_turn() - started
         tty.finish()
     records = [json.loads(line) for line in compact.read_text().splitlines()]
     [entry] = [record for record in records if record['type'] == 'compaction']
@@ -235,6 +247,8 @@ def main():
     parser.add_argument('--messages', type=int, default=8192)
     parser.add_argument('--message-padding', type=int, default=128)
     parser.add_argument('--environment', required=True, help='Hardware, OS and build description')
+    parser.add_argument('--tui-mode', choices=('fullscreen', 'regular'), default='regular')
+    parser.add_argument('--restore-only', action='store_true', help='Measure launch to editor readiness and process RSS on resume')
     args = parser.parse_args()
     if not (1 <= args.samples <= 100 and 64 <= args.messages <= 20000 and 32 <= args.message_padding <= 512):
         parser.error('samples must be 1..100, messages 64..20000 and padding 32..512')
@@ -251,11 +265,41 @@ def main():
             'baseUrl': f'http://127.0.0.1:{server.server_port}/v1', 'apiKey': 'fixture',
             'models': [{'id': 'bench', 'contextWindow': 128000, 'maxTokens': 1024}]}}}))
         command = [str(binary), '--models-file', str(config), '--provider', 'bench', '--no-tools',
-                   '--no-proxy', '--no-skills', '--no-prompt-templates']
+                   '--no-proxy', '--no-skills', '--no-prompt-templates', '--tui-mode', args.tui_mode]
         history, compact = root / 'history.jsonl', root / 'compact.jsonl'
         write_session(history, root, args.messages, args.message_padding)
         compact_count = min(args.messages, 1024)
         server.context_requests = []
+        if args.restore_only:
+            original = history.read_bytes()
+            samples = []
+            for _ in range(args.samples):
+                with terminal(command, root, env, history) as tty:
+                    entered = tty.expect(ALT_SCREEN) if args.tui_mode == 'fullscreen' else None
+                    ready = tty.ready()
+                    output_bytes = tty.bytes_read - len(tty.pending)
+                    peak_rss = tty.finish()
+                samples.append((ready - tty.started, output_bytes, peak_rss,
+                                (entered - tty.started, ready - entered) if entered is not None else None))
+            if history.read_bytes() != original:
+                raise RuntimeError('read-only session fixture changed')
+            print(json.dumps({
+                'environment': args.environment,
+                'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+                'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                'tui_mode': args.tui_mode, 'session_messages': args.messages,
+                'session_bytes': len(original), 'pty_columns': 80, 'pty_rows': 24,
+                'restore_ms': stats([sample[0] for sample in samples], 1e6),
+                'pty_bytes_read_at_ready': stats([sample[1] for sample in samples]),
+                'process_peak_rss_bytes': stats([sample[2] for sample in samples]),
+                'fullscreen_milestone_ms': ({
+                    'launch_to_alternate_screen': stats([sample[3][0] for sample in samples], 1e6),
+                    'alternate_screen_to_ready': stats([sample[3][1] for sample in samples], 1e6),
+                } if args.tui_mode == 'fullscreen' else {}),
+            }, indent=2))
+            return
+        if args.tui_mode == 'fullscreen':
+            parser.error('use --restore-only for fullscreen; the full suite uses regular-mode output markers')
         worker = threading.Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
@@ -273,7 +317,7 @@ def main():
             'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
             'script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             'binary_version': subprocess.check_output([str(binary), '--version'], env=env, timeout=10).decode().strip(),
-            'sample_count': args.samples, 'pty_columns': 80, 'pty_rows': 24,
+            'sample_count': args.samples, 'pty_columns': 80, 'pty_rows': 24, 'tui_mode': args.tui_mode,
             'session_messages': args.messages, 'session_bytes': history.stat().st_size,
             'session_message_padding': args.message_padding, 'compaction_input_messages': compact_count,
             'stream_text_bytes': len(STREAM_TEXT) + len('BenchStreamDone'),

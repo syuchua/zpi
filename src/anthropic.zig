@@ -14,6 +14,7 @@ pub const Client = struct {
     environ: ?*const std.process.Environ.Map = null,
     proxy_policy: ProxyPolicy = .system,
     cancel: ?model.Cancel = null,
+    timing: ?model.Timing = null,
     status: ?std.http.Status = null,
     retry_after_ms: ?u64 = null,
 
@@ -70,7 +71,9 @@ pub const Client = struct {
         if (std.mem.startsWith(u8, self.config.api_key, "sk-ant-oat")) return error.OAuthUnsupported;
         if (std.mem.indexOfAny(u8, self.config.api_key, "\r\n") != null) return error.InvalidCredential;
         try http_headers.validateAll(self.config.headers);
+        const encoding_started = model.Timing.start(self.timing, self.io);
         const payload = try encodeRequest(allocator, self.config, messages, tools);
+        model.Timing.finish(self.timing, self.io, encoding_started, "request_encode");
         defer allocator.free(payload);
         const accept_override = http_headers.get(self.config.headers, "accept");
         const api_key_override = http_headers.get(self.config.headers, "x-api-key");
@@ -103,6 +106,7 @@ pub const Client = struct {
         }
         var decoder = Decoder.init(allocator, sink);
         defer decoder.deinit();
+        const transport_started = model.Timing.start(self.timing, self.io);
         try http_transport.postSse(allocator, self.io, .{
             .uri = uri,
             .authorization = null,
@@ -111,7 +115,9 @@ pub const Client = struct {
             .environ = self.environ,
             .proxy_policy = self.proxy_policy,
             .cancel_socket = cancel_socket,
+            .timing = self.timing,
         }, decoder.sseSink(), &decoder.done, &self.status, &self.retry_after_ms);
+        model.Timing.finish(self.timing, self.io, transport_started, "http_sse_transport");
     }
 };
 
@@ -119,6 +125,7 @@ pub fn encodeRequest(a: std.mem.Allocator, config: Config, messages: []const mod
     if (config.max_tokens == 0) return error.InvalidTokenLimit;
     const projected = try model.projectSystemPrompt(a, messages);
     defer a.free(projected);
+    try model.validateRequestImages(projected);
     var out = std.Io.Writer.Allocating.init(a);
     defer out.deinit();
     var json: std.json.Stringify = .{ .writer = &out.writer };
@@ -211,7 +218,10 @@ pub fn encodeRequest(a: std.mem.Allocator, config: Config, messages: []const mod
                 try json.endObject();
             },
             .thinking => return error.UnsupportedThinkingReplay,
-            .image => return error.UnsupportedContent,
+            .image => |image| {
+                if (message.role != .user) return error.InvalidImageRole;
+                try writeImageBlock(&json, image);
+            },
             .tool_call => |call| {
                 if (message.role != .assistant or call.arguments != .object) return error.InvalidToolArguments;
                 try json.beginObject();
@@ -258,6 +268,22 @@ pub fn encodeRequest(a: std.mem.Allocator, config: Config, messages: []const mod
     try json.endObject();
     return out.toOwnedSlice();
 }
+fn writeImageBlock(json: *std.json.Stringify, image: model.Image) !void {
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("image");
+    try json.objectField("source");
+    try json.beginObject();
+    try json.objectField("type");
+    try json.write("base64");
+    try json.objectField("media_type");
+    try json.write(image.mime_type);
+    try json.objectField("data");
+    try image.writeBase64(json, false);
+    try json.endObject();
+    try json.endObject();
+}
+
 fn writeTextContent(json: *std.json.Stringify, content: []const model.Content) !void {
     try json.beginArray();
     for (content) |part| switch (part) {

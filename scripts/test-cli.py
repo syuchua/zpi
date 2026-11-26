@@ -92,6 +92,23 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             assert request['stream'] is True
+            if self.path == '/image-fixture/v1/chat/completions':
+                messages = request['messages']
+                image_parts = [part for message in messages if message['role'] == 'user'
+                               and isinstance(message['content'], list)
+                               for part in message['content'] if part.get('type') == 'image_url']
+                assert len(image_parts) == 1, messages
+                assert image_parts[0]['image_url']['url'] == 'data:image/png;base64,iVBORw0KGgpmaXh0dXJl'
+                assert any(part.get('text') == 'describe fixture' for message in messages if message['role'] == 'user'
+                           and isinstance(message['content'], list) for part in message['content'])
+                response = {'choices': [{'index': 0, 'delta': {'content': 'fixture image recognized'}, 'finish_reason': 'stop'}]}
+                data = ('data: ' + json.dumps(response) + '\n\ndata: [DONE]\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if self.path == '/subagent-fixture/chat/completions':
                 messages = request['messages']
                 user = next(m['content'] for m in messages if m['role'] == 'user')
@@ -2264,16 +2281,17 @@ def check_tui_components(root, environment, server):
         return transcript.find(marker, start)
 
     try:
-        # 1. Idle double-rule editor + 2-line Footer shows cwd (branch), provider/model, thinking level, and context window.
+        # 1. The idle footer shows cwd (branch), model, thinking level, and context window.
         expect('─'.encode('utf-8') * 16)
         expect(b'comp-work (feat/tui-test)')
         expect(b'comp-fixture/comp-model (medium)')
         expect(b'/10k (')
 
-        # 2. Submit turn: Loader, ThinkingBlock, ToolCard (+ arg header) + DiffView, MarkdownStyler, and updated Footer render.
+        # 2. Submit turn: progress Footer, Loader, ThinkingBlock, ToolCard (+ arg header) + DiffView, MarkdownStyler render.
         start = len(transcript)
         os.write(master, b'update comp\n')
         expect(b'Thinking...', start)
+        expect('━'.encode(), start)
         expect(b'checking file', start)
         expect(b'\xe2\x95\xad\xe2\x94\x80 ', start)
         expect(b'[tool: edit]', start)
@@ -2621,6 +2639,7 @@ def check_settings_and_model_switch(root, environment, server):
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+
 
 
 def check_resume_picker(root, environment):
@@ -3559,14 +3578,15 @@ def check_fullscreen_viewport(root, environment, server):
         paint_begin, paint_end = expect(sync_begin), expect(frame_end, expect(sync_begin))
         first_full_paint = bytes(transcript[paint_begin:paint_end])
         assert first_full_paint.startswith(sync_begin + b'\x1b[H'), first_full_paint
-        frame, pos = frame_with(b'[Skills]', 0, editor_row=37)
+        frame, pos = frame_with(b'[Skills]', 0, editor_row=36)
         assert b'____  ____  ___' in frame and b'fullscreen-fixture' in frame, frame
         assert b'Ctrl-C interrupt' in frame and b'[Tools]' in frame, frame
         rows = frame.split(b'\n')
-        assert '─'.encode() * 16 in rows[35] and '─'.encode() * 16 in rows[37], frame
-        assert b'queue-fixture/queue-model' in rows[-1], frame
+        assert '─'.encode() * 16 in rows[36], frame
+        assert b'queue-fixture/queue-model' in rows[-2], frame
+        assert '─'.encode() * 16 in rows[-1], frame
         assert frame.count(b'(click to show more)') == 2, frame
-        assert frame.count(b'Input') >= 1 and frame.count(b'Output') == 2, frame
+        assert frame.count(b'Output') == 2, frame
         assert b'48;2;40;43;50' in frame, frame
         assert b'> initial user' in rows[1], frame
         for row in (rows[0], rows[2]):
@@ -3579,6 +3599,7 @@ def check_fullscreen_viewport(root, environment, server):
         os.write(master, b'/resume ' + os.fsencode(width_session) + b'\r')
         frame, pos = frame_with(b'(click to show more)', pos)
         assert b'> width user' in frame.split(b'\n')[1], frame
+        assert '─'.encode() * 16 in frame.split(b'\n')[-1], frame
         assert b'A' * 55 in frame and b'C' * 15 not in frame, frame
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 132, 0, 0))
         frame, pos = frame_with(width_text.encode(), pos)
@@ -3607,6 +3628,8 @@ def check_fullscreen_viewport(root, environment, server):
 
         os.write(master, b'/resume ' + os.fsencode(session) + b'\r')
         frame, pos = frame_with(b'restored assistant', pos)
+        assert b'queue-fixture/queue-model' in frame.split(b'\n')[-2], frame
+        assert '─'.encode() * 16 in frame.split(b'\n')[-1], frame
         assert b'initial assistant' not in frame, frame
         assert frame.count(b'Input') == 2 and frame.count(b'Output') == 2, frame
         assert frame.count(b'(click to show more)') == 2, frame
@@ -3620,8 +3643,9 @@ def check_fullscreen_viewport(root, environment, server):
         # subsequent mouse coordinates are calculated using the new geometry.
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 60, 0, 0))
         resized_mark = len(transcript)
-        frame, pos = frame_with(b'> restored user', resized_mark, editor_row=37)
-        assert b'queue-fixture/queue-model' in frame, frame
+        frame, pos = frame_with(b'> restored user', resized_mark, editor_row=36)
+        assert b'queue-fixture/queue-model' in frame.split(b'\n')[-2], frame
+        assert '─'.encode() * 16 in frame.split(b'\n')[-1], frame
         assert frame.count(b'\n') == 39, frame
 
         first_result_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'first result marker' in line)
@@ -3670,7 +3694,7 @@ def check_fullscreen_viewport(root, environment, server):
         assert b'\x1b[?1049h' not in typing and b'\x1b[?1049l' not in typing, typing
         assert full_clear not in typing, typing
         names = re.findall(rb'\x1b\[(\d+);1H', typing)
-        assert names and set(names) == {b'37'}, (names, typing)
+        assert names and set(names) == {b'36'}, (names, typing)
         assert b'> \x1b[0mfullscreen-read' in typing, typing
         # The typed word streamed in one row repaint per keystroke (coalesced
         # frames may merge a few), never a whole viewport, and far fewer bytes
@@ -3722,6 +3746,10 @@ def check_fullscreen_viewport(root, environment, server):
         assert sum(partial) < len(first_full_paint), (partial, len(first_full_paint))
         assert frame.count(b'live read marker') == 2, frame
         assert b'(click to show more)' in frame, frame
+        # The final text can be painted before the busy editor hands off to
+        # the idle editor, where tool cards accept clicks.
+        idle = expect(b'\x1b[?2004h', expect(b'\x1b[?2004l', typing_mark) + len(b'\x1b[?2004l'))
+        frame, pos = frame_with(b'fullscreen read complete', max(idle, pos))
         live_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'live read marker' in line)
         os.write(master, f'\x1b[<0;5;{live_row}M'.encode())
         frame, pos = frame_with(b'(click to collapse)', pos)
@@ -3979,6 +4007,40 @@ def main():
                 return
             check_subagent(root, environment, server)
             check_pi_import(root, common[:-4], environment, server)
+            image_provider_config = root / 'image-models.json'
+            image_provider_config.write_text(json.dumps({'providers': {'image-fixture': {
+                'api': 'openai-completions',
+                'baseUrl': f'http://127.0.0.1:{server.server_port}/image-fixture/v1',
+                'apiKey': 'image-key', 'models': [{'id': 'fixture-model'}],
+            }}}))
+            image_bytes = b'\x89PNG\r\n\x1a\nfixture'
+            image_path = root / 'fixture.png'
+            image_path.write_bytes(image_bytes)
+            image_session = root / 'image-session.jsonl'
+            image_args = [str(BINARY), '--no-proxy', '--models-file', str(image_provider_config),
+                          '--provider', 'image-fixture', '--session', str(image_session), '--no-tools',
+                          '--image', str(image_path), '-p', 'describe fixture']
+            image_result = run_repo_cli(image_args, input='', text=True, capture_output=True,
+                                        env=environment, timeout=15)
+            assert image_result.returncode == 0, (image_result.stderr, image_result.stdout)
+            assert 'fixture image recognized' in image_result.stdout
+            image_entries = [json.loads(line) for line in image_session.read_text().splitlines()]
+            image_message = next(entry['message'] for entry in image_entries
+                                 if entry.get('type') == 'message' and entry.get('message', {}).get('role') == 'user')
+            assert any(part.get('image', {}).get('mime_type') == 'image/png' and
+                       part['image']['data'] == 'iVBORw0KGgpmaXh0dXJl'
+                       for part in image_message['content']), image_message
+            rejected_image_session = root / 'rejected-image.jsonl'
+            image_path.write_bytes(b'not an image')
+            rejected_args = [str(BINARY), '--no-proxy', '--models-file', str(image_provider_config),
+                             '--provider', 'image-fixture', '--session', str(rejected_image_session),
+                             '--no-tools', '--image', str(image_path), '-p', 'bad image']
+            rejected = run_repo_cli(rejected_args,
+                                    input='', text=True, capture_output=True, env=environment, timeout=10)
+            assert rejected.returncode == 1 and rejected.stderr == 'zpi: UnsupportedImageType\n', rejected
+            assert not rejected_image_session.exists()
+            image_path.write_bytes(image_bytes)
+
             credential_session = root / 'invalid-credential.jsonl'
             credential_args = common[:-1] + [str(credential_session), '--no-tools', '-p', 'Reject credential']
             for invalid_key in ('synthetic-invalid-key\r\nInjected: value', 'x' * (16 * 1024 + 1)):

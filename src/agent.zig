@@ -61,6 +61,7 @@ pub const Agent = struct {
     messages: std.ArrayList(model.Message) = .empty,
     tools: []const Tool,
     provider: model.Provider,
+    timing: ?model.Timing = null,
     io: std.Io,
     cwd: []const u8,
     cancel: ?model.Cancel = null,
@@ -132,13 +133,18 @@ pub const Agent = struct {
         self.unresolved_tools = false;
     }
     pub fn prompt(self: *Agent, text: []const u8, sink: Sink) !void {
+        return self.promptMessage(.{ .role = .user, .content = &.{.{ .text = text }} }, sink);
+    }
+    pub fn promptMessage(self: *Agent, message: model.Message, sink: Sink) !void {
+        if (message.role != .user) return error.InvalidPromptRole;
+        _ = try model.validateMessageImages(message);
         if (self.running) return error.AgentBusy;
         if (self.max_turns == 0) return error.InvalidTurnLimit;
         if (self.commit_failed) return error.SessionCommitFailed;
         if (self.unresolved_tools) return error.UnresolvedToolCalls;
         self.running = true;
         defer self.running = false;
-        try self.append(.{ .role = .user, .content = &.{.{ .text = text }} });
+        try self.append(message);
         try self.notifyCommit(sink);
         const definitions = try self.allocator.alloc(model.ToolDefinition, self.tools.len);
         defer self.allocator.free(definitions);
@@ -218,10 +224,12 @@ pub const Agent = struct {
                     }
                 }
                 try sink.emit(sink.context, .{ .tool_start = call });
+                const tool_started = model.Timing.start(self.timing, self.io);
                 const result: ToolResult = if (steered)
                     .{ .text = "Skipped due to queued user message.", .is_error = true }
                 else
                     try self.executeTool(call, turn_alloc, sink);
+                model.Timing.finish(self.timing, self.io, tool_started, "tool_execute_only");
                 try self.append(.{
                     .role = .tool_result,
                     .content = &.{.{ .text = result.text }},
@@ -250,7 +258,9 @@ pub const Agent = struct {
                 if (attempt > 0) sink.emit(sink.context, .{ .retry_finished = .{ .success = false, .attempt = attempt, .error_code = "Canceled" } }) catch {};
                 return error.Canceled;
             };
+            const provider_started = model.Timing.start(self.timing, self.io);
             self.provider.run(self.allocator, self.messages.items, definitions, .{ .context = collected, .emit = Collector.emit }) catch |err| {
+                model.Timing.finish(self.timing, self.io, provider_started, "provider_call_including_decode_and_delivery");
                 if (err == error.Canceled or err == error.OutOfMemory) {
                     if (attempt > 0) sink.emit(sink.context, .{ .retry_finished = .{ .success = false, .attempt = attempt, .error_code = @errorName(err) } }) catch {};
                     return err;
@@ -282,6 +292,7 @@ pub const Agent = struct {
                 collected.* = .{ .allocator = turn_alloc, .sink = sink };
                 continue;
             };
+            model.Timing.finish(self.timing, self.io, provider_started, "provider_call_including_decode_and_delivery");
             if (attempt > 0) {
                 try sink.emit(sink.context, .{ .retry_finished = .{ .success = true, .attempt = attempt } });
             }

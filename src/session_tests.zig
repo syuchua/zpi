@@ -47,6 +47,26 @@ test "torn final append is removed and a new message remains readable" {
     try std.testing.expectEqualStrings("new reply", active[1].message.content[0].text);
 }
 
+test "binary images round trip in v3 session records without changing legacy record versions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/images.jsonl", .{&tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const png = "\x89PNG\r\n\x1a\nfixture";
+    var store = try session.Store.create(std.testing.allocator, std.testing.io, path, "/workspace");
+    _ = try store.appendMessage(.{ .role = .user, .content = &.{.{ .image = .{ .bytes = png, .mime_type = "image/png" } }} });
+    store.deinit();
+    const bytes = try tmp.dir.readFileAlloc(std.testing.io, "images.jsonl", std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\"version\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "iVBORw0KGgpmaXh0dXJl") != null);
+    var reopened = try session.Store.open(std.testing.allocator, std.testing.io, path);
+    defer reopened.deinit();
+    const restored = reopened.entries.items[0].message.content[0].image;
+    try std.testing.expectEqualStrings(png, restored.bytes);
+    try std.testing.expectEqualStrings("image/png", restored.mime_type);
+}
+
 test "session open rejects symlinks and nonregular files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

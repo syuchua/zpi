@@ -22,6 +22,7 @@ pub const Options = struct {
     pi_sdk: ?[]const u8 = null,
     extension_host: ?[]const u8 = null,
     include_files: std.ArrayList([]const u8) = .empty,
+    image_files: std.ArrayList([]const u8) = .empty,
     tools: ?[]const u8 = null,
     exclude_tools: ?[]const u8 = null,
     no_builtin_tools: bool = false,
@@ -53,6 +54,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
     errdefer result.extensions.deinit(allocator);
     errdefer result.native_plugins.deinit(allocator);
     errdefer result.include_files.deinit(allocator);
+    errdefer result.image_files.deinit(allocator);
     errdefer result.append_system_prompt.deinit(allocator);
     errdefer result.skills.deinit(allocator);
     errdefer result.prompt_templates.deinit(allocator);
@@ -95,6 +97,13 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
         }
         if (!positional_only and (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v"))) {
             result.print_version = true;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--image") or std.mem.startsWith(u8, arg, "--image="))) {
+            const value = if (std.mem.eql(u8, arg, "--image")) try takeValue(args, &i) else arg[8..];
+            if (value.len == 0) return error.EmptyImagePath;
+            if (result.image_files.items.len >= 16) return error.TooManyImages;
+            try result.image_files.append(allocator, value);
             continue;
         }
         if (!positional_only and std.mem.eql(u8, arg, "--no-proxy")) {
@@ -250,10 +259,11 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
     if (result.append_system_prompt.items.len > 64) return error.TooManyPromptAdditions;
     if (result.skills.items.len > 64) return error.TooManySkills;
     try tool_selection.validate(.{ .tools = result.tools, .no_tools = result.no_tools, .no_builtin_tools = result.no_builtin_tools });
-    if (result.mode == .rpc and (result.prompt.items.len != 0 or result.include_files.items.len != 0)) return error.RpcPromptArguments;
+    if (result.image_files.items.len > zpi.model.Image.max_message_images) return error.TooManyImages;
+    if (result.mode == .rpc and (result.prompt.items.len != 0 or result.include_files.items.len != 0 or result.image_files.items.len != 0)) return error.RpcPromptArguments;
     // Redirected stdin may supply the entire prompt. Validate emptiness after
     // reading it, before configuration, sessions, or executable resources load.
-    if (result.prompt.items.len == 0 and result.include_files.items.len == 0 and result.mode != .interactive and result.mode != .rpc and stdin_is_tty) return error.EmptyPrompt;
+    if (result.prompt.items.len == 0 and result.include_files.items.len == 0 and result.image_files.items.len == 0 and result.mode != .interactive and result.mode != .rpc and stdin_is_tty) return error.EmptyPrompt;
     return result;
 }
 fn sameMcpNamespace(left: []const u8, right: []const u8) bool {
@@ -282,6 +292,19 @@ test "prompt template flags keep explicit paths with default discovery disabled"
     try std.testing.expectEqualStrings("a.md", options.prompt_templates.items[0]);
     try std.testing.expectEqualStrings("templates", options.prompt_templates.items[1]);
     try std.testing.expectError(error.EmptyPromptTemplatePath, parse(a, &.{"--prompt-template="}, false, false));
+}
+
+test "CLI parses bounded repeatable image attachments" {
+    const a = std.testing.allocator;
+    var options = try parse(a, &.{ "-p", "inspect", "--image", "first.png", "--image=second.webp" }, false, false);
+    defer options.prompt.deinit(a);
+    defer options.image_files.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), options.prompt.items.len);
+    try std.testing.expectEqual(@as(usize, 2), options.image_files.items.len);
+    try std.testing.expectEqualStrings("first.png", options.image_files.items[0]);
+    try std.testing.expectEqualStrings("second.webp", options.image_files.items[1]);
+    try std.testing.expectError(error.EmptyImagePath, parse(a, &.{"--image="}, false, false));
+    try std.testing.expectError(error.TooManyImages, parse(a, &.{ "--image", "1", "--image", "2", "--image", "3", "--image", "4", "--image", "5", "--image", "6", "--image", "7", "--image", "8", "--image", "9" }, false, false));
 }
 
 test "CLI parses modes, overrides, positionals and conflicts" {

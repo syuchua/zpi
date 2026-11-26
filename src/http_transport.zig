@@ -50,6 +50,7 @@ pub const Request = struct {
     /// Optional caller-supplied CA bundle (primarily for tests). When null,
     /// loads `SSL_CERT_FILE` (if set) or rescans OS root certificates.
     ca_bundle: ?*std.crypto.Certificate.Bundle = null,
+    timing: ?model.Timing = null,
 };
 
 pub fn postSse(
@@ -63,6 +64,7 @@ pub fn postSse(
 ) !void {
     const uri = req_opts.uri;
     const is_https = std.mem.eql(u8, uri.scheme, "https");
+    const request_started = model.Timing.start(req_opts.timing, io);
     if (!is_https and !std.mem.eql(u8, uri.scheme, "http")) return error.InvalidEndpoint;
     if (uri.user != null or uri.password != null) return error.InvalidEndpoint;
     try http_headers.validateAll(req_opts.extra_headers);
@@ -142,10 +144,13 @@ pub fn postSse(
     const body_copy = try allocator.dupe(u8, req_opts.payload);
     defer allocator.free(body_copy);
     try req.sendBodyComplete(body_copy);
+    model.Timing.finish(req_opts.timing, io, request_started, "http_connect_and_send");
+    const response_started = model.Timing.start(req_opts.timing, io);
     var response = req.receiveHead(&.{}) catch |err| switch (err) {
         error.ReadFailed => return if (req.connection) |conn| conn.getReadError() orelse error.ResponseReadFailed else error.ResponseReadFailed,
         else => |e| return e,
     };
+    model.Timing.finish(req_opts.timing, io, response_started, "http_wait_for_response_headers");
     out_status.* = response.head.status;
     if (response.head.status != .ok) {
         out_retry_after_ms.* = http_headers.parseRetryAfterMs(response.head);
@@ -160,7 +165,7 @@ pub fn postSse(
 
     var transfer_buffer: [8192]u8 = undefined;
     const body_reader = response.reader(&transfer_buffer);
-    try drainSseStream(allocator, body_reader, sse_sink, done_flag);
+    try timedDrainSseStream(allocator, io, req_opts.timing, body_reader, sse_sink, done_flag);
 }
 
 fn runTunneledPost(
@@ -175,6 +180,7 @@ fn runTunneledPost(
     out_status: *?std.http.Status,
     out_retry_after_ms: *?u64,
 ) !void {
+    const request_started = model.Timing.start(req_opts.timing, io);
     const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
     const max_head_len: usize = 16 * 1024;
     const now = std.Io.Clock.real.now(io);
@@ -347,11 +353,14 @@ fn runTunneledPost(
         .interface = undefined,
         .max_head_len = max_head_len,
     };
+    model.Timing.finish(req_opts.timing, io, request_started, "http_connect_and_send");
+    const response_started = model.Timing.start(req_opts.timing, io);
     const resp_head_bytes = resp_http.receiveHead() catch |err| switch (err) {
         error.ReadFailed => return if (origin_tls.read_err) |e| e else if (sock_reader.err) |e| e else error.ResponseReadFailed,
         else => |e| return e,
     };
     const head = try std.http.Client.Response.Head.parse(resp_head_bytes);
+    model.Timing.finish(req_opts.timing, io, response_started, "http_wait_for_response_headers");
     out_status.* = head.status;
     if (head.status != .ok) {
         out_retry_after_ms.* = http_headers.parseRetryAfterMs(head);
@@ -366,7 +375,13 @@ fn runTunneledPost(
 
     var transfer_buffer: [8192]u8 = undefined;
     const body_reader = resp_http.bodyReader(&transfer_buffer, head.transfer_encoding, head.content_length);
-    try drainSseStream(allocator, body_reader, sse_sink, done_flag);
+    try timedDrainSseStream(allocator, io, req_opts.timing, body_reader, sse_sink, done_flag);
+}
+
+fn timedDrainSseStream(allocator: std.mem.Allocator, io: std.Io, timing: ?model.Timing, reader: *std.Io.Reader, sink: sse.Sink, done: *const bool) !void {
+    const started = model.Timing.start(timing, io);
+    try drainSseStream(allocator, reader, sink, done);
+    model.Timing.finish(timing, io, started, "sse_read_decode_and_delivery");
 }
 
 fn drainSseStream(
