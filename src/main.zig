@@ -247,6 +247,7 @@ fn run(init: std.process.Init) !void {
                 .new_session = CliAdapter.newSessionErased,
                 .session_info = CliAdapter.sessionInfoErased,
                 .copy_last_reply = CliAdapter.copyLastReplyErased,
+                .copy_selection = CliAdapter.copySelectionErased,
                 .render_initial_history = CliAdapter.renderInitialHistoryErased,
                 .render_fullscreen_history = CliAdapter.renderFullscreenHistoryErased,
                 .render_saved_session_on_exit = CliAdapter.renderSavedSessionOnExitErased,
@@ -1464,6 +1465,18 @@ const CliAdapter = struct {
             }
             count += 1;
         }
+    }
+
+    fn copySelectionErased(context: *anyopaque, text: []const u8) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness orelse return error.SessionUnavailable;
+        const clipboard = @import("clipboard");
+        return clipboard.copy(self.io, h.environ, clipboard.spawnRunner, text, .{}) catch |err| switch (err) {
+            error.Unavailable => error.ClipboardUnavailable,
+            error.Failed => error.ClipboardFailed,
+            error.Timeout => error.ClipboardTimeout,
+            error.InvalidPayload => error.InvalidClipboardPayload,
+        };
     }
 
     fn copyLastReplyErased(context: *anyopaque) anyerror!void {

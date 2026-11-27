@@ -8,6 +8,7 @@ pub const terminal = @import("tui/terminal.zig");
 pub const theme = @import("tui/theme.zig");
 pub const renderer = @import("tui/renderer.zig");
 pub const components = struct {
+    pub const text_selection = @import("tui/text_selection.zig");
     pub const markdown = @import("tui/components/markdown.zig");
     pub const message = @import("tui/components/message.zig");
     pub const tool_card = @import("tui/components/tool_card.zig");
@@ -85,6 +86,7 @@ fn reportTurnError(io: std.Io, view: ?*ConversationView, colored: bool, err: any
 
 test {
     _ = mouse;
+    _ = components.text_selection;
 }
 
 fn renderFullscreenConversation(
@@ -204,12 +206,24 @@ fn renderFullscreenConversation(
             index -= 1;
             const line = body.items[index];
             const row = header_rows + body.items.len - 1 - index;
-            view.hit_rows.items[row] = line.id;
+            const body_prefix = line.kind == .text and line.id != null and view.toolBodyRowLimit(line.id.?) != null and width >= 3;
+            const prefix = if (body_prefix) "│ " else "";
+            const display_text = try a.alloc(u8, prefix.len + line.text.len);
+            @memcpy(display_text[0..prefix.len], prefix);
+            @memcpy(display_text[prefix.len..], line.text);
+            view.hit_rows.items[row] = .{ .id = line.id, .text = display_text, .prefix = prefix.len, .selectable = line.id != null and line.kind != .hint };
             if (line.kind) |kind| {
                 try appendToolPanelRow(&rows_out, a, th, line.text, width, kind);
             } else try appendFullscreenRow(&rows_out, a, line.text, width);
         }
         for (body.items.len..body_rows) |_| try rows_out.append(a, "");
+    }
+    if (view.selection) |selection| {
+        for (selection.first.row..selection.last.row + 1) |row| {
+            if (row == 0 or row > rows_out.items.len or row > view.hit_rows.items.len) continue;
+            const hit = view.hit_rows.items[row - 1] orelse continue;
+            if (selection.columns(row, hit)) |cols| rows_out.items[row - 1] = try components.text_selection.highlightAlloc(a, rows_out.items[row - 1], cols);
+        }
     }
     if (search_rows > 0) try appendFullscreenRow(&rows_out, a, search_line.?, width);
     if (search_rows == 0 and jump_latest_rows > 0 and width > 0) {
@@ -316,10 +330,60 @@ fn mouseMatchesFrame(view: *const ConversationView, current: std.posix.winsize, 
         event.row <= current.row and event.col <= current.col;
 }
 
+fn handleTranscriptMouse(view: *ConversationView, event: mouse.Event, pressed: *bool, dragged: *bool) bool {
+    switch (event.kind) {
+        .left => {
+            if (event.row == 0 or event.row > view.hit_rows.items.len) return false;
+            const hit = view.hit_rows.items[event.row - 1] orelse return false;
+            if (!hit.selectable) return false;
+            pressed.* = true;
+            dragged.* = false;
+            view.selection = .{ .first = .{ .row = event.row, .col = event.col }, .last = .{ .row = event.row, .col = event.col } };
+            return true;
+        },
+        .left_motion => {
+            if (!pressed.*) return false;
+            dragged.* = true;
+            if (view.selection) |range| view.selection = components.text_selection.Range.init(range.first, .{ .row = event.row, .col = event.col }) orelse range;
+            return true;
+        },
+        .left_release => {
+            if (!pressed.*) return false;
+            if (view.selection) |range| view.selection = components.text_selection.Range.init(range.first, .{ .row = event.row, .col = event.col }) orelse range;
+            pressed.* = false;
+            return dragged.*;
+        },
+        else => return false,
+    }
+}
+
+fn copySelectionErased(context: *anyopaque, text: []const u8) anyerror!void {
+    const submit: *Submit = @ptrCast(@alignCast(context));
+    const copy = submit.copy_selection orelse return error.ClipboardUnavailable;
+    return copy(submit.context, text);
+}
+
+fn copyTextSelection(io: std.Io, allocator: std.mem.Allocator, submit: Submit, view: *ConversationView) !void {
+    const range = view.selection orelse return;
+    const text = try range.copyAlloc(allocator, view.hit_rows.items) orelse return;
+    defer allocator.free(text);
+    view.selection = null;
+    const copy = submit.copy_selection orelse return;
+    copy(submit.context, text) catch |err| {
+        try writeTuiError(io, switch (err) {
+            error.ClipboardUnavailable => "zpi: clipboard unavailable; install pbcopy, wl-copy, or xclip as appropriate\n",
+            error.ClipboardTimeout => "zpi: clipboard helper timed out\n",
+            error.InvalidClipboardPayload => "zpi: selected text is too large or invalid UTF-8\n",
+            else => "zpi: failed to copy selection to clipboard\n",
+        }, false);
+    };
+}
+
 fn navigateWithMouse(view: *ConversationView, event: mouse.Event) bool {
     switch (event.kind) {
         .wheel_up => view.scrollUp(3),
         .wheel_down => view.scrollDown(3),
+        .left_motion, .left_release => return false,
         .left => {
             if (view.jump_latest_row > 0 and event.row == view.jump_latest_row) {
                 view.followLatest();
@@ -443,6 +507,8 @@ pub const Submit = struct {
     new_session: ?*const fn (*anyopaque) anyerror!void = null,
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
     copy_last_reply: ?*const fn (*anyopaque) anyerror!void = null,
+    copy_selection: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    copy_selection: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     render_initial_history: ?*const fn (*anyopaque) anyerror!bool = null,
     render_fullscreen_history: ?*const fn (*anyopaque, *ConversationView) anyerror!bool = null,
     jobs_info: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
@@ -1892,6 +1958,8 @@ fn readPromptLine(
     var search = components.search.SearchState.init(allocator);
     defer search.deinit();
     var search_active = false;
+    var mouse_pressed = false;
+    var mouse_dragged = false;
 
     const has_footer = (submit.fullscreen or th.mode != .none) and submit.status_info != null;
     var dialog = initial_dialog;
@@ -2348,8 +2416,17 @@ fn readPromptLine(
                         const params = seq[0..slen];
                         if (!in_paste) if (submit.conversation_view) |view| if (final_byte) |fin| {
                             if (mouse.Event.parse(fin, params)) |event| {
-                                if (event.kind == .ignored) continue;
                                 if (!dirty and mouseMatchesFrame(view, terminalSize(output), event)) {
+                                    const was_dragged = mouse_dragged;
+                                    if (event.kind == .left_motion or event.kind == .left_release) {
+                                        if (handleTranscriptMouse(view, event, &mouse_pressed, &mouse_dragged)) {
+                                            if (event.kind == .left_release and was_dragged) try copyTextSelection(io, allocator, submit, view);
+                                            dirty = true;
+                                            continue;
+                                        }
+                                    } else if (event.kind == .left) {
+                                        _ = handleTranscriptMouse(view, event, &mouse_pressed, &mouse_dragged);
+                                    } else if (event.kind == .ignored) continue;
                                     if (!navigateWithMouse(view, event) and event.kind == .left) {
                                         const index = event.row -| view.popup_row;
                                         if (event.row >= view.popup_row and index < view.popup_rows and popup.isOpen() and popup.kind == .command) {
@@ -2559,6 +2636,10 @@ const LiveScreen = struct {
     overlay_active: bool = false,
     event_wake: ?*agent.model.Interrupt = null,
     started_ms: i64 = 0,
+    mouse_pressed: bool = false,
+    mouse_dragged: bool = false,
+    copy_selection: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    copy_context: ?*anyopaque = null,
 
     fn elapsedMs(self: *const LiveScreen) u64 {
         const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
@@ -2630,7 +2711,23 @@ const LiveScreen = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (mouse.Event.parse(final, params)) |event| {
-            if (mouseMatchesFrame(view, terminalSize(self.output), event)) _ = navigateWithMouse(view, event);
+            if (mouseMatchesFrame(view, terminalSize(self.output), event)) {
+                const was_dragged = self.mouse_dragged;
+                if (event.kind == .left_motion or event.kind == .left_release) {
+                    if (handleTranscriptMouse(view, event, &self.mouse_pressed, &self.mouse_dragged)) {
+                        self.notifyLocked();
+                        if (event.kind == .left_release and was_dragged) if (view.selection) |range| {
+                            if (range.copyAlloc(self.allocator, view.hit_rows.items) catch null) |text| {
+                                defer self.allocator.free(text);
+                                if (self.copy_selection) |copy| copy(self.copy_context.?, text) catch {};
+                            }
+                            view.selection = null;
+                        };
+                    }
+                } else if (event.kind == .left) {
+                    _ = handleTranscriptMouse(view, event, &self.mouse_pressed, &self.mouse_dragged);
+                } else _ = navigateWithMouse(view, event);
+            }
             return true;
         }
         return view.handleScrollKey(final, params);
@@ -3085,6 +3182,10 @@ fn runTurnWithLiveEditor(
     var cols = terminalColumns(output);
     var last_size = terminalSize(output);
     var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th, submit.conversation_view, painter);
+    screen.copy_selection = if (submit.copy_selection != null) copySelectionErased else null;
+    screen.copy_context = &submit;
+    screen.copy_selection = if (submit.copy_selection != null) copySelectionErased else null;
+    screen.copy_context = &submit;
     var event_wake = try agent.model.Interrupt.init();
     defer event_wake.deinit(io);
     screen.event_wake = &event_wake;

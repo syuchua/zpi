@@ -2,11 +2,12 @@
 const std = @import("std");
 const terminal = @import("../terminal.zig");
 const search = @import("search.zig");
+const text_selection = @import("../text_selection.zig");
 
 pub const ConversationView = struct {
     allocator: std.mem.Allocator,
     lines: std.ArrayList(Line) = .empty,
-    hit_rows: std.ArrayList(?usize) = .empty,
+    hit_rows: std.ArrayList(?text_selection.Row) = .empty,
     popup_row: usize = 0,
     popup_rows: usize = 0,
     jump_latest_row: usize = 0,
@@ -464,7 +465,8 @@ pub const ConversationView = struct {
 
     pub fn toolAtRow(self: *const ConversationView, row: usize) ?[]const u8 {
         if (row == 0 or row > self.hit_rows.items.len) return null;
-        const id = self.hit_rows.items[row - 1] orelse return null;
+        const hit = self.hit_rows.items[row - 1] orelse return null;
+        const id = hit.id orelse return null;
         if (id < self.first_id or id >= self.end()) return null;
         return self.lines.items[(self.first + id - self.first_id) % max_lines].tool_id;
     }
@@ -525,7 +527,7 @@ test "tool text rows retain hit targets and result preview stays folded with an 
     try view.layoutTools(80);
     const hint = view.end() - 1;
     try view.appendToolText("╰─ ✓\n", "call-1");
-    try view.hit_rows.append(view.allocator, hint);
+    try view.hit_rows.append(view.allocator, .{ .id = hint, .selectable = false });
     try std.testing.expectEqualStrings("call-1", view.toolAtRow(1).?);
     try std.testing.expectEqualStrings("one", view.lineAt(start).?);
     try std.testing.expectEqualStrings("two", view.lineAt(start + 1).?);
