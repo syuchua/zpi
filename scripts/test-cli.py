@@ -2699,7 +2699,7 @@ def check_resume_picker(root, environment):
         return transcript.find(marker, start)
 
     try:
-        expect(b'v0.1.1')
+        expect(b'v0.1.2')
         expect(b'|__ / |  _ \\|_ _|')
         expect(b'[Tools]')
         expect(b'first task alpha')

@@ -77,7 +77,7 @@ pub const Client = struct {
             .jsonrpc = "2.0",
             .id = self.next_id,
             .method = "initialize",
-            .params = .{ .protocolVersion = preferred_version, .capabilities = .{}, .clientInfo = .{ .name = "zpi", .version = "0.1.1" } },
+            .params = .{ .protocolVersion = preferred_version, .capabilities = .{}, .clientInfo = .{ .name = "zpi", .version = "0.1.2" } },
         })).?;
         self.next_id += 1;
         defer reply.deinit();

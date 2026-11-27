@@ -1,6 +1,6 @@
 //! Bounded literal transcript search for the fullscreen TUI.
 //!
-//! Scope and policy (0.1.1):
+//! Scope and policy (0.1.2):
 //!   * Search covers the retained transcript lines of the fullscreen
 //!     `ConversationView` ring: live turns plus restored
 //!     sessions/history/branch-summary text. The ring holds the newest
