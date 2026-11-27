@@ -3545,6 +3545,21 @@ def check_fullscreen_viewport(root, environment, server):
             raise
         raise AssertionError(('no matching fullscreen frame', marker, editor_row, bytes(transcript[-3000:])))
 
+    def mouse_report(code, col, row, final='M'):
+        return f'\x1b[<{code};{col};{row}{final}'.encode()
+
+    def drag(start, anchor, focus, highlight, expected, unchanged):
+        clipboard_capture.unlink(missing_ok=True)
+        os.write(master, mouse_report(0, *anchor) + mouse_report(32, *focus))
+        _, start = frame_with(b'\x1b[7m' + highlight, start)
+        assert not clipboard_capture.exists(), 'selection copied before release'
+        os.write(master, mouse_report(0, *focus, final='m'))
+        frame, start = frame_with(unchanged, start)
+        assert b'\x1b[7m' + highlight not in frame, frame
+        assert clipboard_capture.read_bytes() == expected
+        assert b'Copied' in frame, frame
+        return frame, start
+
     def settle(start):
         """Wait for the next full repaint (first frame, resize, or invalidation)."""
         deadline = time.monotonic() + 10
@@ -3609,8 +3624,14 @@ def check_fullscreen_viewport(root, environment, server):
         rows = frame.split(b'\n')
         assert any(b'A' * 55 in row for row in rows) and any(b'B' * 55 in row for row in rows), frame
         assert b'C' * 15 not in frame, frame
+        if sys.platform in ('darwin', 'linux'):
+            a_row = next(row for row, line in enumerate(rows, 1) if b'A' * 55 in line)
+            b_row = next(row for row, line in enumerate(rows, 1) if b'B' * 55 in line)
+            frame, pos = drag(pos, (55, a_row), (5, b_row), b'AAA', b'AAA\nBBB', b'A' * 55)
+            assert b'(click to show more)' in frame, frame
+            rows = frame.split(b'\n')
         hint_row = next(row for row, line in enumerate(rows, 1) if b'(click to show more)' in line)
-        os.write(master, f'\x1b[<0;5;{hint_row}M'.encode())
+        os.write(master, f'\x1b[<0;5;{hint_row}M\x1b[<0;5;{hint_row}m'.encode())
         frame, pos = frame_with(b'(click to collapse)', pos)
         assert b'C' * 15 in frame, frame
 
@@ -3637,7 +3658,18 @@ def check_fullscreen_viewport(root, environment, server):
         assert b'> restored user' in frame.split(b'\n')[1], frame
         assert b'first result marker' in frame and b'second result marker' in frame, frame
         assert b'click to show more' in frame, frame
-        assert b'\x1b[?2004h\x1b[?1006h\x1b[?1000h' in transcript
+        assert b'\x1b[?2004h\x1b[?1006h\x1b[?1002h' in transcript
+
+        if sys.platform in ('darwin', 'linux'):
+            assistant_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'restored assistant' in line)
+            clipboard_capture.unlink(missing_ok=True)
+            os.write(master, mouse_report(0, 1, assistant_row) + mouse_report(0, 1, assistant_row, final='m') + b'x')
+            frame, pos = frame_with(b'\x1b[0mx', pos)
+            assert not clipboard_capture.exists(), 'plain click copied transcript'
+            os.write(master, b'\x15')
+            frame, pos = frame_with(b'restored assistant', pos)
+            os.write(master, mouse_report(0, 1, assistant_row) + mouse_report(32, 8, assistant_row))
+            frame, pos = frame_with(b'\x1b[7mrestored', pos)
 
         # Resize while idle: the redraw keeps the pinned message and editor, and
         # subsequent mouse coordinates are calculated using the new geometry.
@@ -3647,21 +3679,28 @@ def check_fullscreen_viewport(root, environment, server):
         assert b'queue-fixture/queue-model' in frame.split(b'\n')[-2], frame
         assert '─'.encode() * 16 in frame.split(b'\n')[-1], frame
         assert frame.count(b'\n') == 39, frame
+        if sys.platform in ('darwin', 'linux'):
+            os.write(master, mouse_report(0, 8, assistant_row, final='m') + b'x')
+            frame, pos = frame_with(b'\x1b[0mx', pos)
+            assert not clipboard_capture.exists(), 'resize copied a stale selection'
+            os.write(master, b'\x15')
+            frame, pos = frame_with(b'restored assistant', pos)
+            assert b'\x1b[7mrestored' not in frame, frame
 
         first_result_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'first result marker' in line)
-        os.write(master, f'\x1b[<0;5;{first_result_row}M'.encode())
+        os.write(master, f'\x1b[<0;5;{first_result_row}M\x1b[<0;5;{first_result_row}m'.encode())
         frame, pos = frame_with(b'first result marker', pos)
         assert frame.count(b'first result marker') == 12 and frame.count(b'second result marker') == 2, frame
         assert frame.count(b'(click to collapse)') == 1 and frame.count(b'(click to show more)') == 1, frame
 
         second_result_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'second result marker' in line)
-        os.write(master, f'\x1b[<0;5;{second_result_row}M'.encode())
+        os.write(master, f'\x1b[<0;5;{second_result_row}M\x1b[<0;5;{second_result_row}m'.encode())
         frame, pos = frame_with(b'second result marker', pos)
         assert frame.count(b'first result marker') >= 10 and frame.count(b'second result marker') == 12, frame
         assert frame.count(b'(click to collapse)') == 2, frame
 
         second_hint_row = max(row for row, line in enumerate(frame.split(b'\n'), 1) if b'(click to collapse)' in line)
-        os.write(master, f'\x1b[<0;5;{second_hint_row}M'.encode())
+        os.write(master, f'\x1b[<0;5;{second_hint_row}M\x1b[<0;5;{second_hint_row}m'.encode())
         frame, pos = frame_with(b'(click to show more)', pos)
         assert frame.count(b'first result marker') == 12 and frame.count(b'second result marker') == 2, frame
 
@@ -3751,7 +3790,7 @@ def check_fullscreen_viewport(root, environment, server):
         idle = expect(b'\x1b[?2004h', expect(b'\x1b[?2004l', typing_mark) + len(b'\x1b[?2004l'))
         frame, pos = frame_with(b'fullscreen read complete', max(idle, pos))
         live_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'live read marker' in line)
-        os.write(master, f'\x1b[<0;5;{live_row}M'.encode())
+        os.write(master, f'\x1b[<0;5;{live_row}M\x1b[<0;5;{live_row}m'.encode())
         frame, pos = frame_with(b'(click to collapse)', pos)
         assert frame.count(b'live read marker') == 12, frame
 
@@ -3791,6 +3830,9 @@ def check_fullscreen_viewport(root, environment, server):
         frame, pos = frame_with(b'fullscreen-new-output', resume_mark)
         assert b'> fullscreen-slow' in frame.split(b'\n')[1], frame
         assert b'\x1b[?2004l' not in transcript[resume_mark:pos]
+        if sys.platform in ('darwin', 'linux'):
+            live_text_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'fullscreen-new-output' in line)
+            frame, pos = drag(pos, (14, live_text_row), (12, live_text_row), b'new', b'new', b'fullscreen-new-output')
         os.write(master, b'\x1b[5~')
         frame, pos = frame_with(b'Jump to latest', pos)
         before_body = frame.split(b'\n')[3:5]
@@ -3833,6 +3875,10 @@ def check_fullscreen_viewport(root, environment, server):
         frame, pos = frame_with(b'search transcript', pos)
         search_text = lambda raw: re.sub(rb'\x1b\[[0-9;?]*[a-zA-Z]', b'', raw)
         assert b'/ search transcript' in search_text(frame), frame
+        if sys.platform in ('darwin', 'linux'):
+            selected_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'fullscreen-new-output' in line)
+            frame, pos = drag(pos, (12, selected_row), (14, selected_row), b'new', b'new', b'fullscreen-new-output')
+            assert b'/ search transcript' in search_text(frame), frame
         os.write(master, b'\x1b')
         restored, pos = frame_with(b'fullscreen-new-output', pos)
         assert b'search transcript' not in restored, restored
@@ -3918,6 +3964,11 @@ def check_fullscreen_viewport(root, environment, server):
             for clipboard_name in clipboard_names:
                 (clipboard_bin / clipboard_name).write_text('#!/bin/sh\nexit 1\n')
             clipboard_capture.unlink()
+            selected_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'fullscreen-new-output' in line)
+            os.write(master, mouse_report(0, 12, selected_row) + mouse_report(32, 14, selected_row) + mouse_report(0, 14, selected_row, final='m'))
+            failed = expect(b'zpi: failed to copy selection to clipboard', pos)
+            frame, pos = frame_with(b'fullscreen-new-output', failed)
+            assert not clipboard_capture.exists() and session.read_bytes() == saved
             os.write(master, b'/copy\r')
             failed = expect(b'zpi: copy failed.', pos)
             frame, pos = frame_with(b'fullscreen-new-output', failed)
@@ -3925,7 +3976,7 @@ def check_fullscreen_viewport(root, environment, server):
 
         os.write(master, b'/quit\n')
         leave = expect(b'\x1b[?1049l', pos)
-        assert b'\x1b[?1000l\x1b[?1006l' in transcript[pos:leave], transcript[pos:leave]
+        assert b'\x1b[?1002l\x1b[?1006l' in transcript[pos:leave], transcript[pos:leave]
         assert wait_for_pty_exit(process, master, transcript, timeout=10) == 0, bytes(transcript[-4096:])
         assert transcript[leave + len(b'\x1b[?1049l'):].splitlines() == [b'Saved session: ' + os.fsencode(session.name)], transcript[leave:]
         assert transcript.count(b'\x1b[?1049l') == 1, transcript[pos:leave]

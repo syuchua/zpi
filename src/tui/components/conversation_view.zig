@@ -8,6 +8,8 @@ pub const ConversationView = struct {
     allocator: std.mem.Allocator,
     lines: std.ArrayList(Line) = .empty,
     hit_rows: std.ArrayList(?text_selection.Row) = .empty,
+    mouse_gesture: ?text_selection.Gesture = null,
+    copy_notice_until_ms: ?i64 = null,
     popup_row: usize = 0,
     popup_rows: usize = 0,
     jump_latest_row: usize = 0,
@@ -73,9 +75,31 @@ pub const ConversationView = struct {
         self.user_rows.deinit(self.allocator);
     }
 
+    pub fn clearMouseGesture(self: *ConversationView) void {
+        self.mouse_gesture = null;
+    }
+
+    pub fn showCopiedNotice(self: *ConversationView, now_ms: i64) void {
+        self.copy_notice_until_ms = now_ms + 1400;
+    }
+
+    pub fn clearCopiedNotice(self: *ConversationView) void {
+        self.copy_notice_until_ms = null;
+    }
+
+    pub fn expireCopiedNotice(self: *ConversationView, now_ms: i64) bool {
+        const deadline = self.copy_notice_until_ms orelse return false;
+        if (now_ms < deadline) return false;
+        self.copy_notice_until_ms = null;
+        return true;
+    }
+
     pub fn clear(self: *ConversationView) void {
         for (self.lines.items) |line| line.deinit(self.allocator);
         self.hit_rows.clearRetainingCapacity();
+        self.mouse_gesture = null;
+        self.copy_notice_until_ms = null;
+        self.frame_size = std.mem.zeroes(std.posix.winsize);
         self.popup_rows = 0;
         self.jump_latest_row = 0;
         self.pinned_hit_row = null;
@@ -183,6 +207,7 @@ pub const ConversationView = struct {
     }
 
     pub fn toggleToolExpanded(self: *ConversationView, id: []const u8) !void {
+        self.mouse_gesture = null;
         if (self.expanded_tools.fetchRemove(id)) |old| {
             self.allocator.free(old.key);
             return;
@@ -193,6 +218,7 @@ pub const ConversationView = struct {
     }
 
     pub fn setToolsExpanded(self: *ConversationView, enabled: bool) void {
+        self.mouse_gesture = null;
         self.tools_expanded = enabled;
         self.clearToolOverrides();
     }
@@ -280,6 +306,7 @@ pub const ConversationView = struct {
     }
 
     pub fn followLatest(self: *ConversationView) void {
+        self.mouse_gesture = null;
         self.anchor = null;
         self.user_nav_row = null;
     }
@@ -301,6 +328,7 @@ pub const ConversationView = struct {
     }
 
     pub fn jumpToUserRow(self: *ConversationView, row: usize) void {
+        self.mouse_gesture = null;
         if (row < self.first_id or row >= self.end()) return;
         // The exclusive end includes the message's first text row even in a short pane.
         // When the target already ends the page, step one row further back so
@@ -403,6 +431,7 @@ pub const ConversationView = struct {
     /// Matches already inside the tail viewport keep following so streaming
     /// output does not move the viewport away from them.
     pub fn jumpToSearchRow(self: *ConversationView, row: usize) bool {
+        self.mouse_gesture = null;
         if (row < self.first_id or row >= self.end()) {
             if (self.search_hit_row == row) self.search_hit_row = null;
             return false;
@@ -472,6 +501,7 @@ pub const ConversationView = struct {
     }
 
     pub fn scrollUp(self: *ConversationView, amount: usize) void {
+        self.mouse_gesture = null;
         var oldest = self.first_id;
         var visible: usize = 0;
         while (oldest < self.end() and visible < self.body_height) : (oldest += 1) {
@@ -487,6 +517,7 @@ pub const ConversationView = struct {
     }
 
     pub fn scrollDown(self: *ConversationView, amount: usize) void {
+        self.mouse_gesture = null;
         if (self.anchor == null) return;
         var next = self.pageEnd();
         var remaining = amount;
@@ -527,7 +558,7 @@ test "tool text rows retain hit targets and result preview stays folded with an 
     try view.layoutTools(80);
     const hint = view.end() - 1;
     try view.appendToolText("╰─ ✓\n", "call-1");
-    try view.hit_rows.append(view.allocator, .{ .id = hint, .selectable = false });
+    try view.hit_rows.append(view.allocator, .{ .id = hint });
     try std.testing.expectEqualStrings("call-1", view.toolAtRow(1).?);
     try std.testing.expectEqualStrings("one", view.lineAt(start).?);
     try std.testing.expectEqualStrings("two", view.lineAt(start + 1).?);

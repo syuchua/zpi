@@ -118,6 +118,8 @@ fn renderFullscreenConversation(
     // Search and Jump to latest share a row below the transcript.
     const search_rows: usize = @intFromBool(search_line != null and chrome_budget > 0 and width > 0 and dialog.len == 0);
     const jump_latest_rows: usize = @intFromBool(search_rows == 0 and !view.isFollowing() and chrome_budget > 0 and popup.len == 0 and width > 0 and dialog.len == 0);
+    if (size.row != view.frame_size.row or size.col != view.frame_size.col) view.clearCopiedNotice();
+    if (view.copy_notice_until_ms != null) _ = view.expireCopiedNotice(std.Io.Timestamp.now(io, .awake).toMilliseconds());
     const reserved_below_body = jump_latest_rows + search_rows;
     const chrome_available = chrome_budget - reserved_below_body;
     // Keep room for the transcript and scrolling controls on short terminals.
@@ -126,12 +128,15 @@ fn renderFullscreenConversation(
     const loader_rows: usize = @intFromBool(rows >= 5 and chrome_available > chrome_rows);
     const extra_rows = chrome_available - chrome_rows - loader_rows;
     const rule_rows: usize = @intFromBool(rows >= 12 and width >= 4 and extra_rows > 0);
+    const notice_label = "Copied";
+    const show_notice = view.copy_notice_until_ms != null and width >= notice_label.len and dialog.len == 0;
+    const notice_on_footer = show_notice and chrome_rows >= 3;
+    const notice_on_rule = show_notice and !notice_on_footer and rule_rows > 0;
     const popup_budget = extra_rows - rule_rows;
     const popup_rows = @min(popup.len, popup_budget / 2);
     const queued_rows = @min(@min(queued.len, 4), popup_budget - popup_rows);
     const body_rows = rows -| (1 + header_rows + chrome_rows + loader_rows + popup_rows + queued_rows + rule_rows + reserved_below_body);
     view.body_height = @max(1, body_rows);
-    view.frame_size = size;
     view.pinned_hit_row = if (pinned_user) |user| user.row else null;
     view.pinned_header_rows = if (dialog.len == 0 and width > 0 and pinned_user != null) header_rows else 0;
     view.jump_latest_row = if (dialog.len == 0 and jump_latest_rows > 0 and width > 0) header_rows + body_rows + 1 else 0;
@@ -139,8 +144,8 @@ fn renderFullscreenConversation(
     // Popup rows sit above the editor and its optional separator. Mouse rows are 1-based.
     view.popup_row = rows - chrome_rows - popup_rows - rule_rows;
     view.popup_rows = popup_rows;
-    try view.hit_rows.resize(allocator, rows);
-    @memset(view.hit_rows.items, null);
+    const hit_rows = try a.alloc(?components.text_selection.Row, rows);
+    @memset(hit_rows, null);
 
     // Retained rows: one clipped row per terminal row. Blank rows are empty so an
     // unchanged blank line costs nothing to repaint.
@@ -157,7 +162,11 @@ fn renderFullscreenConversation(
         } else try appendFullscreenRow(&rows_out, a, "Conversation · PgUp / PgDn / End", width);
     }
 
-    var body: std.ArrayList(struct { text: []const u8, id: ?usize, kind: ?ConversationView.ToolRowKind = null }) = .empty;
+    var body: std.ArrayList(struct {
+        text: []const u8,
+        hit: components.text_selection.Row,
+        kind: ?ConversationView.ToolRowKind,
+    }) = .empty;
     if (dialog.len > 0) {
         // A dialog taller than the body is clipped; the padding range must use
         // the clamped count or it would underflow/overflow the row budget.
@@ -187,9 +196,11 @@ fn renderFullscreenConversation(
                 }
             }
             var lines = std.mem.splitBackwardsScalar(u8, wrapped, '\n');
-            while (body.items.len < body_rows) {
+            const tool_gutter = row_limit != null and width >= 3;
+            var wrap_from_end: usize = 0;
+            while (body.items.len < body_rows) : (wrap_from_end += 1) {
                 const wrapped_line = lines.next() orelse break;
-                var rendered = if (row_limit != null and width >= 3) blk: {
+                var rendered = if (tool_gutter) blk: {
                     var tool_line: std.ArrayList(u8) = .empty;
                     try th.paint(&tool_line, a, theme.Theme.border, "│ ");
                     try tool_line.appendSlice(a, wrapped_line);
@@ -198,31 +209,46 @@ fn renderFullscreenConversation(
                 if (search_query) |query| if (query.len > 0 and line_id != null) {
                     if (view.search_hit_row == line_id.?) rendered = try components.search.highlightAlloc(a, th, rendered, query);
                 };
-                try body.append(a, .{ .text = rendered, .id = line_id, .kind = tool_kind });
+                try body.append(a, .{
+                    .text = rendered,
+                    .hit = .{
+                        .id = line_id,
+                        .wrap_from_end = wrap_from_end,
+                        .prefix = if (tool_gutter) 2 else 0,
+                        .selectable = tool_kind != .hint,
+                    },
+                    .kind = tool_kind,
+                });
             }
         }
         var index = body.items.len;
         while (index > 0) {
             index -= 1;
-            const line = body.items[index];
-            const row = header_rows + body.items.len - 1 - index;
-            const body_prefix = line.kind == .text and line.id != null and view.toolBodyRowLimit(line.id.?) != null and width >= 3;
-            const prefix = if (body_prefix) "│ " else "";
-            const display_text = try a.alloc(u8, prefix.len + line.text.len);
-            @memcpy(display_text[0..prefix.len], prefix);
-            @memcpy(display_text[prefix.len..], line.text);
-            view.hit_rows.items[row] = .{ .id = line.id, .text = display_text, .prefix = prefix.len, .selectable = line.id != null and line.kind != .hint };
+            var line = body.items[index];
+            const row = rows_out.items.len;
             if (line.kind) |kind| {
-                try appendToolPanelRow(&rows_out, a, th, line.text, width, kind);
-            } else try appendFullscreenRow(&rows_out, a, line.text, width);
+                line.hit.width = try appendToolPanelRow(&rows_out, a, th, line.text, width, kind);
+            } else {
+                try appendFullscreenRow(&rows_out, a, line.text, width);
+                line.hit.width = terminal.visibleWidth(rows_out.items[row]);
+            }
+            line.hit.fingerprint = std.hash.Wyhash.hash(0, rows_out.items[row]);
+            hit_rows[row] = line.hit;
         }
         for (body.items.len..body_rows) |_| try rows_out.append(a, "");
     }
-    if (view.selection) |selection| {
-        for (selection.first.row..selection.last.row + 1) |row| {
-            if (row == 0 or row > rows_out.items.len or row > view.hit_rows.items.len) continue;
-            const hit = view.hit_rows.items[row - 1] orelse continue;
-            if (selection.columns(row, hit)) |cols| rows_out.items[row - 1] = try components.text_selection.highlightAlloc(a, rows_out.items[row - 1], cols);
+    if (view.mouse_gesture) |gesture| {
+        if (size.row != view.frame_size.row or size.col != view.frame_size.col or
+            !components.text_selection.Gesture.sameRows(view.hit_rows.items, hit_rows))
+        {
+            view.mouse_gesture = null;
+        } else if (gesture.range()) |selection| {
+            for (selection.first.row..selection.last.row + 1) |row| {
+                const hit = hit_rows[row - 1] orelse continue;
+                if (selection.columns(row, hit)) |cols| {
+                    rows_out.items[row - 1] = try components.text_selection.highlightAlloc(a, rows_out.items[row - 1], cols);
+                }
+            }
         }
     }
     if (search_rows > 0) try appendFullscreenRow(&rows_out, a, search_line.?, width);
@@ -242,7 +268,7 @@ fn renderFullscreenConversation(
     if (rule_rows > 0) {
         var rule: std.ArrayList(u8) = .empty;
         _ = try EditorState.appendRuleLine(&rule, a, th, size.col, isBangMode(editor.buf.items));
-        try rows_out.append(a, rule.items);
+        try rows_out.append(a, if (notice_on_rule) try copiedNoticeRow(a, th, rule.items, width, notice_label) else rule.items);
     }
     const editor_row = rows_out.items.len;
 
@@ -250,7 +276,11 @@ fn renderFullscreenConversation(
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..editor.cursor], '\n')) |nl| nl + 1 else 0;
     const line_end = std.mem.indexOfScalarPos(u8, text, editor.cursor, '\n') orelse text.len;
     const prefix_width: usize = if (width >= 3) 2 else 0;
-    const cursor_budget = width -| prefix_width;
+    // Short screens can lack both rules. Leave enough room for the prompt,
+    // the cursor, and the notice on the existing editor row.
+    const notice_on_editor = show_notice and !notice_on_footer and !notice_on_rule and width >= prefix_width + notice_label.len + 2;
+    const editor_width = if (notice_on_editor) width - notice_label.len - 1 else width;
+    const cursor_budget = editor_width - prefix_width;
     var start = editor.cursor;
     var cursor_width: usize = 0;
     while (start > line_start) {
@@ -268,7 +298,7 @@ fn renderFullscreenConversation(
         } else try th.paint(&editor_line, a, theme.Theme.accent, "> ");
     }
     _ = try terminal.appendClippedText(&editor_line, a, text[start..line_end], cursor_budget);
-    try rows_out.append(a, editor_line.items);
+    try rows_out.append(a, if (notice_on_editor) try copiedNoticeRow(a, th, editor_line.items, width, notice_label) else editor_line.items);
     if (footer.len > 0) {
         const indices: []const usize = switch (chrome_rows) {
             4 => &.{ 0, 1, 2, 3 },
@@ -277,11 +307,28 @@ fn renderFullscreenConversation(
             1 => &.{2},
             else => &.{},
         };
-        for (indices) |index| try appendFullscreenRow(&rows_out, a, footer[index], width);
+        for (indices) |index| {
+            if (notice_on_footer and index == 3) {
+                try rows_out.append(a, try copiedNoticeRow(a, th, footer[index], width, notice_label));
+            } else try appendFullscreenRow(&rows_out, a, footer[index], width);
+        }
     }
     // Diff against the retained frame so steady streaming only repaints edited
     // rows; the cursor is left on the editor row.
+    try view.hit_rows.ensureTotalCapacity(view.allocator, hit_rows.len);
     try painter.render(io, output, rows_out.items, .{ .row = editor_row, .col = prefix_width + cursor_width }, size.col);
+    view.hit_rows.clearRetainingCapacity();
+    view.hit_rows.appendSliceAssumeCapacity(hit_rows);
+    view.frame_size = size;
+}
+
+fn copiedNoticeRow(a: std.mem.Allocator, th: theme.Theme, base: []const u8, width: usize, label: []const u8) ![]const u8 {
+    var row: std.ArrayList(u8) = .empty;
+    const label_col = width - label.len;
+    const used = try terminal.appendTruncatedAnsi(&row, a, base, label_col -| 1, "");
+    try row.appendNTimes(a, ' ', label_col - used);
+    try th.paint(&row, a, theme.Theme.tool_output, label);
+    return row.items;
 }
 
 fn appendPinnedUserRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize) !void {
@@ -299,7 +346,7 @@ fn appendFullscreenRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocato
     try rows_out.append(a, row.items);
 }
 
-fn appendToolPanelRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize, kind: ConversationView.ToolRowKind) !void {
+fn appendToolPanelRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator, th: theme.Theme, text: []const u8, width: usize, kind: ConversationView.ToolRowKind) !usize {
     var clipped: std.ArrayList(u8) = .empty;
     defer clipped.deinit(a);
     _ = try terminal.appendTruncatedAnsi(&clipped, a, text, width, "");
@@ -320,9 +367,11 @@ fn appendToolPanelRow(rows_out: *std.ArrayList([]const u8), a: std.mem.Allocator
             pos += 1;
         }
     }
-    try row.appendNTimes(a, ' ', width -| terminal.visibleWidth(clipped.items));
+    const content_width = terminal.visibleWidth(clipped.items);
+    try row.appendNTimes(a, ' ', width -| content_width);
     try th.appendClose(&row, a);
     try rows_out.append(a, row.items);
+    return content_width;
 }
 
 fn mouseMatchesFrame(view: *const ConversationView, current: std.posix.winsize, event: mouse.Event) bool {
@@ -330,53 +379,74 @@ fn mouseMatchesFrame(view: *const ConversationView, current: std.posix.winsize, 
         event.row <= current.row and event.col <= current.col;
 }
 
-fn handleTranscriptMouse(view: *ConversationView, event: mouse.Event, pressed: *bool, dragged: *bool) bool {
+const TranscriptMouse = union(enum) { other, handled, copy: []u8 };
+
+/// Handle selection against the last painted frame. Return owned bytes so the
+/// caller can invoke the clipboard helper outside the live screen mutex.
+fn handleTranscriptMouse(view: *ConversationView, painter: *renderer.FullscreenRenderer, size: std.posix.winsize, event: mouse.Event, allocator: std.mem.Allocator) !TranscriptMouse {
+    if (painter.paintedRows() != view.hit_rows.items.len or painter.needsFullPaint() or !mouseMatchesFrame(view, size, event)) {
+        view.mouse_gesture = null;
+        return .handled;
+    }
+    const point: components.text_selection.Point = .{ .row = event.row, .col = event.col };
     switch (event.kind) {
         .left => {
-            if (event.row == 0 or event.row > view.hit_rows.items.len) return false;
-            const hit = view.hit_rows.items[event.row - 1] orelse return false;
-            if (!hit.selectable) return false;
-            pressed.* = true;
-            dragged.* = false;
-            view.selection = .{ .first = .{ .row = event.row, .col = event.col }, .last = .{ .row = event.row, .col = event.col } };
-            return true;
+            view.clearCopiedNotice();
+            if (event.row == 0 or event.row > view.hit_rows.items.len) return .other;
+            view.mouse_gesture = null;
+            const hit = view.hit_rows.items[event.row - 1] orelse return .other;
+            const on_text = hit.selectable and event.col > hit.prefix and event.col <= hit.width;
+            if (!on_text and view.toolAtRow(event.row) == null) return .other;
+            view.mouse_gesture = .{ .anchor = point, .focus = point, .selectable = on_text };
         },
         .left_motion => {
-            if (!pressed.*) return false;
-            dragged.* = true;
-            if (view.selection) |range| view.selection = components.text_selection.Range.init(range.first, .{ .row = event.row, .col = event.col }) orelse range;
-            return true;
+            if (view.mouse_gesture) |*gesture| {
+                gesture.move(point);
+            } else return .other;
         },
         .left_release => {
-            if (!pressed.*) return false;
-            if (view.selection) |range| view.selection = components.text_selection.Range.init(range.first, .{ .row = event.row, .col = event.col }) orelse range;
-            pressed.* = false;
-            return dragged.*;
+            var gesture = view.mouse_gesture orelse return .handled;
+            view.mouse_gesture = null;
+            gesture.move(point);
+            if (!gesture.moved) {
+                if (view.toolAtRow(event.row)) |id| try view.toggleToolExpanded(id);
+            } else if (gesture.range()) |selection| {
+                if (try selection.copyAlloc(allocator, view.hit_rows.items, painter.rows.items)) |text| return .{ .copy = text };
+            }
         },
-        else => return false,
+        .wheel_up, .wheel_down => {
+            view.mouse_gesture = null;
+            return .other;
+        },
+        .ignored => {},
     }
+    return .handled;
 }
 
-fn copySelectionErased(context: *anyopaque, text: []const u8) anyerror!void {
-    const submit: *Submit = @ptrCast(@alignCast(context));
-    const copy = submit.copy_selection orelse return error.ClipboardUnavailable;
-    return copy(submit.context, text);
-}
-
-fn copyTextSelection(io: std.Io, allocator: std.mem.Allocator, submit: Submit, view: *ConversationView) !void {
-    const range = view.selection orelse return;
-    const text = try range.copyAlloc(allocator, view.hit_rows.items) orelse return;
-    defer allocator.free(text);
-    view.selection = null;
-    const copy = submit.copy_selection orelse return;
-    copy(submit.context, text) catch |err| {
-        try writeTuiError(io, switch (err) {
-            error.ClipboardUnavailable => "zpi: clipboard unavailable; install pbcopy, wl-copy, or xclip as appropriate\n",
-            error.ClipboardTimeout => "zpi: clipboard helper timed out\n",
-            error.InvalidClipboardPayload => "zpi: selected text is too large or invalid UTF-8\n",
-            else => "zpi: failed to copy selection to clipboard\n",
-        }, false);
+fn copyTextSelection(submit: Submit, screen: ScreenIo, text: []u8) !bool {
+    defer submit.allocator.free(text);
+    const copy = submit.copy_selection orelse {
+        try screen.writeStderr("zpi: clipboard is unavailable\n");
+        return false;
     };
+    copy(submit.context, text) catch |err| {
+        try screen.writeStderr(switch (err) {
+            error.ClipboardUnavailable => "zpi: clipboard unavailable. Check pbcopy (macOS) or wl-copy / xclip (Linux).\n",
+            error.ClipboardTimeout => "zpi: clipboard helper timed out\n",
+            error.InvalidClipboardPayload => "zpi: selected text is too large or is not valid UTF-8\n",
+            else => "zpi: failed to copy selection to clipboard\n",
+        });
+        return false;
+    };
+    return true;
+}
+
+/// Return whether canceling a gesture requires repainting its highlight.
+fn cancelTranscriptGesture(view: ?*ConversationView) bool {
+    const conversation = view orelse return false;
+    if (conversation.mouse_gesture == null) return false;
+    conversation.clearMouseGesture();
+    return true;
 }
 
 fn navigateWithMouse(view: *ConversationView, event: mouse.Event) bool {
@@ -507,7 +577,6 @@ pub const Submit = struct {
     new_session: ?*const fn (*anyopaque) anyerror!void = null,
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
     copy_last_reply: ?*const fn (*anyopaque) anyerror!void = null,
-    copy_selection: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     copy_selection: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     render_initial_history: ?*const fn (*anyopaque) anyerror!bool = null,
     render_fullscreen_history: ?*const fn (*anyopaque, *ConversationView) anyerror!bool = null,
@@ -1792,8 +1861,8 @@ fn handleSearchKey(
     output: std.Io.File,
     queue: *InputQueue,
     submit: Submit,
-    cols: usize,
     first: u8,
+    painter: *renderer.FullscreenRenderer,
 ) !SearchKeyResult {
     var bytes: [4]u8 = undefined;
     var len: usize = 1;
@@ -1819,6 +1888,7 @@ fn handleSearchKey(
     }
     if (first == 0x1b) {
         const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse return .cancel;
+        if (next != '[') view.clearMouseGesture();
         switch (next) {
             // Esc Esc also cancels; the first Esc already restored the page.
             '\x1b' => return .cancel,
@@ -1852,18 +1922,22 @@ fn handleSearchKey(
                     seq[slen] = c;
                     slen += 1;
                 }
-                if (final_byte) |fin| switch (fin) {
-                    'A' => searchStep(state, view, false),
-                    'B' => searchStep(state, view, true),
-                    // Wheel scrolling while searching moves the page but keeps
-                    // the query and match list intact.
-                    '~', 'M', 'm' => {
-                        if (mouse.Event.parse(fin, seq[0..slen])) |event| {
-                            if (mouseMatchesFrame(view, terminalSize(output), event)) _ = navigateWithMouse(view, event);
+                if (final_byte) |fin| {
+                    if (mouse.Event.parse(fin, seq[0..slen])) |event| {
+                        switch (try handleTranscriptMouse(view, painter, terminalSize(output), event, submit.allocator)) {
+                            .other => _ = navigateWithMouse(view, event),
+                            .handled => {},
+                            .copy => |text| if (try copyTextSelection(submit, .{ .io = io, .file = output, .painter = painter }, text)) view.showCopiedNotice(std.Io.Timestamp.now(io, .awake).toMilliseconds()),
                         }
-                    },
-                    else => return .none,
-                };
+                        return .refresh;
+                    }
+                    switch (fin) {
+                        'A' => searchStep(state, view, false),
+                        'B' => searchStep(state, view, true),
+                        else => {},
+                    }
+                }
+                view.clearMouseGesture();
                 return .refresh;
             },
             // Alt+<printable> and Alt+Enter are not part of the query.
@@ -1883,8 +1957,6 @@ fn handleSearchKey(
         if (!std.unicode.utf8ValidateSlice(bytes[0..len])) return .none;
         if (!state.pushSlice(bytes[0..len])) return .none;
     } else return .none;
-    _ = io;
-    _ = cols;
     try searchRefresh(state, view);
     return .refresh;
 }
@@ -1958,8 +2030,9 @@ fn readPromptLine(
     var search = components.search.SearchState.init(allocator);
     defer search.deinit();
     var search_active = false;
-    var mouse_pressed = false;
-    var mouse_dragged = false;
+    defer if (submit.conversation_view) |view| {
+        view.mouse_gesture = null;
+    };
 
     const has_footer = (submit.fullscreen or th.mode != .none) and submit.status_info != null;
     var dialog = initial_dialog;
@@ -2048,9 +2121,13 @@ fn readPromptLine(
                     const new_size = terminalSize(output);
                     if (new_size.row != last_size.row or new_size.col != last_size.col) {
                         last_size = new_size;
+                        _ = cancelTranscriptGesture(submit.conversation_view);
                         dirty = true;
                     }
                     const bg_ready = if (submit.bg_wake) |wake| wake.isCanceled() else false;
+                    if (submit.conversation_view) |view| {
+                        if (view.expireCopiedNotice(std.Io.Timestamp.now(io, .awake).toMilliseconds())) dirty = true;
+                    }
                     if (!bg_ready) continue;
                 }
                 try collectBgNotifications(submit, io, output, bg_queue, true);
@@ -2075,6 +2152,7 @@ fn readPromptLine(
             return .{ .text = try editor.buf.toOwnedSlice(allocator) };
         };
 
+        if (b != 0x1b) dirty = cancelTranscriptGesture(submit.conversation_view) or dirty;
         skip_popup_refresh = false;
         if (search_active) {
             const result = try handleSearchKey(
@@ -2085,11 +2163,12 @@ fn readPromptLine(
                 output,
                 @constCast(queue),
                 submit,
-                cols,
                 b,
+                painter.?,
             );
             switch (result) {
                 .cancel => {
+                    submit.conversation_view.?.mouse_gesture = null;
                     search.restorePage(submit.conversation_view.?);
                     search.clear();
                     search_active = false;
@@ -2319,8 +2398,9 @@ fn readPromptLine(
             },
             0x1b => {
                 const next = try queue.readByteTimeout(input_fd, submit.cancel, 25) orelse {
-                    // Esc on an empty prompt in fullscreen is the search fallback;
-                    // a draft, dialog, popup or completion hint keeps its meaning.
+                    dirty = cancelTranscriptGesture(submit.conversation_view) or dirty;
+                    // Esc opens search on an empty prompt. A draft, dialog,
+                    // popup or completion hint keeps its usual Escape behavior.
                     if (submit.fullscreen and submit.conversation_view != null and !in_paste and
                         editor.buf.items.len == 0 and dialog == null and !popup.isOpen() and
                         editor.completion_hint == null)
@@ -2343,6 +2423,7 @@ fn readPromptLine(
                     }
                     continue;
                 };
+                if (next != '[') dirty = cancelTranscriptGesture(submit.conversation_view) or dirty;
                 switch (next) {
                     '\r', '\n' => {
                         try editor.insertSlice("\n");
@@ -2416,28 +2497,18 @@ fn readPromptLine(
                         const params = seq[0..slen];
                         if (!in_paste) if (submit.conversation_view) |view| if (final_byte) |fin| {
                             if (mouse.Event.parse(fin, params)) |event| {
-                                if (!dirty and mouseMatchesFrame(view, terminalSize(output), event)) {
-                                    const was_dragged = mouse_dragged;
-                                    if (event.kind == .left_motion or event.kind == .left_release) {
-                                        if (handleTranscriptMouse(view, event, &mouse_pressed, &mouse_dragged)) {
-                                            if (event.kind == .left_release and was_dragged) try copyTextSelection(io, allocator, submit, view);
-                                            dirty = true;
-                                            continue;
-                                        }
-                                    } else if (event.kind == .left) {
-                                        _ = handleTranscriptMouse(view, event, &mouse_pressed, &mouse_dragged);
-                                    } else if (event.kind == .ignored) continue;
-                                    if (!navigateWithMouse(view, event) and event.kind == .left) {
+                                switch (try handleTranscriptMouse(view, painter.?, terminalSize(output), event, submit.allocator)) {
+                                    .handled => {},
+                                    .copy => |text| if (try copyTextSelection(submit, .{ .io = io, .file = output, .painter = painter }, text)) view.showCopiedNotice(std.Io.Timestamp.now(io, .awake).toMilliseconds()),
+                                    .other => if (!navigateWithMouse(view, event) and event.kind == .left and !dirty) {
                                         const index = event.row -| view.popup_row;
                                         if (event.row >= view.popup_row and index < view.popup_rows and popup.isOpen() and popup.kind == .command) {
                                             const item = popup.scroll + index;
                                             if (index < components.autocomplete.Popup.max_visible and item < popup.items.items.len) {
                                                 try applyAutocomplete(&editor, &popup, io, submit, popup.items.items[item]);
                                             }
-                                        } else if (view.toolAtRow(event.row)) |id| {
-                                            try view.toggleToolExpanded(id);
                                         }
-                                    }
+                                    },
                                 }
                                 dirty = true;
                                 continue;
@@ -2447,6 +2518,7 @@ fn readPromptLine(
                                 continue;
                             }
                         };
+                        dirty = cancelTranscriptGesture(submit.conversation_view) or dirty;
                         if (final_byte) |fin| switch (fin) {
                             'A' => {
                                 // Alt+Up (CSI 1;3A / 1;5A) walks earlier user
@@ -2636,10 +2708,6 @@ const LiveScreen = struct {
     overlay_active: bool = false,
     event_wake: ?*agent.model.Interrupt = null,
     started_ms: i64 = 0,
-    mouse_pressed: bool = false,
-    mouse_dragged: bool = false,
-    copy_selection: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
-    copy_context: ?*anyopaque = null,
 
     fn elapsedMs(self: *const LiveScreen) u64 {
         const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
@@ -2706,31 +2774,31 @@ const LiveScreen = struct {
         if (self.loader.setPhase(phase, detail, self.elapsedMs())) self.notifyLocked();
     }
 
-    fn handleScrollKey(self: *LiveScreen, final: u8, params: []const u8) bool {
+    fn handleScrollKey(self: *LiveScreen, final: u8, params: []const u8, submit: Submit) !bool {
         const view = self.conversation_view orelse return false;
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (mouse.Event.parse(final, params)) |event| {
-            if (mouseMatchesFrame(view, terminalSize(self.output), event)) {
-                const was_dragged = self.mouse_dragged;
-                if (event.kind == .left_motion or event.kind == .left_release) {
-                    if (handleTranscriptMouse(view, event, &self.mouse_pressed, &self.mouse_dragged)) {
-                        self.notifyLocked();
-                        if (event.kind == .left_release and was_dragged) if (view.selection) |range| {
-                            if (range.copyAlloc(self.allocator, view.hit_rows.items) catch null) |text| {
-                                defer self.allocator.free(text);
-                                if (self.copy_selection) |copy| copy(self.copy_context.?, text) catch {};
-                            }
-                            view.selection = null;
-                        };
-                    }
-                } else if (event.kind == .left) {
-                    _ = handleTranscriptMouse(view, event, &self.mouse_pressed, &self.mouse_dragged);
-                } else _ = navigateWithMouse(view, event);
+        const selected_text: ?[]u8 = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const event = mouse.Event.parse(final, params) orelse {
+                view.clearMouseGesture();
+                return view.handleScrollKey(final, params);
+            };
+            switch (try handleTranscriptMouse(view, self.painter.?, terminalSize(self.output), event, submit.allocator)) {
+                .other => _ = navigateWithMouse(view, event),
+                .handled => {},
+                .copy => |text| break :blk text,
             }
-            return true;
+            break :blk null;
+        };
+        if (selected_text) |text| {
+            if (try copyTextSelection(submit, .{ .io = self.io, .file = self.output, .painter = self.painter }, text)) {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                view.showCopiedNotice(std.Io.Timestamp.now(self.io, .awake).toMilliseconds());
+                self.notifyLocked();
+            }
         }
-        return view.handleScrollKey(final, params);
+        return true;
     }
 
     fn writeSegment(self: *LiveScreen, prefix: []const u8, safe: []const u8, suffix: []const u8) !void {
@@ -3182,10 +3250,9 @@ fn runTurnWithLiveEditor(
     var cols = terminalColumns(output);
     var last_size = terminalSize(output);
     var screen = LiveScreen.init(submit.allocator, io, output, use_sgr, th, submit.conversation_view, painter);
-    screen.copy_selection = if (submit.copy_selection != null) copySelectionErased else null;
-    screen.copy_context = &submit;
-    screen.copy_selection = if (submit.copy_selection != null) copySelectionErased else null;
-    screen.copy_context = &submit;
+    defer if (submit.conversation_view) |view| {
+        view.mouse_gesture = null;
+    };
     var event_wake = try agent.model.Interrupt.init();
     defer event_wake.deinit(io);
     screen.event_wake = &event_wake;
@@ -3237,6 +3304,11 @@ fn runTurnWithLiveEditor(
 
     while (!done.isCanceled()) {
         const now = screen.elapsedMs();
+        const notice_expired = if (submit.conversation_view) |view| blk: {
+            screen.mutex.lockUncancelable(io);
+            defer screen.mutex.unlock(io);
+            break :blk view.expireCopiedNotice(std.Io.Timestamp.now(io, .awake).toMilliseconds());
+        } else false;
         const update_pending = event_wake.isCanceled();
         const animation_deadline = (now / animation_interval_ms + 1) * animation_interval_ms;
         const update_deadline = last_paint_ms + update_interval_ms;
@@ -3245,7 +3317,7 @@ fn runTurnWithLiveEditor(
             const current_size = terminalSize(output);
             const resized = !std.meta.eql(current_size, last_size);
             const animate = now / animation_interval_ms != last_paint_ms / animation_interval_ms;
-            if (dirty or resized or animate or (update_pending and now >= update_deadline)) {
+            if (dirty or resized or animate or notice_expired or (update_pending and now >= update_deadline)) {
                 cols = current_size.col;
                 last_size = current_size;
                 try screen.renderLive(&editor, followups.items, submit, cols);
@@ -3267,6 +3339,8 @@ fn runTurnWithLiveEditor(
             else => return err,
         }) orelse continue;
         if (done.isCanceled()) break;
+        if (b != 0x1b) if (submit.conversation_view) |view| view.clearMouseGesture();
+        if (submit.conversation_view) |view| view.clearCopiedNotice();
 
         switch (b) {
             0x03 => {
@@ -3380,6 +3454,7 @@ fn runTurnWithLiveEditor(
             },
             0x1b => {
                 const next = try queue.readByteWithWake(input_fd, wake, 25) orelse {
+                    if (submit.conversation_view) |view| view.clearMouseGesture();
                     if (done.isCanceled()) break;
                     if (editor.buf.items.len > 0) {
                         try editor.replaceBuffer("");
@@ -3390,6 +3465,7 @@ fn runTurnWithLiveEditor(
                     }
                     continue;
                 };
+                if (next != '[' and next != 'O') if (submit.conversation_view) |view| view.clearMouseGesture();
                 switch (next) {
                     '\r', '\n' => {
                         try editor.insertSlice("\n");
@@ -3404,6 +3480,7 @@ fn runTurnWithLiveEditor(
                         dirty = true;
                     },
                     0x1b => {
+                        if (submit.conversation_view) |view| view.mouse_gesture = null;
                         const third = try queue.readByteWithWake(input_fd, wake, 25) orelse continue;
                         if (third == '[' or third == 'O') {
                             const fourth = try queue.readByteWithWake(input_fd, wake, 25) orelse continue;
@@ -3414,6 +3491,7 @@ fn runTurnWithLiveEditor(
                         }
                     },
                     'O' => {
+                        if (submit.conversation_view) |view| view.mouse_gesture = null;
                         const code = try queue.readByteWithWake(input_fd, wake, 25) orelse continue;
                         switch (code) {
                             'H' => {
@@ -3458,11 +3536,12 @@ fn runTurnWithLiveEditor(
                         }
                         const params = seq[0..slen];
                         if (!in_paste) if (final_byte) |fin| {
-                            if (screen.handleScrollKey(fin, params)) {
+                            if (try screen.handleScrollKey(fin, params, submit)) {
                                 dirty = true;
                                 continue;
                             }
                         };
+                        if (submit.conversation_view) |view| view.clearMouseGesture();
                         if (final_byte) |fin| switch (fin) {
                             'A' => {
                                 if (std.mem.eql(u8, params, "1;3")) {
