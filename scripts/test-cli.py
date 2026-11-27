@@ -700,6 +700,7 @@ class Handler(BaseHTTPRequestHandler):
                         final = {'choices': [{'index': 0, 'delta': {'content': ' fullscreen read complete'}, 'finish_reason': 'stop'}]}
                         self.wfile.write(('data: ' + json.dumps(final) + '\n\ndata: [DONE]\n\n').encode())
                         self.wfile.flush()
+                        time.sleep(0.05)
                         return
                     response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
                         'index': 0, 'id': 'live-read', 'type': 'function',
@@ -3788,7 +3789,12 @@ def check_fullscreen_viewport(root, environment, server):
         # The final text can be painted before the busy editor hands off to
         # the idle editor, where tool cards accept clicks.
         idle = expect(b'\x1b[?2004h', expect(b'\x1b[?2004l', typing_mark) + len(b'\x1b[?2004l'))
-        frame, pos = frame_with(b'fullscreen read complete', max(idle, pos))
+        # The idle prompt can retain the live frame byte-for-byte, in which
+        # case the diff renderer correctly emits no second copy of this text.
+        if b'fullscreen read complete' in b'\n'.join(screen_rows()):
+            frame = b'\n'.join(screen_rows())
+        else:
+            frame, pos = frame_with(b'fullscreen read complete', idle)
         live_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'live read marker' in line)
         os.write(master, f'\x1b[<0;5;{live_row}M\x1b[<0;5;{live_row}m'.encode())
         frame, pos = frame_with(b'(click to collapse)', pos)
