@@ -3747,6 +3747,7 @@ def check_fullscreen_viewport(root, environment, server):
         # incremental repaints are captured before the turn settles.
         for marker in (b'fully', b'split', b'fully split streamed'):
             _, pos = frame_with(marker, pos)
+        final_paint_start = pos
         frame, pos = frame_with(b'fullscreen read complete', pos)
         streamed = bytes(transcript[typing_mark:pos])
         # Streaming output repaints only the transcript rows it changed.
@@ -3788,7 +3789,7 @@ def check_fullscreen_viewport(root, environment, server):
         assert b'(click to show more)' in frame, frame
         # The final text can be painted before the busy editor hands off to
         # the idle editor, where tool cards accept clicks.
-        idle = expect(b'\x1b[?2004h', expect(b'\x1b[?2004l', typing_mark) + len(b'\x1b[?2004l'))
+        idle = expect(b'\x1b[?1002h', final_paint_start)
         # The idle prompt can retain the live frame byte-for-byte, in which
         # case the diff renderer correctly emits no second copy of this text.
         if b'fullscreen read complete' in b'\n'.join(screen_rows()):
@@ -3796,7 +3797,7 @@ def check_fullscreen_viewport(root, environment, server):
         else:
             frame, pos = frame_with(b'fullscreen read complete', idle)
         live_row = next(row for row, line in enumerate(frame.split(b'\n'), 1) if b'live read marker' in line)
-        os.write(master, f'\x1b[<0;5;{live_row}M\x1b[<0;5;{live_row}m'.encode())
+        os.write(master, mouse_report(0, 5, live_row) + mouse_report(0, 5, live_row, final='m'))
         frame, pos = frame_with(b'(click to collapse)', pos)
         assert frame.count(b'live read marker') == 12, frame
 
