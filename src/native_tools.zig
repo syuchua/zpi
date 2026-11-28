@@ -121,6 +121,8 @@ pub fn combine(a: std.mem.Allocator, module: *runtime.Module, existing: []const 
         try tools.append(a, .{
             .context = entry,
             .execute = Entry.execute,
+            .capability = .native_plugin_load,
+            .source = .native_plugin,
             .definition = .{
                 .name = try a.dupe(u8, name),
                 .description = try a.dupe(u8, try runtime.spanText(spec.description, 16384)),

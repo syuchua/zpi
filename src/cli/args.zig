@@ -42,6 +42,16 @@ pub const Options = struct {
     no_proxy: bool = false,
     no_tools: bool = false,
     allow_loopback_web_fetch: bool = false,
+    security_mode: zpi.security.Mode = .compatibility,
+    audit_log: ?[]const u8 = null,
+    allow_capabilities: std.ArrayList(zpi.security.Capability) = .empty,
+    request_capabilities: std.ArrayList(zpi.security.Capability) = .empty,
+    session_capabilities: std.ArrayList(zpi.security.Capability) = .empty,
+    security_policy_file: ?[]const u8 = null,
+    enable_project_context: bool = false,
+    no_context_files: bool = false,
+    doctor_subcommand: bool = false,
+    verbose: bool = false,
     fullscreen: bool = true,
     print_version: bool = false,
     print_help: bool = false,
@@ -50,6 +60,10 @@ pub const ParseError = error{ UnknownOption, MissingValue, InvalidMode, Conflict
 
 pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_tty: bool, stdout_is_tty: bool) !Options {
     var result: Options = .{};
+    if (args.len > 0 and std.mem.eql(u8, args[0], "doctor")) {
+        result.doctor_subcommand = true;
+        return result;
+    }
     errdefer result.prompt.deinit(allocator);
     errdefer result.extensions.deinit(allocator);
     errdefer result.native_plugins.deinit(allocator);
@@ -59,6 +73,9 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
     errdefer result.skills.deinit(allocator);
     errdefer result.prompt_templates.deinit(allocator);
     errdefer result.mcp_servers.deinit(allocator);
+    errdefer result.allow_capabilities.deinit(allocator);
+    errdefer result.request_capabilities.deinit(allocator);
+    errdefer result.session_capabilities.deinit(allocator);
     var selected_mode: ?OutputMode = null;
     var positional_only = false;
     var i: usize = 0;
@@ -91,6 +108,10 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
             try result.include_files.append(allocator, arg[1..]);
             continue;
         }
+        if (!positional_only and std.mem.eql(u8, arg, "--verbose")) {
+            result.verbose = true;
+            continue;
+        }
         if (!positional_only and (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h"))) {
             result.print_help = true;
             continue;
@@ -112,6 +133,51 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
         }
         if (!positional_only and std.mem.eql(u8, arg, "--allow-loopback-web-fetch")) {
             result.allow_loopback_web_fetch = true;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--security") or std.mem.startsWith(u8, arg, "--security="))) {
+            const value = if (std.mem.eql(u8, arg, "--security")) try takeValue(args, &i) else arg[11..];
+            if (std.mem.eql(u8, value, "secure")) result.security_mode = .secure else if (std.mem.eql(u8, value, "compatibility")) result.security_mode = .compatibility else return error.InvalidSecurityMode;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--allow-capability") or std.mem.startsWith(u8, arg, "--allow-capability="))) {
+            const value = if (std.mem.eql(u8, arg, "--allow-capability")) try takeValue(args, &i) else arg[19..];
+            const capability = zpi.security.Capability.parse(value) orelse return error.InvalidCapability;
+            try result.allow_capabilities.append(allocator, capability);
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--security-policy") or std.mem.startsWith(u8, arg, "--security-policy="))) {
+            const value = if (std.mem.eql(u8, arg, "--security-policy")) try takeValue(args, &i) else arg[17..];
+            if (value.len == 0) return error.InvalidSecurityPolicy;
+            result.security_policy_file = value;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--allow-capability-once") or std.mem.startsWith(u8, arg, "--allow-capability-once="))) {
+            const prefix = "--allow-capability-once=";
+            const value = if (std.mem.eql(u8, arg, "--allow-capability-once")) try takeValue(args, &i) else arg[prefix.len..];
+            const capability = zpi.security.Capability.parse(value) orelse return error.InvalidCapability;
+            try result.request_capabilities.append(allocator, capability);
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--allow-capability-session") or std.mem.startsWith(u8, arg, "--allow-capability-session="))) {
+            const prefix = "--allow-capability-session=";
+            const value = if (std.mem.eql(u8, arg, "--allow-capability-session")) try takeValue(args, &i) else arg[prefix.len..];
+            const capability = zpi.security.Capability.parse(value) orelse return error.InvalidCapability;
+            try result.session_capabilities.append(allocator, capability);
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--audit-log") or std.mem.startsWith(u8, arg, "--audit-log="))) {
+            const value = if (std.mem.eql(u8, arg, "--audit-log")) try takeValue(args, &i) else arg[12..];
+            if (value.len == 0) return error.InvalidAuditPath;
+            result.audit_log = value;
+            continue;
+        }
+        if (!positional_only and std.mem.eql(u8, arg, "--enable-project-context")) {
+            result.enable_project_context = true;
+            continue;
+        }
+        if (!positional_only and std.mem.eql(u8, arg, "--no-context-files")) {
+            result.no_context_files = true;
             continue;
         }
         if (!positional_only and (std.mem.eql(u8, arg, "--no-tools") or std.mem.eql(u8, arg, "-nt"))) {
@@ -280,6 +346,35 @@ fn takeValue(args: []const [:0]const u8, index: *usize) ParseError![]const u8 {
     if (index.* + 1 >= args.len) return error.MissingValue;
     index.* += 1;
     return args[index.*];
+}
+
+test "security options are explicit and reject unknown capability ids" {
+    const a = std.testing.allocator;
+    var options = try parse(a, &.{
+        "--security",                                 "secure",
+        "--audit-log",                                "audit.jsonl",
+        "--security-policy",                          "policy.json",
+        "--allow-capability",                         "filesystem.write",
+        "--allow-capability-once",                    "process.exec",
+        "--allow-capability-session=clipboard.write", "prompt",
+    }, false, false);
+    defer options.prompt.deinit(a);
+    defer options.allow_capabilities.deinit(a);
+    defer options.request_capabilities.deinit(a);
+    defer options.session_capabilities.deinit(a);
+    try std.testing.expectEqual(zpi.security.Mode.secure, options.security_mode);
+    try std.testing.expectEqualStrings("audit.jsonl", options.audit_log.?);
+    try std.testing.expectEqualStrings("policy.json", options.security_policy_file.?);
+    try std.testing.expectEqual(@as(usize, 1), options.allow_capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 1), options.request_capabilities.items.len);
+    try std.testing.expectEqual(@as(usize, 1), options.session_capabilities.items.len);
+    try std.testing.expectError(error.InvalidCapability, parse(a, &.{"--allow-capability-once=unknown"}, false, false));
+    const doctor = try parse(a, &.{"doctor"}, false, false);
+    try std.testing.expect(doctor.doctor_subcommand);
+    var prompt = try parse(a, &.{ "-p", "doctor" }, false, false);
+    defer prompt.prompt.deinit(a);
+    try std.testing.expect(!prompt.doctor_subcommand);
+    try std.testing.expectEqualStrings("doctor", prompt.prompt.items[0]);
 }
 
 test "prompt template flags keep explicit paths with default discovery disabled" {

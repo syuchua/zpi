@@ -68,7 +68,7 @@ pub fn combine(a: std.mem.Allocator, client: *mcp.Client, server: []const u8, de
         for (result.items) |existing| if (std.mem.eql(u8, existing.definition.name, function_name_owned)) return error.McpToolNameCollision;
         const entry = try a.create(Entry);
         entry.* = .{ .client = client, .remote_name = try a.dupe(u8, name_value.string) };
-        try result.append(a, .{ .context = entry, .execute = Entry.execute, .definition = .{
+        try result.append(a, .{ .context = entry, .execute = Entry.execute, .capability = .mcp_start, .source = .mcp, .definition = .{
             .name = function_name_owned,
             .description = if (description_value == .string) try a.dupe(u8, description_value.string) else "MCP tool",
             .parameters = try agent.cloneValue(a, schema, 0),
@@ -90,6 +90,17 @@ test "MCP adapter rejects normalized name collisions and paginated listings" {
         \\{"tools":[{"name":"echo-text","inputSchema":{"type":"object"}},{"name":"echo_text","inputSchema":{"type":"object"}}]}
     , .{});
     try std.testing.expectError(error.McpToolNameCollision, combine(a, &client, "demo", &.{}, collision));
+    const listing = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"tools\":[{\"name\":\"echo\",\"inputSchema\":{\"type\":\"object\"}}]}", .{});
+    const tools = try combine(a, &client, "demo", &.{}, listing);
+    try std.testing.expectEqual(agent.security.Capability.mcp_start, tools[0].capability.?);
+    try std.testing.expectEqual(agent.security.Source.mcp, tools[0].source);
+    try std.testing.expectEqualStrings("mcp__demo__echo", tools[0].definition.name);
+    const decision = agent.security.evaluate(.{ .mode = .secure, .grants = &.{.{ .capability = .mcp_start }} }, .{
+        .capability = tools[0].capability.?,
+        .source = tools[0].source,
+        .target = .{ .kind = .server },
+    });
+    try std.testing.expect(decision.allowed());
     const page = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"tools\":[],\"nextCursor\":\"more\"}", .{});
     try std.testing.expectError(error.UnsupportedMcpPagination, combine(a, &client, "demo", &.{}, page));
     try std.testing.expectError(error.InvalidMcpTools, combine(a, &client, "demo", &.{}, .null));

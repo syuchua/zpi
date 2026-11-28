@@ -135,19 +135,30 @@ const Server = struct {
         const busy = self.busy;
         self.mutex.unlock(self.h.io);
         if (busy) return self.failure(req, "Agent is busy");
+        const authorization = self.h.authorize(.rpc_control, .rpc, .request, null) catch |err| return self.failure(req, @errorName(err));
+        if (!authorization.result.allowed()) return self.failure(req, "CapabilityDenied");
         try self.waitForWorker();
         self.interrupt.reset();
 
         var scratch = std.heap.ArenaAllocator.init(self.h.gpa);
         defer scratch.deinit();
-        const effective = (self.h.preparePrompt(scratch.allocator(), message.string, "rpc") catch |err|
-            return self.failure(req, @errorName(err))) orelse return self.response(req, .{ .disposition = "handled" });
-        const owned = try self.h.gpa.dupe(u8, effective);
+        const effective = self.h.preparePrompt(scratch.allocator(), message.string, "rpc") catch |err| {
+            try self.h.auditOutcome(.unknown, authorization);
+            return self.failure(req, @errorName(err));
+        } orelse {
+            try self.h.auditOutcome(.allowed, authorization);
+            return self.response(req, .{ .disposition = "handled" });
+        };
+        const owned = self.h.gpa.dupe(u8, effective) catch |err| {
+            try self.h.auditOutcome(.unknown, authorization);
+            return err;
+        };
 
         self.mutex.lockUncancelable(self.h.io);
         defer self.mutex.unlock(self.h.io);
-        self.worker = std.Thread.spawn(.{}, runPrompt, .{ self, owned }) catch |err| {
+        self.worker = std.Thread.spawn(.{}, runPrompt, .{ self, owned, authorization }) catch |err| {
             self.h.gpa.free(owned);
+            try self.h.auditOutcome(.unknown, authorization);
             return self.writeFailureLocked(req, @errorName(err));
         };
         self.busy = true;
@@ -159,15 +170,27 @@ const Server = struct {
         };
     }
 
-    fn runPrompt(self: *Server, text: []u8) void {
+    fn runPrompt(self: *Server, text: []u8, authorization: zpi.security.Authorization) void {
         defer self.h.gpa.free(text);
         self.mutex.lockUncancelable(self.h.io);
         self.mutex.unlock(self.h.io);
 
-        const result = if (self.interrupt.isCanceled()) error.Canceled else self.h.submitPrepared(text);
+        const canceled_before_start = self.interrupt.isCanceled();
+        const result = if (canceled_before_start) error.Canceled else self.h.submitPrepared(text);
+        const outcome: zpi.security.Outcome = if (result) |_|
+            .allowed
+        else |err| switch (err) {
+            error.Canceled => if (canceled_before_start) .cancelled else .unknown,
+            else => .failed,
+        };
+        const audit_result = self.h.auditOutcome(outcome, authorization);
         self.mutex.lockUncancelable(self.h.io);
         defer self.mutex.unlock(self.h.io);
         self.busy = false;
+        audit_result catch |err| {
+            self.worker_error = err;
+            self.writeLocked(.{ .type = "error", .error_code = @errorName(err) }) catch {};
+        };
         if (result) |_| {
             self.writeLocked(.{ .type = "agent_settled", .aborted = false }) catch |err| {
                 self.worker_error = err;

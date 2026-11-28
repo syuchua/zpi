@@ -79,7 +79,8 @@ const BashContext = struct {
 
 fn definition(a: std.mem.Allocator, name: []const u8, description: []const u8, schema: []const u8, context: ?*anyopaque, execute: @FieldType(agent.Tool, "execute")) !agent.Tool {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, schema, .{});
-    return .{ .definition = .{ .name = name, .description = description, .parameters = parsed.value }, .context = context, .execute = execute, .builtin = true };
+    const capability: @import("agent").security.Capability = if (std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "grep") or std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "ls") or std.mem.eql(u8, name, "get_content")) .filesystem_read else if (std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "edit")) .filesystem_write else if (std.mem.eql(u8, name, "bash") or std.mem.startsWith(u8, name, "bg_")) .process_exec else if (std.mem.eql(u8, name, "web_fetch")) .network_connect else .process_exec;
+    return .{ .definition = .{ .name = name, .description = description, .parameters = parsed.value }, .capability = capability, .context = context, .execute = execute, .builtin = true };
 }
 fn string(args: std.json.Value, key: []const u8) ![]const u8 {
     if (args != .object) return error.ExpectedObject;

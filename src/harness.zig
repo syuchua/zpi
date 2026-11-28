@@ -22,6 +22,14 @@ pub const Template = prompt_templates.Template;
 pub const SessionCandidate = recent_session.SessionCandidate;
 pub const freeSessionList = recent_session.freeList;
 
+pub fn diagnosticModel(a: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, cwd: []const u8, overrides: config.Overrides) !Selection {
+    const settings = try settings_mod.load(a, io, cwd, environ);
+    var effective = overrides;
+    effective.default_provider = settings.default_provider;
+    effective.default_model = settings.default_model;
+    return config.load(a, io, environ, effective);
+}
+
 pub const McpServer = struct {
     name: []const u8,
     argv: []const [:0]const u8,
@@ -61,6 +69,12 @@ pub const Options = struct {
     no_tools: bool = false,
     allow_loopback_web_fetch: bool = false,
     cancel_token: ?zpi.model.Cancel = null,
+    security_mode: zpi.security.Mode = .compatibility,
+    allow_capabilities: []const zpi.security.Capability = &.{},
+    request_capabilities: []const zpi.security.Capability = &.{},
+    session_capabilities: []const zpi.security.Capability = &.{},
+    security_policy_file: ?[]const u8 = null,
+    audit_log: ?[]const u8 = null,
 };
 
 pub const Event = union(enum) {
@@ -248,6 +262,11 @@ pub const Harness = struct {
     steering_mutex: std.Io.Mutex = .init,
     steering_queue: std.ArrayList([]u8) = .empty,
     bg_wake_interrupt: zpi.model.Interrupt,
+    security_policy: zpi.security.Policy,
+    grants: []zpi.security.Grant,
+    request_grants: []bool,
+    authorization_mutex: std.Io.Mutex = .init,
+    audit_sink: zpi.audit.Sink,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -298,10 +317,59 @@ pub const Harness = struct {
             .runtime = undefined,
             .sink = sink,
             .bg_wake_interrupt = bg_wake,
+            .security_policy = undefined,
+            .grants = &.{},
+            .request_grants = &.{},
+            .audit_sink = undefined,
         };
         var arena_active = true;
         errdefer if (arena_active) self.arena.deinit();
         const a = self.arena.allocator();
+        if (options.security_mode == .secure and options.audit_log == null) return error.SecureModeRequiresAuditLog;
+        if (options.security_policy_file != null and options.security_mode != .secure) return error.PersistentPolicyRequiresSecureMode;
+        if (options.request_capabilities.len > 0 and options.audit_log == null) return error.RequestGrantRequiresAuditLog;
+        self.audit_sink = try zpi.audit.Sink.init(gpa, io, options.audit_log);
+        errdefer self.audit_sink.deinit();
+        const file_grants = if (options.security_policy_file) |path| blk: {
+            if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null or !std.unicode.utf8ValidateSlice(path)) return error.InvalidSecurityPolicy;
+            const absolute = try std.fs.path.resolveAlloc(a, &.{ options.host_cwd, path });
+            const fd = try std.posix.openat(std.Io.Dir.cwd().handle, absolute, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true, .NONBLOCK = true }, 0);
+            const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = true } };
+            defer file.close(io);
+            const stat = try file.stat(io);
+            if (!zpi.audit.isPrivateFile(file, stat)) return error.InsecureSecurityPolicyPermissions;
+            if (stat.size > zpi.security.max_policy_bytes) return error.SecurityPolicyTooLarge;
+            const bytes = try a.alloc(u8, @intCast(stat.size));
+            defer a.free(bytes);
+            if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.SecurityPolicyChanged;
+            const after = try file.stat(io);
+            if (!zpi.audit.isPrivateFile(file, after) or after.size != stat.size or after.nlink != stat.nlink or after.permissions.toMode() != stat.permissions.toMode() or after.mtime.nanoseconds != stat.mtime.nanoseconds or after.ctime.nanoseconds != stat.ctime.nanoseconds) return error.SecurityPolicyChanged;
+            break :blk try zpi.security.parsePolicy(a, bytes);
+        } else try a.alloc(zpi.security.Grant, 0);
+        const grant_count = file_grants.len + options.allow_capabilities.len + options.session_capabilities.len + options.request_capabilities.len;
+        const grants = try a.alloc(zpi.security.Grant, grant_count);
+        @memcpy(grants[0..file_grants.len], file_grants);
+        var grant_index = file_grants.len;
+        for (options.allow_capabilities) |capability| {
+            grants[grant_index] = .{ .capability = capability, .scope = .invocation };
+            grant_index += 1;
+        }
+        for (options.session_capabilities) |capability| {
+            grants[grant_index] = .{ .capability = capability, .scope = .session };
+            grant_index += 1;
+        }
+        for (options.request_capabilities) |capability| {
+            grants[grant_index] = .{ .capability = capability, .scope = .request };
+            grant_index += 1;
+        }
+        self.grants = grants;
+        self.request_grants = try a.alloc(bool, grants.len);
+        @memset(self.request_grants, false);
+        self.security_policy = .{
+            .mode = options.security_mode,
+            .grants = grants,
+            .active_scopes = .{ .request = true, .invocation = true, .session = true, .persistent = options.security_policy_file != null },
+        };
 
         const host_cwd = try a.dupe(u8, options.host_cwd);
         const home = if (environ.get("HOME")) |h| try a.dupe(u8, h) else null;
@@ -475,8 +543,14 @@ pub const Harness = struct {
         const plugin_names = try a.alloc([]const u8, options.native_plugins.len);
         for (options.native_plugins, plugin_names, self.native_modules) |path, *pname, *module| {
             const absolute = try std.fs.path.resolveAlloc(a, &.{ host_cwd, path });
-            module.* = try zpi.native_runtime.Module.open(absolute);
+            const authorization = try self.authorize(.native_plugin_load, .native_plugin, .plugin, null);
+            if (!authorization.result.allowed()) return error.CapabilityDenied;
+            module.* = zpi.native_runtime.Module.open(absolute) catch |err| {
+                try self.auditOutcome(.unknown, authorization);
+                return err;
+            };
             self.native_loaded += 1;
+            try self.auditOutcome(.allowed, authorization);
             pname.* = std.fs.path.basename(path);
             registered_tools = try zpi.native_tools.combine(a, module, registered_tools);
         }
@@ -505,12 +579,25 @@ pub const Harness = struct {
         const mcp_names = try a.alloc([]const u8, options.mcp_servers.len);
         for (options.mcp_servers, mcp_names, self.mcp_clients) |server, *mname, *client| {
             mname.* = try a.dupe(u8, server.name);
+            const server_auth = try self.authorize(.mcp_start, .mcp, .server, null);
+            if (!server_auth.result.allowed()) return error.CapabilityDenied;
+            const process_auth = try self.authorize(.process_exec, .mcp, .command, server_auth.event_id);
+            if (!process_auth.result.allowed()) return error.CapabilityDenied;
             const command = try a.alloc([]const u8, server.argv.len);
             for (server.argv, command) |arg, *value| value.* = arg;
-            client.* = try zpi.mcp.Client.start(gpa, io, .{ .argv = command, .cwd = cwd });
+            client.* = zpi.mcp.Client.start(gpa, io, .{ .argv = command, .cwd = cwd }) catch |err| {
+                try self.auditOutcome(.failed, process_auth);
+                try self.auditOutcome(.failed, server_auth);
+                return err;
+            };
             client.cancel = options.cancel_token;
             self.mcp_started += 1;
-            try client.initialize();
+            try self.auditOutcome(.allowed, process_auth);
+            client.initialize() catch |err| {
+                try self.auditOutcome(.unknown, server_auth);
+                return err;
+            };
+            try self.auditOutcome(.allowed, server_auth);
             if (client.supportsTools()) {
                 const listing = try client.listTools();
                 defer listing.deinit();
@@ -519,6 +606,10 @@ pub const Harness = struct {
         }
         self.mcp_server_names = mcp_names;
 
+        errdefer if (self.extension_host) |*host| {
+            host.shutdown() catch {};
+            host.deinit();
+        };
         if (options.extensions.len > 0) {
             const ext_names = try a.alloc([]const u8, options.extensions.len);
             for (options.extensions, ext_names) |epath, *ename| ename.* = std.fs.path.basename(epath);
@@ -534,20 +625,29 @@ pub const Harness = struct {
             for (options.extensions, paths) |path, *resolved| {
                 resolved.* = try std.fs.path.resolveAlloc(a, &.{ host_cwd, path });
             }
-            self.extension_host = try zpi.extensions.Host.start(gpa, io, .{
+            const extension_auth = try self.authorize(.extension_load, .typescript, .plugin, null);
+            if (!extension_auth.result.allowed()) return error.CapabilityDenied;
+            const process_auth = try self.authorize(.process_exec, .typescript, .command, extension_auth.event_id);
+            if (!process_auth.result.allowed()) return error.CapabilityDenied;
+            self.extension_host = zpi.extensions.Host.start(gpa, io, .{
                 .host_script = script,
                 .sdk_directory = sdk_directory,
                 .cwd = cwd,
-            });
+            }) catch |err| {
+                try self.auditOutcome(.failed, process_auth);
+                try self.auditOutcome(.failed, extension_auth);
+                return err;
+            };
             self.extension_host.?.cancel = options.cancel_token;
-            var ready = try self.extension_host.?.load(paths);
+            try self.auditOutcome(.allowed, process_auth);
+            var ready = self.extension_host.?.load(paths) catch |err| {
+                try self.auditOutcome(.unknown, extension_auth);
+                return err;
+            };
             defer ready.deinit();
+            try self.auditOutcome(.allowed, extension_auth);
             registered_tools = try zpi.extension_tools.combine(a, &self.extension_host.?, ready.value(), registered_tools);
         }
-        errdefer if (self.extension_host) |*host| {
-            host.shutdown() catch {};
-            host.deinit();
-        };
 
         const candidates = try a.alloc(tool_selection.Candidate, registered_tools.len);
         for (registered_tools, candidates) |tool, *candidate| {
@@ -564,6 +664,7 @@ pub const Harness = struct {
         for (selected, self.enabled_tools) |index, *tool| tool.* = registered_tools[index];
 
         self.runtime = agent.Agent.init(gpa, io, self.provider, self.enabled_tools, cwd);
+        self.configureSecurity(&self.runtime);
         self.runtime.cancel = options.cancel_token;
         self.runtime.retry = self.settings.retry;
         self.runtime.compaction_hook = .{
@@ -608,6 +709,7 @@ pub const Harness = struct {
             host.shutdown() catch {};
             host.deinit();
         }
+        self.audit_sink.deinit();
         for (self.native_modules[0..self.native_loaded]) |*module| {
             module.close() catch {
                 self.retained_native_warning = true;
@@ -795,7 +897,10 @@ pub const Harness = struct {
 
     pub fn newSession(self: *Harness) !StatusSummary {
         if (self.runtime.running) return error.AgentBusy;
-        if (self.store.pending_create and self.store.entries.items.len == 0) return self.statusSummary();
+        if (self.store.pending_create and self.store.entries.items.len == 0) {
+            self.expireSessionGrants();
+            return self.statusSummary();
+        }
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -813,6 +918,7 @@ pub const Harness = struct {
         var staged = agent.Agent.init(self.gpa, self.io, self.provider, self.enabled_tools, self.cwd);
         staged.timing = self.runtime.timing;
         errdefer staged.deinit();
+        self.configureSecurity(&staged);
         staged.cancel = self.runtime.cancel;
         staged.retry = self.runtime.retry;
         staged.compaction_hook = self.runtime.compaction_hook;
@@ -829,6 +935,7 @@ pub const Harness = struct {
         self.store.deinit();
         self.store = next;
         self.runtime = staged;
+        self.expireSessionGrants();
         self.steering_mutex.lockUncancelable(self.io);
         for (self.steering_queue.items) |item| self.gpa.free(item);
         self.steering_queue.clearRetainingCapacity();
@@ -871,6 +978,7 @@ pub const Harness = struct {
         var staged = agent.Agent.init(self.gpa, self.io, self.provider, self.enabled_tools, self.runtime.cwd);
         staged.timing = self.runtime.timing;
         errdefer if (!installed) staged.deinit();
+        self.configureSecurity(&staged);
         staged.cancel = self.runtime.cancel;
         staged.retry = self.runtime.retry;
         staged.compaction_hook = self.runtime.compaction_hook;
@@ -887,6 +995,7 @@ pub const Harness = struct {
         self.store.deinit();
         self.store = next_store;
         self.runtime = staged;
+        self.expireSessionGrants();
         installed = true;
         try self.runtime.reconcile(.{ .context = self, .emit = agentEmitErased });
         return self.statusSummary();
@@ -1092,6 +1201,7 @@ pub const Harness = struct {
         };
         var child = agent.Agent.init(ctx.allocator, ctx.io, provider, enabled.items, ctx.cwd);
         defer child.deinit();
+        self.configureSecurity(&child);
         child.cancel = ctx.cancel;
         child.retry = self.runtime.retry;
         child.max_turns = request.max_turns;
@@ -1109,22 +1219,118 @@ pub const Harness = struct {
         return ctx.allocator.dupe(u8, text.items);
     }
 
-    /// Run a user-requested shell command through Zpi's bounded shell tool.
-    /// The result is borrowed from the supplied allocator for the caller's turn.
+    fn configureSecurity(self: *Harness, runtime: *agent.Agent) void {
+        if (self.security_policy.mode == .compatibility and !self.audit_sink.enabled() and self.security_policy.grants.len == 0) return;
+        runtime.security_context = self;
+        runtime.authorize_tool = authorizeToolErased;
+        runtime.audit_tool_outcome = auditToolOutcomeErased;
+    }
+
+    fn authorizeToolErased(context: ?*anyopaque, tool: agent.Tool, authorization: *?zpi.security.Authorization) anyerror!void {
+        const self: *Harness = @ptrCast(@alignCast(context.?));
+        const capability = tool.capability orelse return error.UnclassifiedTool;
+        const target: zpi.security.TargetKind = switch (capability) {
+            .filesystem_read, .filesystem_write => .path,
+            .process_exec => .command,
+            .network_connect => .url,
+            .mcp_start => .server,
+            .extension_load, .native_plugin_load => .plugin,
+            else => .tool,
+        };
+        authorization.* = try self.authorize(capability, tool.source, target, null);
+        if (!authorization.*.?.result.allowed()) return error.CapabilityDenied;
+    }
+
+    fn expireSessionGrants(self: *Harness) void {
+        self.authorization_mutex.lockUncancelable(self.io);
+        defer self.authorization_mutex.unlock(self.io);
+        self.security_policy.active_scopes.session = false;
+    }
+
+    fn auditToolOutcomeErased(context: ?*anyopaque, tool: agent.Tool, authorization: ?zpi.security.Authorization, outcome: zpi.security.Outcome) anyerror!void {
+        const self: *Harness = @ptrCast(@alignCast(context.?));
+        _ = tool.capability orelse return error.UnclassifiedTool;
+        try self.auditOutcome(outcome, authorization orelse return);
+    }
+
+    pub const Authorization = zpi.security.Authorization;
+
+    pub fn authorize(self: *Harness, capability: zpi.security.Capability, source: zpi.security.Source, target: zpi.security.TargetKind, parent_id: ?u64) !Authorization {
+        self.authorization_mutex.lockUncancelable(self.io);
+        defer self.authorization_mutex.unlock(self.io);
+        const request: zpi.security.Request = .{ .capability = capability, .source = source, .target = .{ .kind = target } };
+        const policy = zpi.security.Policy{ .mode = self.security_policy.mode, .grants = self.grants, .active_scopes = self.security_policy.active_scopes, .consumed_request_grants = self.request_grants };
+        const result = zpi.security.evaluate(policy, request);
+        if (result.decision == .invalid) return error.InvalidSecurityPolicy;
+        const event_id = try self.audit_sink.append(.{
+            .event = .authorization,
+            .parent_id = parent_id,
+            .source = source,
+            .capability = capability,
+            .target_kind = target,
+            .mode = self.security_policy.mode,
+            .decision = result.decision,
+            .outcome = if (result.allowed()) .allowed else .denied,
+            .policy_source = result.policy_source,
+            .reason = result.reason,
+        });
+        if (result.consume) |index| {
+            if (event_id == null) return error.RequestGrantRequiresAuditLog;
+            self.request_grants[index] = true;
+        }
+        return .{ .request = request, .result = result, .event_id = event_id };
+    }
+
+    pub fn auditOutcome(self: *Harness, outcome: zpi.security.Outcome, authorization: Authorization) !void {
+        if (authorization.event_id == null) return;
+        _ = try self.audit_sink.append(.{
+            .event = .operation,
+            .parent_id = authorization.event_id,
+            .source = authorization.request.source,
+            .capability = authorization.request.capability,
+            .target_kind = authorization.request.target.kind,
+            .mode = self.security_policy.mode,
+            .decision = authorization.result.decision,
+            .outcome = outcome,
+            .policy_source = authorization.result.policy_source,
+            .reason = zpi.security.reasonForOutcome(outcome),
+        });
+    }
+
+    pub fn authorizeClipboard(self: *Harness) !Authorization {
+        return self.authorize(.clipboard_write, .system, .request, null);
+    }
+
     pub fn executeUserShell(self: *Harness, allocator: std.mem.Allocator, command: []const u8, cancel: ?zpi.model.Cancel) !agent.ToolResult {
         if (command.len == 0 or command.len > 16 * 1024) return error.InvalidCommand;
+        const authorization = try self.authorize(.process_exec, .system, .command, null);
+        if (!authorization.result.allowed()) return error.CapabilityDenied;
         const tool = for (self.tool_set.tools) |candidate| {
             if (std.mem.eql(u8, candidate.definition.name, "bash")) break candidate;
-        } else return error.ShellUnavailable;
+        } else {
+            try self.auditOutcome(.failed, authorization);
+            return error.ShellUnavailable;
+        };
         var arguments: std.json.ObjectMap = .empty;
         defer arguments.deinit(allocator);
         try arguments.put(allocator, "command", .{ .string = command });
-        return tool.execute(tool.context, .{
+        const result = tool.execute(tool.context, .{
             .allocator = allocator,
             .io = self.io,
             .cwd = self.cwd,
             .cancel = cancel,
-        }, .{ .object = arguments });
+        }, .{ .object = arguments }) catch |err| {
+            const outcome: zpi.security.Outcome = if (err == error.Canceled)
+                if (cancel) |token| (if (token.isCanceled()) .cancelled else .unknown) else .unknown
+            else if (err == error.Timeout)
+                .unknown
+            else
+                .failed;
+            try self.auditOutcome(outcome, authorization);
+            return err;
+        };
+        try self.auditOutcome(if (result.is_error) .failed else .allowed, authorization);
+        return result;
     }
 
     /// The interactive editor records local output between turns. Both stores
@@ -1579,6 +1785,8 @@ test "harness lists and resumes sessions in session_dir without mutating state o
     const dir = try std.fs.path.resolveAlloc(a, &.{ host, ".zig-cache", "tmp", &tmp.sub_path });
     defer a.free(dir);
 
+    const audit_path = try std.fs.path.join(a, &.{ dir, "audit.jsonl" });
+    defer a.free(audit_path);
     const s1_path = try std.fs.path.join(a, &.{ dir, "s1.jsonl" });
     defer a.free(s1_path);
     const s2_path = try std.fs.path.join(a, &.{ dir, "s2.jsonl" });
@@ -1604,6 +1812,11 @@ test "harness lists and resumes sessions in session_dir without mutating state o
         .host_cwd = dir,
         .session = s1_path,
         .session_dir = dir,
+        .security_mode = .secure,
+        .audit_log = audit_path,
+        .allow_capabilities = &.{.process_exec},
+        .request_capabilities = &.{.filesystem_write},
+        .session_capabilities = &.{.clipboard_write},
         .no_tools = true,
         .no_skills = true,
         .no_prompt_templates = true,
@@ -1614,6 +1827,19 @@ test "harness lists and resumes sessions in session_dir without mutating state o
     defer recent_session.freeList(a, listed);
     try std.testing.expectEqual(@as(usize, 2), listed.len);
 
+    const initial_grant = try h.authorizeClipboard();
+    try std.testing.expectEqual(zpi.security.PolicySource.session, initial_grant.result.policy_source);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    h.audit_sink.allocator = failing.allocator();
+    const failed_authorization = h.authorize(.filesystem_write, .builtin_tool, .path, null);
+    h.audit_sink.allocator = a;
+    try std.testing.expectError(error.OutOfMemory, failed_authorization);
+    const once = try h.authorize(.filesystem_write, .builtin_tool, .path, null);
+    try std.testing.expect(once.result.allowed());
+    try std.testing.expectEqual(zpi.security.PolicySource.request, once.result.policy_source);
+    try std.testing.expectEqual(@as(?u64, 2), once.event_id);
+    try std.testing.expect(!(try h.authorize(.filesystem_write, .builtin_tool, .path, null)).result.allowed());
+    try std.testing.expect(initial_grant.result.allowed());
     // Resuming an already-active session succeeds without hitting self-lock.
     _ = try h.resumeSession(s1_path);
     try std.testing.expectEqual(@as(usize, 2), (try h.sessionStats()).total_messages);
@@ -1622,11 +1848,86 @@ test "harness lists and resumes sessions in session_dir without mutating state o
     try std.testing.expectError(error.FileNotFound, h.resumeSession("missing.jsonl"));
     try std.testing.expectEqualStrings(s1_path, (try h.sessionStats()).file_path.?);
 
-    // Resuming s2 switches store and runtime cleanly.
+    try std.testing.expect((try h.authorizeClipboard()).result.allowed());
+
+    // Resuming s2 switches store and runtime cleanly and expires session grants.
     _ = try h.resumeSession(s2_path);
     const stats2 = try h.sessionStats();
     try std.testing.expectEqualStrings(s2_path, stats2.file_path.?);
     try std.testing.expectEqual(@as(usize, 1), stats2.total_messages);
+    const expired_grant = try h.authorizeClipboard();
+    try std.testing.expect(!expired_grant.result.allowed());
+    // Record a terminal result after the scope that authorized it has expired.
+    try h.auditOutcome(.allowed, initial_grant);
+    const invocation_grant = try h.authorize(.process_exec, .system, .command, null);
+    try std.testing.expect(invocation_grant.result.allowed());
+    try std.testing.expectEqual(zpi.security.PolicySource.invocation, invocation_grant.result.policy_source);
+
+    const canceled_path = try std.fs.path.join(a, &.{ dir, "canceled-shell-effect" });
+    defer a.free(canceled_path);
+    const canceled_command = try std.fmt.allocPrint(a, "touch '{s}'", .{canceled_path});
+    defer a.free(canceled_command);
+    var interrupt = try zpi.model.Interrupt.init();
+    defer interrupt.deinit(io);
+    interrupt.trigger();
+    try std.testing.expectError(error.Canceled, h.executeUserShell(a, canceled_command, interrupt.cancel()));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, canceled_path, .{}));
+
+    h.grants[0].effect = .deny;
+    const denied_path = try std.fs.path.join(a, &.{ dir, "denied-shell-effect" });
+    defer a.free(denied_path);
+    const denied_command = try std.fmt.allocPrint(a, "touch '{s}'", .{denied_path});
+    defer a.free(denied_command);
+    try std.testing.expectError(error.CapabilityDenied, h.executeUserShell(a, denied_command, null));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, denied_path, .{}));
+    h.grants[0].effect = .allow;
+
+    const failed = try h.executeUserShell(a, "exit 7", null);
+    defer a.free(failed.text);
+    try std.testing.expect(failed.is_error);
+    const succeeded = try h.executeUserShell(a, "true", null);
+    defer a.free(succeeded.text);
+    try std.testing.expect(!succeeded.is_error);
+
+    const security_audit = try std.Io.Dir.cwd().readFileAlloc(io, audit_path, a, .limited(64 * 1024));
+    defer a.free(security_audit);
+    const audit_run_id = try std.fmt.allocPrint(a, "{x}", .{&h.audit_sink.run_id});
+    defer a.free(audit_run_id);
+    const initial_event_number: i64 = @intCast(initial_grant.event_id.?);
+    const denied_event_number: i64 = @intCast(expired_grant.event_id.?);
+    var audit_lines = std.mem.splitScalar(u8, security_audit, '\n');
+    var session_authorization_found = false;
+    var session_operation_found = false;
+    while (audit_lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, line, .{});
+        defer parsed.deinit();
+        const value = parsed.value;
+        const event_id = value.object.get("eventId").?.integer;
+        const parent_id = value.object.get("parentId").?;
+        const event = value.object.get("event").?.string;
+        const run_id = value.object.get("runId").?.string;
+        if (std.mem.eql(u8, run_id, audit_run_id) and std.mem.eql(u8, event, "authorization") and event_id == initial_event_number) {
+            try std.testing.expectEqualStrings("session", value.object.get("policySource").?.string);
+            session_authorization_found = true;
+        } else if (std.mem.eql(u8, run_id, audit_run_id) and std.mem.eql(u8, event, "operation") and parent_id == .integer and parent_id.integer == initial_event_number) {
+            try std.testing.expectEqualStrings("session", value.object.get("policySource").?.string);
+            try std.testing.expectEqualStrings("allowed", value.object.get("outcome").?.string);
+            try std.testing.expectEqualStrings("allow", value.object.get("decision").?.string);
+            try std.testing.expectEqualStrings("clipboard.write", value.object.get("capability").?.string);
+            try std.testing.expect(event_id > denied_event_number);
+            session_operation_found = true;
+        }
+        if (parent_id == .integer) try std.testing.expect(parent_id.integer != denied_event_number);
+    }
+    try std.testing.expect(session_authorization_found);
+    try std.testing.expect(session_operation_found);
+    try std.testing.expect(std.mem.indexOf(u8, security_audit, "\"outcome\":\"cancelled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, security_audit, "\"reason\":\"explicit-deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, security_audit, "\"outcome\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, security_audit, "\"outcome\":\"allowed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, security_audit, canceled_path) == null);
+    try std.testing.expect(std.mem.indexOf(u8, security_audit, denied_path) == null);
 
     // Exiting a fresh Harness without any non-system conversation record must
     // not leave an empty .jsonl file on disk.
@@ -1663,4 +1964,37 @@ test "harness lists and resumes sessions in session_dir without mutating state o
     try std.testing.expectEqual(@as(usize, 1), drained.len);
     try std.testing.expectEqualStrings("second steer", drained[0]);
     try std.testing.expectEqual(@as(usize, 0), h.steeringCount());
+}
+
+test "new session revokes its grants without restoring consumed grants" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const audit_path = try std.fs.path.join(a, &.{ dir, "audit.jsonl" });
+    defer a.free(audit_path);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+
+    const h = try Harness.create(a, io, &env, .{
+        .host_cwd = dir,
+        .session_dir = dir,
+        .security_mode = .secure,
+        .audit_log = audit_path,
+        .request_capabilities = &.{.clipboard_write},
+        .session_capabilities = &.{.process_exec},
+        .allow_capabilities = &.{.filesystem_read},
+        .no_tools = true,
+        .no_skills = true,
+        .no_prompt_templates = true,
+    }, null);
+    defer h.deinit();
+    try std.testing.expect((try h.authorizeClipboard()).result.allowed());
+    try std.testing.expectEqual(zpi.security.PolicySource.session, (try h.authorize(.process_exec, .system, .command, null)).result.policy_source);
+    _ = try h.newSession();
+    try std.testing.expect(!(try h.authorizeClipboard()).result.allowed());
+    try std.testing.expect(!(try h.authorize(.process_exec, .system, .command, null)).result.allowed());
+    try std.testing.expectEqual(zpi.security.PolicySource.invocation, (try h.authorize(.filesystem_read, .builtin_tool, .path, null)).result.policy_source);
 }

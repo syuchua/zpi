@@ -6,6 +6,7 @@ const args_module = @import("cli/args.zig");
 const initial_prompt = @import("cli/initial_prompt.zig");
 const rpc = @import("rpc.zig");
 const pi_session = @import("pi_session");
+const doctor = @import("doctor");
 const tui = if (build_options.enable_tui) @import("tui") else struct {};
 const agent = zpi.agent;
 
@@ -15,7 +16,15 @@ const help =
     \\Usage: zpi [options] [--] [@files...] PROMPT...
     \\       zpi [options] --image PATH    Analyze an image with a text prompt
     \\       zpi [options]                 Interactive full-screen terminal UI
+    \\       zpi doctor                    Offline configuration and runtime checks
     \\       zpi --import-pi-session SOURCE --session DESTINATION
+    \\
+    \\Examples:
+    \\  zpi doctor
+    \\  zpi -p "Summarize README.md"
+    \\  zpi --tools read -p "Review src/main.zig"
+    \\  zpi --mode json --no-session --no-tools "Explain Zig error unions"
+    \\  zpi --continue
     \\
     \\  -p, --print            Print final response and exit
     \\  --tui-mode <mode>      Interactive TUI mode: fullscreen (default) or regular
@@ -55,6 +64,15 @@ const help =
     \\  --pi-sdk DIRECTORY     User-installed pi SDK (1.5.2 or 1.6.0) for extensions
     \\  --extension-host PATH  Override installed ts-host.mjs path
     \\  --native-plugin PATH   Explicit trusted native library (repeatable)
+    \\  --security MODE        Policy: compatibility (default) or secure
+    \\  --allow-capability ID       Grant a capability for this invocation
+    \\  --allow-capability-once ID  Grant once for one authorization check
+    \\  --allow-capability-session ID Grant until /new, resume, or process exit
+    \\  --security-policy PATH      Load private persistent policy JSON in secure mode
+    \\  --audit-log PATH           Append redacted JSONL events (required by secure)
+    \\  --enable-project-context   Load AGENTS.md/CLAUDE.md as inert data
+    \\  --no-context-files         Disable project context loading
+    \\  --verbose                  Include static, redacted error hints
     \\  -h, --help             Show help
     \\  -v, --version          Show version
     \\
@@ -78,10 +96,35 @@ fn handleSigint(_: std.posix.SIG) callconv(.c) void {
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
-        // Error names only: never print configuration, credentials or request bodies.
-        std.debug.print("zpi: {s}\n", .{@errorName(err)});
+        var buffer: [2048]u8 = undefined;
+        var stderr = std.Io.File.stderr().writerStreaming(init.io, &buffer);
+        stderr.interface.print("zpi: {s}\n", .{@errorName(err)}) catch {};
+        var verbose = false;
+        var args = init.minimal.args.iterate();
+        while (args.next()) |arg| if (std.mem.eql(u8, arg, "--verbose")) {
+            verbose = true;
+            break;
+        };
+        if (verbose) {
+            stderr.interface.writeAll("zpi: diagnostics omit paths, credentials, URLs and content\n") catch {};
+            const hint: ?[]const u8 = if (err == error.HttpRequestFailed) "check endpoint connectivity and credential presence; run `zpi doctor`" else if (err == error.ProviderNotConfigured) "configure models.json or set --provider; run `zpi doctor`" else if (err == error.MissingValue) "an option is missing its value; see `zpi --help`" else null;
+            if (hint) |text| stderr.interface.print("zpi: hint: {s}\n", .{text}) catch {};
+        }
+        stderr.interface.flush() catch {};
         std.process.exit(1);
     };
+}
+
+fn runDoctor(init: std.process.Init, a: std.mem.Allocator, options: *const args_module.Options) !void {
+    var buffer: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
+    try doctor.run(init.io, a, init.environ_map, build_options.enable_tui, &stdout.interface, .{
+        .host_cwd = try std.process.currentPathAlloc(init.io, a),
+        .provider = options.provider,
+        .models_file = options.models_file,
+        .pi_sdk = options.pi_sdk,
+    });
+    try stdout.interface.flush();
 }
 
 fn run(init: std.process.Init) !void {
@@ -104,10 +147,14 @@ fn run(init: std.process.Init) !void {
     defer options.skills.deinit(a);
     defer options.prompt_templates.deinit(a);
     defer options.mcp_servers.deinit(a);
+    defer options.allow_capabilities.deinit(a);
+    defer options.request_capabilities.deinit(a);
+    defer options.session_capabilities.deinit(a);
     if (options.print_help) return std.Io.File.stdout().writeStreamingAll(init.io, help);
     if (options.print_version) {
         return std.Io.File.stdout().writeStreamingAll(init.io, "zpi " ++ zpi.VERSION ++ "\n");
     }
+    if (options.doctor_subcommand) return runDoctor(init, a, &options);
     if (options.mode == .interactive and !build_options.enable_tui) return error.TuiDisabled;
 
     const piped_input = if (input_tty or options.mode == .rpc) "" else blk: {
@@ -202,6 +249,12 @@ fn run(init: std.process.Init) !void {
         .no_builtin_tools = options.no_builtin_tools,
         .no_tools = options.no_tools,
         .allow_loopback_web_fetch = options.allow_loopback_web_fetch,
+        .security_mode = options.security_mode,
+        .allow_capabilities = options.allow_capabilities.items,
+        .request_capabilities = options.request_capabilities.items,
+        .session_capabilities = options.session_capabilities.items,
+        .security_policy_file = options.security_policy_file,
+        .audit_log = options.audit_log,
         .cancel_token = cancel_token,
     }, if (options.mode == .rpc) null else .{ .context = &adapter, .emit = CliAdapter.emit });
     defer {
@@ -1469,9 +1522,23 @@ const CliAdapter = struct {
 
     fn copySelectionErased(context: *anyopaque, text: []const u8) anyerror!void {
         const self: *CliAdapter = @ptrCast(@alignCast(context));
+        return self.copySelectionWithRunner(@import("clipboard").spawnRunner, text);
+    }
+
+    fn copySelectionWithRunner(self: *CliAdapter, runner: @import("clipboard").Runner, text: []const u8) anyerror!void {
         const h = self.harness orelse return error.SessionUnavailable;
         const clipboard = @import("clipboard");
-        return clipboard.copy(self.io, h.environ, clipboard.spawnRunner, text, .{}) catch |err| switch (err) {
+        const command = clipboard.systemCommandFromEnv(clipboard.nativePlatform(), clipboard.Env.fromProcess(h.environ)) orelse return error.ClipboardUnavailable;
+        clipboard.validatePayload(text) catch return error.InvalidClipboardPayload;
+        const process_authorization = try h.authorize(.process_exec, .system, .command, null);
+        if (!process_authorization.result.allowed()) return error.CapabilityDenied;
+        const clipboard_authorization = try h.authorize(.clipboard_write, .system, .request, process_authorization.event_id);
+        if (!clipboard_authorization.result.allowed()) return error.CapabilityDenied;
+        const result = clipboard.copyWithRunner(self.io, runner, command, text, .{});
+        const outcome: zpi.security.Outcome = if (result) |_| .allowed else |err| if (err == error.Timeout) .unknown else .failed;
+        try h.auditOutcome(outcome, process_authorization);
+        try h.auditOutcome(outcome, clipboard_authorization);
+        return result catch |err| switch (err) {
             error.Unavailable => error.ClipboardUnavailable,
             error.Failed => error.ClipboardFailed,
             error.Timeout => error.ClipboardTimeout,
@@ -1484,13 +1551,7 @@ const CliAdapter = struct {
         const h = self.harness orelse return error.SessionUnavailable;
         const text = try latestAssistantText(self.allocator, &h.store);
         defer self.allocator.free(text);
-        const clipboard = @import("clipboard");
-        return clipboard.copy(self.io, h.environ, clipboard.spawnRunner, text, .{}) catch |err| switch (err) {
-            error.Unavailable => error.ClipboardUnavailable,
-            error.Failed => error.ClipboardFailed,
-            error.Timeout => error.ClipboardTimeout,
-            error.InvalidPayload => error.InvalidClipboardPayload,
-        };
+        return copySelectionErased(context, text);
     }
 
     fn json(self: *CliAdapter, value: anytype) !void {
@@ -1517,6 +1578,100 @@ fn latestAssistantText(allocator: std.mem.Allocator, store: *const zpi.session.S
         if (text.items.len > 0) return text.toOwnedSlice(allocator);
     }
     return error.NoAssistantReply;
+}
+
+test "clipboard request grant allows one copy and redacts audit records" {
+    const clipboard = @import("clipboard");
+    if (clipboard.nativePlatform() == .other) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const audit_path = try std.fs.path.join(a, &.{ dir, "audit.jsonl" });
+    defer a.free(audit_path);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("WAYLAND_DISPLAY", "zpi-test");
+    const h = try harness.Harness.create(a, io, &env, .{
+        .host_cwd = dir,
+        .no_session = true,
+        .security_mode = .secure,
+        .audit_log = audit_path,
+        .request_capabilities = &.{.clipboard_write},
+        .session_capabilities = &.{.process_exec},
+        .no_tools = true,
+        .no_skills = true,
+        .no_prompt_templates = true,
+    }, null);
+    defer h.deinit();
+    const secret = "clipboard-content-secret";
+    const Counter = struct {
+        calls: usize = 0,
+        expected: []const u8,
+        fn copy(context: ?*anyopaque, _: std.Io, _: clipboard.Command, bytes: []const u8) clipboard.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            if (!std.mem.eql(u8, self.expected, bytes)) return error.Failed;
+        }
+    };
+    var counter: Counter = .{ .expected = secret };
+    const runner: clipboard.Runner = .{ .context = &counter, .copyFn = Counter.copy };
+    var adapter: CliAdapter = .{ .allocator = a, .arena = a, .io = io, .mode = .interactive, .harness = h };
+    h.security_policy.active_scopes.session = false;
+    try std.testing.expectError(error.CapabilityDenied, adapter.copySelectionWithRunner(runner, secret));
+    try std.testing.expectEqual(@as(usize, 0), counter.calls);
+    // Restore the test's process grant without changing the request grant.
+    h.security_policy.active_scopes.session = true;
+    try adapter.copySelectionWithRunner(runner, secret);
+    try std.testing.expectError(error.CapabilityDenied, adapter.copySelectionWithRunner(runner, secret));
+    try std.testing.expectEqual(@as(usize, 1), counter.calls);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, audit_path, a, .limited(8192));
+    defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, secret) == null);
+    var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
+    const denied_process = try std.json.parseFromSlice(std.json.Value, a, lines.next() orelse return error.MissingAuditEvent, .{});
+    defer denied_process.deinit();
+    const process_authorization = (try std.json.parseFromSlice(std.json.Value, a, lines.next().?, .{}));
+    defer process_authorization.deinit();
+    const clipboard_authorization = (try std.json.parseFromSlice(std.json.Value, a, lines.next().?, .{}));
+    defer clipboard_authorization.deinit();
+    const process_operation = (try std.json.parseFromSlice(std.json.Value, a, lines.next().?, .{}));
+    defer process_operation.deinit();
+    const clipboard_operation = (try std.json.parseFromSlice(std.json.Value, a, lines.next().?, .{}));
+    defer clipboard_operation.deinit();
+    const second_process_authorization = (try std.json.parseFromSlice(std.json.Value, a, lines.next().?, .{}));
+    defer second_process_authorization.deinit();
+    const denied = (try std.json.parseFromSlice(std.json.Value, a, lines.next().?, .{}));
+    defer denied.deinit();
+    try std.testing.expectEqualStrings("authorization", denied_process.value.object.get("event").?.string);
+    try std.testing.expectEqualStrings("process.exec", denied_process.value.object.get("capability").?.string);
+    try std.testing.expectEqualStrings("deny", denied_process.value.object.get("decision").?.string);
+    try std.testing.expectEqualStrings("missing-grant", denied_process.value.object.get("reason").?.string);
+    try std.testing.expectEqualStrings("process.exec", process_authorization.value.object.get("capability").?.string);
+    try std.testing.expectEqualStrings("session", process_authorization.value.object.get("policySource").?.string);
+    try std.testing.expectEqualStrings("command", process_authorization.value.object.get("target").?.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("clipboard.write", clipboard_authorization.value.object.get("capability").?.string);
+    try std.testing.expectEqualStrings("request", clipboard_authorization.value.object.get("policySource").?.string);
+    try std.testing.expectEqualStrings("authorization", clipboard_authorization.value.object.get("event").?.string);
+    try std.testing.expectEqual(process_authorization.value.object.get("eventId").?.integer, clipboard_authorization.value.object.get("parentId").?.integer);
+    try std.testing.expectEqual(process_authorization.value.object.get("eventId").?.integer, process_operation.value.object.get("parentId").?.integer);
+    try std.testing.expectEqual(clipboard_authorization.value.object.get("eventId").?.integer, clipboard_operation.value.object.get("parentId").?.integer);
+    try std.testing.expectEqualStrings("operation", process_operation.value.object.get("event").?.string);
+    try std.testing.expectEqualStrings("session", process_operation.value.object.get("policySource").?.string);
+    try std.testing.expectEqualStrings("request", clipboard_operation.value.object.get("policySource").?.string);
+    try std.testing.expectEqualStrings("allowed", process_operation.value.object.get("outcome").?.string);
+    try std.testing.expectEqualStrings("allowed", clipboard_operation.value.object.get("outcome").?.string);
+    try std.testing.expectEqualStrings("authorization", denied.value.object.get("event").?.string);
+    try std.testing.expectEqualStrings("clipboard.write", denied.value.object.get("capability").?.string);
+    try std.testing.expectEqual(second_process_authorization.value.object.get("eventId").?.integer, denied.value.object.get("parentId").?.integer);
+    try std.testing.expectEqualStrings("deny", denied.value.object.get("decision").?.string);
+    try std.testing.expectEqualStrings("denied", denied.value.object.get("outcome").?.string);
+    try std.testing.expectEqualStrings("process.exec", second_process_authorization.value.object.get("capability").?.string);
+    try std.testing.expectEqualStrings("authorization", second_process_authorization.value.object.get("event").?.string);
+    try std.testing.expectEqualStrings("session", second_process_authorization.value.object.get("policySource").?.string);
+    try std.testing.expectEqual(@as(?[]const u8, null), lines.next());
 }
 
 test "copy text follows the active branch and preserves raw Markdown" {

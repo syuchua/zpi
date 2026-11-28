@@ -40,11 +40,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "context_budget", .module = context_budget } },
     });
+    const security = b.addModule("security", .{ .root_source_file = b.path("src/security.zig"), .target = target, .optimize = optimize });
+    const audit = b.addModule("audit", .{ .root_source_file = b.path("src/audit.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "security", .module = security }} });
     const agent = b.addModule("agent", .{
         .root_source_file = b.path("src/agent.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "model", .module = model }},
+        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "security", .module = security } },
     });
     const session = b.addModule("session", .{
         .root_source_file = b.path("src/session.zig"),
@@ -180,6 +182,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "mcp_tools", .module = mcp_tools },
             .{ .name = "context_budget", .module = context_budget },
             .{ .name = "compaction", .module = compaction },
+            .{ .name = "security", .module = security },
+            .{ .name = "audit", .module = audit },
         },
     });
     const skills = b.createModule(.{ .root_source_file = b.path("src/cli/skills.zig"), .target = target, .optimize = optimize });
@@ -196,6 +200,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "prompt_templates", .module = prompt_templates },
             .{ .name = "tool_selection", .module = tool_selection },
         },
+    });
+    const doctor = b.createModule(.{
+        .root_source_file = b.path("src/cli/doctor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "harness", .module = harness } },
     });
     const pi_session = b.createModule(.{
         .root_source_file = b.path("src/pi_session.zig"),
@@ -214,12 +224,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "clipboard", .module = clipboard },
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
+            .{ .name = "doctor", .module = doctor },
         } else &.{
             .{ .name = "zpi", .module = core },
             .{ .name = "harness", .module = harness },
             .{ .name = "clipboard", .module = clipboard },
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
+            .{ .name = "doctor", .module = doctor },
         },
     });
     exe_module.addOptions("build_options", build_options);
@@ -257,6 +269,9 @@ pub fn build(b: *std.Build) void {
     const harness_tests = b.addTest(.{ .name = "harness-tests", .root_module = harness });
     const skills_tests = b.addTest(.{ .name = "skills-tests", .root_module = skills });
     const tool_selection_tests = b.addTest(.{ .name = "tool-selection-tests", .root_module = tool_selection });
+    const security_tests = b.addTest(.{ .name = "security-tests", .root_module = security });
+    const doctor_tests = b.addTest(.{ .name = "doctor-tests", .root_module = doctor });
+    const audit_tests = b.addTest(.{ .name = "audit-tests", .root_module = audit });
     const tui_tests = b.addTest(.{ .name = "tui-tests", .root_module = tui });
     const clipboard_tests = b.addTest(.{ .name = "clipboard-tests", .root_module = clipboard });
     const prompt_template_tests = b.addTest(.{ .name = "prompt-template-tests", .root_module = prompt_templates });
@@ -277,6 +292,7 @@ pub fn build(b: *std.Build) void {
     const compaction_tests = b.addTest(.{ .name = "compaction-tests", .root_module = compaction });
     const mcp_tests = b.addTest(.{ .name = "mcp-tests", .root_module = mcp });
     const mcp_tool_tests = b.addTest(.{ .name = "mcp-tool-tests", .root_module = mcp_tools });
+    const extension_tool_tests = b.addTest(.{ .name = "extension-tool-tests", .root_module = extension_tools });
     const replacement_tests = b.addTest(.{ .name = "replacement-tests", .root_module = replacements });
     const search_tests = b.addTest(.{ .name = "search-tests", .root_module = search });
     const web_fetch_tests = b.addTest(.{ .name = "web-fetch-tests", .root_module = web_fetch });
@@ -305,7 +321,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/agent_tests.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "agent", .module = agent } },
+            .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "agent", .module = agent }, .{ .name = "security", .module = security } },
         }),
     });
     const openai_tests = b.addTest(.{
@@ -447,6 +463,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(harness_tests).step);
     test_step.dependOn(&b.addRunArtifact(skills_tests).step);
     test_step.dependOn(&b.addRunArtifact(tool_selection_tests).step);
+    test_step.dependOn(&b.addRunArtifact(security_tests).step);
+    test_step.dependOn(&b.addRunArtifact(doctor_tests).step);
+    test_step.dependOn(&b.addRunArtifact(audit_tests).step);
     if (tui_mode == .native) test_step.dependOn(&b.addRunArtifact(tui_tests).step);
     test_step.dependOn(&b.addRunArtifact(clipboard_tests).step);
     test_step.dependOn(&b.addRunArtifact(sse_tests).step);
@@ -457,6 +476,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(compaction_tests).step);
     test_step.dependOn(&b.addRunArtifact(mcp_tests).step);
     test_step.dependOn(&b.addRunArtifact(mcp_tool_tests).step);
+    test_step.dependOn(&b.addRunArtifact(extension_tool_tests).step);
     test_step.dependOn(&b.addRunArtifact(prompt_template_tests).step);
     test_step.dependOn(&b.addRunArtifact(pi_session_tests).step);
     test_step.dependOn(&b.addRunArtifact(openai_tests).step);
@@ -481,6 +501,9 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(harness_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(skills_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(tool_selection_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(security_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(doctor_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(audit_tests, .{}).step);
     if (tui_mode == .native) test_binaries.dependOn(&b.addInstallArtifact(tui_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(clipboard_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(sse_tests, .{}).step);
@@ -491,6 +514,7 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(compaction_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(mcp_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(mcp_tool_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(extension_tool_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(prompt_template_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(pi_session_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(openai_tests, .{}).step);

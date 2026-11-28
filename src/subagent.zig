@@ -26,6 +26,7 @@ pub fn definition(a: std.mem.Allocator, context: *Context) !agent.Tool {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, schema, .{});
     return .{
         .builtin = true,
+        .capability = .process_exec,
         .context = context,
         .definition = .{
             .name = "subagent",

@@ -2,6 +2,7 @@
 //! owned by this instance. Tools execute only after a successful whole response.
 const std = @import("std");
 pub const model = @import("model");
+pub const security = @import("security");
 
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
@@ -15,6 +16,8 @@ pub const ToolContext = struct {
 pub const ToolResult = struct { text: []const u8, is_error: bool = false, details: ?std.json.Value = null };
 pub const Tool = struct {
     definition: model.ToolDefinition,
+    capability: ?security.Capability = null,
+    source: security.Source = .builtin_tool,
     builtin: bool = false,
     context: ?*anyopaque = null,
     execute: *const fn (?*anyopaque, ToolContext, std.json.Value) anyerror!ToolResult,
@@ -68,6 +71,9 @@ pub const Agent = struct {
     retry: RetryPolicy = .{},
     compaction_hook: ?CompactionHook = null,
     steering_hook: ?SteeringHook = null,
+    security_context: ?*anyopaque = null,
+    authorize_tool: ?*const fn (?*anyopaque, Tool, *?security.Authorization) anyerror!void = null,
+    audit_tool_outcome: ?*const fn (?*anyopaque, Tool, ?security.Authorization, security.Outcome) anyerror!void = null,
     max_turns: usize = 32,
     running: bool = false,
     /// An interrupted tool batch requires reconciliation before another prompt.
@@ -351,12 +357,35 @@ pub const Agent = struct {
         for (self.tools) |tool| {
             if (!std.mem.eql(u8, call.name, tool.definition.name)) continue;
             var update = Update{ .call = call, .sink = sink };
-            const result = tool.execute(tool.context, .{ .allocator = allocator, .io = self.io, .cwd = self.cwd, .call_id = call.id, .cancel = self.cancel, .update_context = &update, .on_update = Update.emit }, call.arguments) catch |err| {
+            const context: ToolContext = .{ .allocator = allocator, .io = self.io, .cwd = self.cwd, .call_id = call.id, .cancel = self.cancel, .update_context = &update, .on_update = Update.emit };
+            var authorization: ?security.Authorization = null;
+            if (self.authorize_tool) |authorize| authorize(self.security_context, tool, &authorization) catch |err| {
+                if (err == error.CapabilityDenied) {
+                    // authorize() records the pre-effect denial. Do not emit an
+                    // operation event because the handler was never entered.
+                    return .{ .text = "Capability denied by security policy.", .is_error = true };
+                }
+                return err;
+            };
+            const result = tool.execute(tool.context, context, call.arguments) catch |err| {
+                // Tool adapters use Canceled for lost transport or interrupted
+                // execution as well as explicit cancellation.
+                const outcome: security.Outcome = if (update.failure != null or err == error.OutOfMemory or err == error.Timeout)
+                    .unknown
+                else if (err == error.Canceled)
+                    if (context.cancel) |cancel| (if (cancel.isCanceled()) .cancelled else .unknown) else .unknown
+                else
+                    .failed;
+                if (self.audit_tool_outcome) |audit| try audit(self.security_context, tool, authorization, outcome);
                 if (update.failure) |failure| return failure;
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
                 return .{ .text = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}), .is_error = true };
             };
-            if (update.failure) |failure| return failure;
+            if (update.failure) |failure| {
+                if (self.audit_tool_outcome) |audit| try audit(self.security_context, tool, authorization, .unknown);
+                return failure;
+            }
+            if (self.audit_tool_outcome) |audit| try audit(self.security_context, tool, authorization, if (result.is_error) .failed else .allowed);
             return result;
         }
         return .{ .text = try std.fmt.allocPrint(allocator, "Unknown tool: {s}", .{call.name}), .is_error = true };

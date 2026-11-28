@@ -98,6 +98,14 @@ test "native agent adapter copies results emits progress and rejects duplicate n
     defer arena.deinit();
     const a = arena.allocator();
     const tools = try native_tools.combine(a, &module, &.{});
+    try std.testing.expectEqual(agent.security.Capability.native_plugin_load, tools[0].capability.?);
+    try std.testing.expectEqual(agent.security.Source.native_plugin, tools[0].source);
+    const decision = agent.security.evaluate(.{ .mode = .secure, .grants = &.{.{ .capability = .native_plugin_load }} }, .{
+        .capability = tools[0].capability.?,
+        .source = tools[0].source,
+        .target = .{ .kind = .plugin },
+    });
+    try std.testing.expect(decision.allowed());
     try std.testing.expectError(error.DuplicateNativeTool, native_tools.combine(a, &module, tools));
     const Updates = struct {
         count: usize = 0,

@@ -1,6 +1,7 @@
 const std = @import("std");
 const model = @import("model");
 const agent = @import("agent");
+const security = @import("security");
 
 const Fake = struct {
     turn: usize = 0,
@@ -74,6 +75,74 @@ test "agent owns prompt, executes tools, persists results in context and settles
     try std.testing.expectEqualStrings("write", runtime.messages.items[1].content[0].tool_call.name);
     try std.testing.expectEqualStrings("wrote", runtime.messages.items[2].content[0].text);
     try std.testing.expectEqualStrings("Finished", runtime.messages.items[3].content[0].text);
+}
+
+const AuthorizationCapture = struct {
+    policy: security.Policy,
+    calls: usize = 0,
+    fn authorize(context: ?*anyopaque, tool: agent.Tool, authorization: *?security.Authorization) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        const request: security.Request = .{
+            .capability = tool.capability orelse return error.UnclassifiedTool,
+            .source = tool.source,
+            .target = .{ .kind = if (tool.capability == .filesystem_write) .path else .request },
+        };
+        const result = security.evaluate(self.policy, request);
+        authorization.* = .{ .request = request, .result = result, .event_id = 1 };
+        if (!result.allowed()) return error.CapabilityDenied;
+    }
+    fn audit(_: ?*anyopaque, _: agent.Tool, _: ?security.Authorization, _: security.Outcome) anyerror!void {
+        return error.UnexpectedOperationAudit;
+    }
+};
+
+test "secure policy denies a tool before its handler runs" {
+    const OneCall = struct {
+        calls: usize = 0,
+        fn run(context: *anyopaque, allocator: std.mem.Allocator, _: []const model.Message, _: []const model.ToolDefinition, sink: model.EventSink) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.calls += 1;
+            if (self.calls == 1) {
+                const args = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+                defer args.deinit();
+                try sink.emit(sink.context, .start);
+                try sink.emit(sink.context, .{ .tool_call_end = .{ .index = 0, .call = .{ .id = "c1", .name = "write", .arguments = args.value } } });
+                try sink.emit(sink.context, .{ .done = .tool_use });
+            } else {
+                try sink.emit(sink.context, .start);
+                try sink.emit(sink.context, .{ .text_delta = "denied" });
+                try sink.emit(sink.context, .{ .done = .stop });
+            }
+        }
+    };
+    var executed: usize = 0;
+    const Handler = struct {
+        fn run(context: ?*anyopaque, _: agent.ToolContext, _: std.json.Value) anyerror!agent.ToolResult {
+            const count: *usize = @ptrCast(@alignCast(context.?));
+            count.* += 1;
+            return .{ .text = "unexpected" };
+        }
+    };
+    const tools = [_]agent.Tool{.{
+        .definition = .{ .name = "write", .description = "write", .parameters = .null },
+        .capability = .filesystem_write,
+        .context = &executed,
+        .execute = Handler.run,
+    }};
+    var auth = AuthorizationCapture{ .policy = .{ .mode = .secure } };
+    var fake: OneCall = .{};
+    var runtime = agent.Agent.init(std.testing.allocator, std.testing.io, .{ .context = &fake, .run_fn = OneCall.run }, &tools, "/tmp");
+    defer runtime.deinit();
+    runtime.security_context = &auth;
+    runtime.authorize_tool = AuthorizationCapture.authorize;
+    runtime.audit_tool_outcome = AuthorizationCapture.audit;
+    var events: Events = .{};
+    try runtime.prompt("run write", .{ .context = &events, .emit = Events.emit });
+    try std.testing.expectEqual(@as(usize, 1), auth.calls);
+    try std.testing.expectEqual(@as(usize, 0), executed);
+    try std.testing.expect(runtime.messages.items[2].is_error);
+    try std.testing.expectEqualStrings("Capability denied by security policy.", runtime.messages.items[2].content[0].text);
 }
 
 test "failed provider completion does not execute partial tool calls" {

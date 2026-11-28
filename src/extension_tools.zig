@@ -85,6 +85,36 @@ fn decodeResult(a: std.mem.Allocator, value: std.json.Value) !agent.ToolResult {
     return .{ .text = try text.toOwnedSlice(a), .is_error = is_error.bool, .details = if (value.object.get("details")) |details| try agent.cloneValue(a, details, 0) else null };
 }
 
+test "extension tools receive extension capability while wrapped built-ins retain theirs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var host: extensions.Host = undefined;
+    const builtin_tool: agent.Tool = .{
+        .definition = .{ .name = "write", .description = "write", .parameters = .null },
+        .capability = .filesystem_write,
+        .source = .builtin_tool,
+        .execute = struct {
+            fn run(_: ?*anyopaque, _: agent.ToolContext, _: std.json.Value) anyerror!agent.ToolResult {
+                return .{ .text = "" };
+            }
+        }.run,
+    };
+    const ready = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"tools\":[{\"name\":\"remote\",\"description\":\"remote\",\"parameters\":{\"type\":\"object\"}}]}", .{});
+    const tools = try combine(a, &host, ready, &.{builtin_tool});
+    try std.testing.expectEqual(@as(usize, 2), tools.len);
+    try std.testing.expectEqual(agent.security.Capability.extension_load, tools[1].capability.?);
+    try std.testing.expectEqual(agent.security.Source.typescript, tools[1].source);
+    const extension_decision = agent.security.evaluate(.{ .mode = .secure, .grants = &.{.{ .capability = tools[1].capability.? }} }, .{
+        .capability = tools[1].capability.?,
+        .source = tools[1].source,
+        .target = .{ .kind = .plugin },
+    });
+    try std.testing.expect(extension_decision.allowed());
+    try std.testing.expectEqual(agent.security.Capability.filesystem_write, tools[0].capability.?);
+    try std.testing.expectEqual(agent.security.Source.builtin_tool, tools[0].source);
+}
+
 /// All allocated metadata/context entries live in the invocation arena.
 pub fn combine(a: std.mem.Allocator, host: *extensions.Host, ready: std.json.Value, builtins: []const agent.Tool) ![]agent.Tool {
     if (ready != .object) return error.InvalidExtensionHandshake;
@@ -101,7 +131,7 @@ pub fn combine(a: std.mem.Allocator, host: *extensions.Host, ready: std.json.Val
         for (name.string) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return error.InvalidExtensionTool;
         const entry = try a.create(Entry);
         entry.* = .{ .host = host, .name = try a.dupe(u8, name.string), .schema = try agent.cloneValue(a, parameters, 0) };
-        const tool: agent.Tool = .{ .context = entry, .execute = Entry.execute, .definition = .{
+        const tool: agent.Tool = .{ .context = entry, .execute = Entry.execute, .source = .typescript, .capability = .extension_load, .definition = .{
             .name = entry.name,
             .description = try a.dupe(u8, description.string),
             .parameters = try agent.cloneValue(a, parameters, 0),
