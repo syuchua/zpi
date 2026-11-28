@@ -10,6 +10,11 @@ pub const ToolContext = struct {
     cwd: []const u8,
     call_id: []const u8 = "",
     cancel: ?model.Cancel = null,
+    authorize_url: ?*const fn (?*anyopaque, []const u8, *?security.Authorization) anyerror!void = null,
+    authorization_context: ?*anyopaque = null,
+    authorize_rewritten: ?*const fn (?*anyopaque, Tool, ToolContext, std.json.Value, *?security.Authorization) anyerror!void = null,
+    rewritten_authorization: ?*?security.Authorization = null,
+    policy_root_override: ?[]const u8 = null,
     update_context: ?*anyopaque = null,
     on_update: ?*const fn (?*anyopaque, ToolResult) anyerror!void = null,
 };
@@ -19,6 +24,7 @@ pub const Tool = struct {
     capability: ?security.Capability = null,
     source: security.Source = .builtin_tool,
     builtin: bool = false,
+    defer_authorization: bool = false,
     context: ?*anyopaque = null,
     execute: *const fn (?*anyopaque, ToolContext, std.json.Value) anyerror!ToolResult,
 };
@@ -72,8 +78,11 @@ pub const Agent = struct {
     compaction_hook: ?CompactionHook = null,
     steering_hook: ?SteeringHook = null,
     security_context: ?*anyopaque = null,
-    authorize_tool: ?*const fn (?*anyopaque, Tool, *?security.Authorization) anyerror!void = null,
+    authorize_tool: ?*const fn (?*anyopaque, Tool, ToolContext, std.json.Value, *?security.Authorization) anyerror!void = null,
+    authorize_url: ?*const fn (?*anyopaque, []const u8, *?security.Authorization) anyerror!void = null,
     audit_tool_outcome: ?*const fn (?*anyopaque, Tool, ?security.Authorization, security.Outcome) anyerror!void = null,
+    fail_stop_on_denial: bool = false,
+    policy_root_override: ?[]const u8 = null,
     max_turns: usize = 32,
     running: bool = false,
     /// An interrupted tool batch requires reconciliation before another prompt.
@@ -357,13 +366,25 @@ pub const Agent = struct {
         for (self.tools) |tool| {
             if (!std.mem.eql(u8, call.name, tool.definition.name)) continue;
             var update = Update{ .call = call, .sink = sink };
-            const context: ToolContext = .{ .allocator = allocator, .io = self.io, .cwd = self.cwd, .call_id = call.id, .cancel = self.cancel, .update_context = &update, .on_update = Update.emit };
             var authorization: ?security.Authorization = null;
-            if (self.authorize_tool) |authorize| authorize(self.security_context, tool, &authorization) catch |err| {
+            const context: ToolContext = .{
+                .allocator = allocator,
+                .io = self.io,
+                .cwd = self.cwd,
+                .call_id = call.id,
+                .cancel = self.cancel,
+                .authorize_url = self.authorize_url,
+                .authorization_context = self.security_context,
+                .authorize_rewritten = if (tool.defer_authorization) self.authorize_tool else null,
+                .rewritten_authorization = &authorization,
+                .policy_root_override = self.policy_root_override,
+                .update_context = &update,
+                .on_update = Update.emit,
+            };
+            if (!tool.defer_authorization) if (self.authorize_tool) |authorize| authorize(self.security_context, tool, context, call.arguments, &authorization) catch |err| {
                 if (err == error.CapabilityDenied) {
-                    // authorize() records the pre-effect denial. Do not emit an
-                    // operation event because the handler was never entered.
-                    return .{ .text = "Capability denied by security policy.", .is_error = true };
+                    if (self.fail_stop_on_denial) return error.CapabilityDenied;
+                    return authorizationDenied(allocator, authorization);
                 }
                 return err;
             };
@@ -379,6 +400,13 @@ pub const Agent = struct {
                 if (self.audit_tool_outcome) |audit| try audit(self.security_context, tool, authorization, outcome);
                 if (update.failure) |failure| return failure;
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
+                if (err == error.CapabilityDenied) {
+                    if (self.fail_stop_on_denial) return error.CapabilityDenied;
+                    return authorizationDenied(allocator, authorization);
+                }
+                if (self.fail_stop_on_denial and (err == error.PathOutsideWorkspace or err == error.SandboxWriteDenied)) {
+                    return err;
+                }
                 return .{ .text = try std.fmt.allocPrint(allocator, "Tool failed: {s}", .{@errorName(err)}), .is_error = true };
             };
             if (update.failure) |failure| {
@@ -391,6 +419,23 @@ pub const Agent = struct {
         return .{ .text = try std.fmt.allocPrint(allocator, "Unknown tool: {s}", .{call.name}), .is_error = true };
     }
 };
+
+fn authorizationDenied(a: std.mem.Allocator, authorization: ?security.Authorization) !ToolResult {
+    var details: std.json.ObjectMap = .empty;
+    try details.put(a, "type", .{ .string = "authorization_denied" });
+    try details.put(a, "code", .{ .string = "CapabilityDenied" });
+    if (authorization) |auth| {
+        try details.put(a, "capability", .{ .string = auth.request.capability.name() });
+        try details.put(a, "targetKind", .{ .string = @tagName(auth.request.target.kind) });
+        try details.put(a, "policySource", .{ .string = @tagName(auth.result.policy_source) });
+        try details.put(a, "reason", .{ .string = auth.result.reason });
+    }
+    return .{
+        .text = "Capability denied by security policy.",
+        .is_error = true,
+        .details = .{ .object = details },
+    };
+}
 
 const Collector = struct {
     allocator: std.mem.Allocator,

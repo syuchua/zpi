@@ -72,6 +72,14 @@ const help =
     \\  --allow-capability-session ID Grant until /new, resume, or process exit
     \\  --security-policy PATH      Load private persistent policy JSON in secure mode
     \\  --audit-log PATH           Append redacted JSONL events (required by secure)
+    \\  --sandbox MODE             OS confinement: off, read-only, or workspace-write
+    \\                             (default: off in compatibility, workspace-write in secure)
+    \\  --sandbox-network MODE     Child network under sandbox: off (default) or on
+    \\  --sandbox-backend NAME     Backend: auto (default), seatbelt, landlock, or bwrap
+    \\  --env-isolation MODE       Child env: inherit or strict (default: strict with sandbox/secure)
+    \\  --env-allow NAME           Forward an env var under strict isolation (repeatable)
+    \\  --subagent-isolation MODE  Subagent workspace: shared (default), worktree, or auto
+    \\  --unattended               Headless fail-stop mode requiring secure + policy + sandbox + audit
     \\  --enable-project-context   Load AGENTS.md/CLAUDE.md as inert data
     \\  --no-context-files         Disable project context loading
     \\  --verbose                  Static build details and hints for every error (stderr)
@@ -171,6 +179,9 @@ fn warnUnmatchedTools(io: std.Io, a: std.mem.Allocator, h: *harness.Harness, too
 fn run(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(a);
+    if (argv.len >= 5 and std.mem.eql(u8, argv[1], zpi.sandbox.internal_exec_flag) and std.mem.eql(u8, argv[3], "--")) {
+        zpi.sandbox.execInternalLinuxSandbox(a, argv[2], argv[4..], init.environ_map);
+    }
     if (argv.len > 1 and std.mem.eql(u8, argv[1], "--import-pi-session")) {
         if (argv.len != 5 or argv[2].len == 0 or !std.mem.eql(u8, argv[3], "--session") or argv[4].len == 0)
             return error.InvalidPiSessionImportArguments;
@@ -191,11 +202,13 @@ fn run(init: std.process.Init) !void {
     defer options.allow_capabilities.deinit(a);
     defer options.request_capabilities.deinit(a);
     defer options.session_capabilities.deinit(a);
+    defer options.env_allow.deinit(a);
     if (options.print_help) return std.Io.File.stdout().writeStreamingAll(init.io, help);
     if (options.print_version) {
         return std.Io.File.stdout().writeStreamingAll(init.io, "zpi " ++ zpi.VERSION ++ "\n");
     }
     if (options.doctor_subcommand) return runDoctor(init, a, &options);
+    if (options.unattended and options.mode == .interactive) return error.UnattendedRequiresHeadlessMode;
     if (options.mode == .interactive and !build_options.enable_tui) return error.TuiDisabled;
 
     const piped_input = if (input_tty or options.mode == .rpc) "" else blk: {
@@ -296,6 +309,17 @@ fn run(init: std.process.Init) !void {
         .session_capabilities = options.session_capabilities.items,
         .security_policy_file = options.security_policy_file,
         .audit_log = options.audit_log,
+        .sandbox_mode = options.sandbox_mode,
+        .sandbox_network = options.sandbox_network,
+        .sandbox_backend = options.sandbox_backend,
+        .env_isolation = options.env_isolation,
+        .env_allow = options.env_allow.items,
+        .subagent_isolation = switch (options.subagent_isolation) {
+            .shared => .shared,
+            .worktree => .worktree,
+            .auto => .auto,
+        },
+        .unattended = options.unattended,
         .cancel_token = cancel_token,
     }, if (options.mode == .rpc) null else .{ .context = &adapter, .emit = CliAdapter.emit });
     defer {
@@ -337,6 +361,10 @@ fn run(init: std.process.Init) !void {
                 startup_status_active = false;
             }
             const status = h.statusSummary();
+            if (options.security_mode == .secure and !options.unattended) {
+                h.approval = CliAdapter.approveOnceErased;
+                h.approval_context = &adapter;
+            }
             try tui.run(init.io, .{
                 .context = &adapter,
                 .run = CliAdapter.submitErased,
@@ -435,6 +463,16 @@ const CliAdapter = struct {
             }
         }
         try writer.writeAll(text[start..]);
+    }
+
+    fn approveOnceErased(context: ?*anyopaque, request: zpi.security.Request) anyerror!zpi.security.ApprovalOutcome {
+        const self: *CliAdapter = @ptrCast(@alignCast(context.?));
+        if (comptime build_options.enable_tui) {
+            const writer = self.live_writer orelse return .unavailable;
+            const approve = writer.approve_once orelse return .unavailable;
+            return approve(writer.context, request, if (self.interrupt) |token| token.cancel() else null);
+        }
+        return .unavailable;
     }
 
     fn resetCancelErased(context: *anyopaque) void {

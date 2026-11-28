@@ -499,6 +499,7 @@ pub const LiveWriter = struct {
     set_phase: ?*const fn (*anyopaque, components.chrome.Phase, []const u8) void = null,
     write_tool_text: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
     write_tool_body: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
+    approve_once: ?*const fn (*anyopaque, agent.security.Request, ?agent.model.Cancel) anyerror!agent.security.ApprovalOutcome = null,
 };
 
 pub const TreeItem = struct {
@@ -2707,6 +2708,11 @@ const LiveScreen = struct {
     overlay_cols: usize = 80,
     overlay_active: bool = false,
     event_wake: ?*agent.model.Interrupt = null,
+    authorization_condition: std.Io.Condition = .init,
+    authorization_waiting: bool = false,
+    authorization_visible: bool = false,
+    authorization_decision: ?bool = null,
+    authorization_label: std.ArrayList(u8) = .empty,
     started_ms: i64 = 0,
 
     fn elapsedMs(self: *const LiveScreen) u64 {
@@ -2744,6 +2750,7 @@ const LiveScreen = struct {
     fn deinit(self: *LiveScreen) void {
         self.pending_line.deinit(self.allocator);
         self.overlay_bytes.deinit(self.allocator);
+        self.authorization_label.deinit(self.allocator);
     }
 
     fn writer(self: *LiveScreen) LiveWriter {
@@ -2754,7 +2761,41 @@ const LiveScreen = struct {
             .set_phase = setPhaseErased,
             .write_tool_text = if (self.conversation_view != null) writeToolTextErased else null,
             .write_tool_body = if (self.conversation_view != null) writeToolBodyErased else null,
+            .approve_once = approveOnceErased,
         };
+    }
+
+    fn approveOnceErased(context: *anyopaque, request: agent.security.Request, cancel: ?agent.model.Cancel) anyerror!agent.security.ApprovalOutcome {
+        const self: *LiveScreen = @ptrCast(@alignCast(context));
+        return self.approveOnce(request, cancel);
+    }
+
+    fn approveOnce(self: *LiveScreen, request: agent.security.Request, cancel: ?agent.model.Cancel) !agent.security.ApprovalOutcome {
+        const target = request.target.value orelse @tagName(request.target.kind);
+        if (target.len > 4096) return .denied;
+        for (target) |byte| if (byte < 0x20 or byte > 0x7e) return .denied;
+        const token = cancel orelse return .unavailable;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.authorization_waiting or token.isCanceled()) return .denied;
+        try self.authorization_label.print(self.allocator, "{s}  {s}", .{ request.capability.name(), target });
+        self.authorization_waiting = true;
+        defer {
+            self.authorization_decision = null;
+            self.authorization_waiting = false;
+            self.authorization_visible = false;
+            self.authorization_label.clearRetainingCapacity();
+            self.notifyLocked();
+        }
+        self.notifyLocked();
+        while (self.authorization_decision == null and !token.isCanceled()) {
+            self.authorization_condition.waitTimeout(self.io, &self.mutex, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return .denied,
+            };
+        }
+        if (token.isCanceled()) return .denied;
+        return if (self.authorization_decision orelse false) .approved else .denied;
     }
 
     fn writeSegmentErased(context: *anyopaque, prefix: []const u8, safe: []const u8, suffix: []const u8) anyerror!void {
@@ -2941,16 +2982,47 @@ const LiveScreen = struct {
         cols: usize,
     ) !void {
         const max_cols = @max(1, cols -| 1);
-        const activity = blk: {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            if (self.event_wake) |wake| if (wake.isCanceled()) wake.reset();
-            var snapshot = self.loader;
-            snapshot.elapsed_ms = self.elapsedMs();
-            break :blk snapshot;
-        };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.event_wake) |wake| if (wake.isCanceled()) wake.reset();
+        var activity = self.loader;
+        activity.elapsed_ms = self.elapsedMs();
         const loader_line = try activity.renderLineAlloc(self.allocator, self.th, max_cols);
         defer self.allocator.free(loader_line);
+
+        self.authorization_visible = false;
+        if (self.authorization_waiting and self.authorization_decision == null) {
+            const label = self.authorization_label.items;
+            const question = "Allow once? [y/N]";
+            const size = terminalSize(self.output);
+            const max_label_lines: usize = if (size.row >= 9) @min(@as(usize, 6), size.row - 6) else 0;
+            var wrapped: std.ArrayList([]const u8) = .empty;
+            defer wrapped.deinit(self.allocator);
+            try wrapped.append(self.allocator, question);
+            var fits = question.len <= max_cols and max_label_lines > 0;
+            if (fits) {
+                var offset: usize = 0;
+                while (offset < label.len) {
+                    if (wrapped.items.len - 1 >= max_label_lines) {
+                        fits = false;
+                        break;
+                    }
+                    const end = @min(label.len, offset + max_cols);
+                    try wrapped.append(self.allocator, label[offset..end]);
+                    offset = end;
+                }
+            }
+            const lines: []const []const u8 = if (fits) wrapped.items else &.{"Resize to review, or press n to deny"};
+            if (self.conversation_view) |view| {
+                try renderFullscreenConversation(self.allocator, self.io, self.output, self.painter.?, view, editor, "", lines, &.{}, &.{}, &.{}, self.th, null, null);
+            } else {
+                const frame = try std.mem.join(self.allocator, "\r\n", lines);
+                defer self.allocator.free(frame);
+                try self.updateOverlayLocked(frame, lines.len - 1, cols);
+            }
+            self.authorization_visible = fits;
+            return;
+        }
 
         var footer_lines: ?[4][]u8 = null;
         defer if (footer_lines) |lines| {
@@ -2964,8 +3036,6 @@ const LiveScreen = struct {
             }
         }
         if (self.conversation_view) |view| {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
             try renderFullscreenConversation(self.allocator, self.io, self.output, self.painter.?, view, editor, loader_line, &.{}, &.{}, if (footer_lines) |*lines| lines else &.{}, followups, self.th, null, null);
             return;
         }
@@ -2980,13 +3050,16 @@ const LiveScreen = struct {
             if (footer_lines) |*lines| lines else &.{},
         );
         defer self.allocator.free(rendered.bytes);
-        try self.updateOverlay(rendered.bytes, rendered.cursor_row, cols);
+        try self.updateOverlayLocked(rendered.bytes, rendered.cursor_row, cols);
     }
 
     fn updateOverlay(self: *LiveScreen, new_bytes: []const u8, new_cursor_row: usize, cols: usize) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        try self.updateOverlayLocked(new_bytes, new_cursor_row, cols);
+    }
 
+    fn updateOverlayLocked(self: *LiveScreen, new_bytes: []const u8, new_cursor_row: usize, cols: usize) !void {
         if (self.overlay_active and cols == self.overlay_cols and new_cursor_row == self.overlay_cursor_row and std.mem.eql(u8, self.overlay_bytes.items, new_bytes)) {
             return;
         }
@@ -3331,6 +3404,7 @@ fn runTurnWithLiveEditor(
         const deadline = if (update_pending) @min(update_deadline, animation_deadline) else animation_deadline;
         const update_wake = if (update_pending or buffered) null else event_wake.cancel();
         if (queue.eof) {
+            if (submit.trigger_cancel) |trigger| trigger(submit.context);
             _ = try queue.readByteWithWake(input_fd, wake, @intCast(deadline -| now));
             continue;
         }
@@ -3339,6 +3413,28 @@ fn runTurnWithLiveEditor(
             else => return err,
         }) orelse continue;
         if (done.isCanceled()) break;
+        const approval_pending = blk: {
+            screen.mutex.lockUncancelable(io);
+            defer screen.mutex.unlock(io);
+            if (!screen.authorization_waiting) break :blk false;
+            if (screen.authorization_decision == null and !in_paste) {
+                switch (b) {
+                    'y', 'Y' => if (screen.authorization_visible) {
+                        screen.authorization_decision = true;
+                    },
+                    'n', 'N', '\r', '\n' => screen.authorization_decision = false,
+                    else => {},
+                }
+                if (screen.authorization_decision != null) {
+                    dirty = true;
+                    screen.authorization_condition.signal(io);
+                }
+            }
+            break :blk true;
+        };
+        // Escape sequences still go through the normal parser so bracketed paste
+        // stays tracked. Printable bytes never reach the editor during approval.
+        if (approval_pending and b != 0x1b and b != 0x03) continue;
         if (b != 0x1b) if (submit.conversation_view) |view| view.clearMouseGesture();
         if (submit.conversation_view) |view| view.clearCopiedNotice();
 

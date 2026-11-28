@@ -49,6 +49,8 @@ pub fn run(io: std.Io, a: std.mem.Allocator, env: *const std.process.Environ.Map
     try contextReport(io, a, writer, options);
     try searchReport(io, a, writer, options, &warnings);
     try nodeReport(io, a, writer, options, &warnings);
+    const sandbox_status = if (zpi.sandbox.detectBackend(io, .auto)) |backend| @tagName(backend) else |_| "unavailable";
+    try writer.print("  sandbox:  {s} (opt-in via --sandbox or --security secure)\n", .{sandbox_status});
     try writer.writeAll("  policy:   project files are untrusted data; nothing in them is executed or trusted\n");
     if (warnings == 0) {
         try writer.writeAll("\nno warnings; start with `zpi` in a terminal or `zpi -p \"hello\"`\n");

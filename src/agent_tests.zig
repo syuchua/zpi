@@ -80,13 +80,13 @@ test "agent owns prompt, executes tools, persists results in context and settles
 const AuthorizationCapture = struct {
     policy: security.Policy,
     calls: usize = 0,
-    fn authorize(context: ?*anyopaque, tool: agent.Tool, authorization: *?security.Authorization) anyerror!void {
+    fn authorize(context: ?*anyopaque, tool: agent.Tool, tool_context: agent.ToolContext, _: std.json.Value, authorization: *?security.Authorization) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(context.?));
         self.calls += 1;
         const request: security.Request = .{
             .capability = tool.capability orelse return error.UnclassifiedTool,
             .source = tool.source,
-            .target = .{ .kind = if (tool.capability == .filesystem_write) .path else .request },
+            .target = .{ .kind = if (tool.capability == .filesystem_write) .path else .request, .value = if (tool.capability == .filesystem_write) tool_context.cwd else null },
         };
         const result = security.evaluate(self.policy, request);
         authorization.* = .{ .request = request, .result = result, .event_id = 1 };
@@ -143,6 +143,28 @@ test "secure policy denies a tool before its handler runs" {
     try std.testing.expectEqual(@as(usize, 0), executed);
     try std.testing.expect(runtime.messages.items[2].is_error);
     try std.testing.expectEqualStrings("Capability denied by security policy.", runtime.messages.items[2].content[0].text);
+    // Structured denial details expose redacted machine-readable metadata.
+    const details = runtime.messages.items[2].details.?.object;
+    try std.testing.expectEqualStrings("authorization_denied", details.get("type").?.string);
+    try std.testing.expectEqualStrings("CapabilityDenied", details.get("code").?.string);
+    try std.testing.expectEqualStrings("filesystem.write", details.get("capability").?.string);
+    try std.testing.expectEqualStrings("path", details.get("targetKind").?.string);
+    try std.testing.expectEqualStrings("validation", details.get("policySource").?.string);
+    try std.testing.expectEqualStrings("missing-grant", details.get("reason").?.string);
+
+    // Fail-stop mode immediately aborts the turn on the first denial.
+    var auth_stop = AuthorizationCapture{ .policy = .{ .mode = .secure } };
+    var fake_stop: OneCall = .{};
+    var stop_runtime = agent.Agent.init(std.testing.allocator, std.testing.io, .{ .context = &fake_stop, .run_fn = OneCall.run }, &tools, "/tmp");
+    defer stop_runtime.deinit();
+    stop_runtime.security_context = &auth_stop;
+    stop_runtime.authorize_tool = AuthorizationCapture.authorize;
+    stop_runtime.audit_tool_outcome = AuthorizationCapture.audit;
+    stop_runtime.fail_stop_on_denial = true;
+    var stop_events: Events = .{};
+    try std.testing.expectError(error.CapabilityDenied, stop_runtime.prompt("run write", .{ .context = &stop_events, .emit = Events.emit }));
+    try std.testing.expectEqual(@as(usize, 1), fake_stop.calls);
+    try std.testing.expectEqual(@as(usize, 0), executed);
 }
 
 test "failed provider completion does not execute partial tool calls" {

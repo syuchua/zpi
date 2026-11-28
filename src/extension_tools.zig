@@ -29,8 +29,11 @@ pub const Entry = struct {
         if (input != .object) return error.InvalidExtensionGate;
         var result: agent.ToolResult = undefined;
         if (self.builtin) |tool| {
+            if (ctx.authorize_rewritten) |authorize| {
+                try authorize(ctx.authorization_context, tool, ctx, input, ctx.rewritten_authorization orelse return error.InvalidSecurityPolicy);
+            }
             result = tool.execute(tool.context, ctx, input) catch |err| blk: {
-                if (err == error.Canceled or err == error.OutOfMemory) return err;
+                if (err == error.Canceled or err == error.OutOfMemory or err == error.CapabilityDenied) return err;
                 break :blk .{ .text = try std.fmt.allocPrint(ctx.allocator, "Tool failed: {s}", .{@errorName(err)}), .is_error = true };
             };
         } else {
@@ -150,6 +153,7 @@ pub fn combine(a: std.mem.Allocator, host: *extensions.Host, ready: std.json.Val
         entry.* = .{ .host = host, .name = tool.definition.name, .schema = tool.definition.parameters, .builtin = tool.* };
         tool.context = entry;
         tool.execute = Entry.execute;
+        tool.defer_authorization = true;
     };
     return tools.toOwnedSlice(a);
 }

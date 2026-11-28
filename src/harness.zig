@@ -12,6 +12,7 @@ const skills = @import("skills");
 const prompt_templates = @import("prompt_templates");
 const agent = zpi.agent;
 const subagent = @import("subagent.zig");
+const worktree = @import("worktree");
 
 pub const Api = config.Api;
 pub const ModelChoice = config.ModelChoice;
@@ -34,6 +35,8 @@ pub const McpServer = struct {
     name: []const u8,
     argv: []const [:0]const u8,
 };
+
+pub const SubagentIsolation = enum { shared, worktree, auto };
 
 pub const Options = struct {
     host_cwd: []const u8,
@@ -75,6 +78,13 @@ pub const Options = struct {
     session_capabilities: []const zpi.security.Capability = &.{},
     security_policy_file: ?[]const u8 = null,
     audit_log: ?[]const u8 = null,
+    sandbox_mode: ?zpi.sandbox.Mode = null,
+    sandbox_network: zpi.sandbox.Network = .off,
+    sandbox_backend: zpi.sandbox.Backend = .auto,
+    env_isolation: ?zpi.sandbox.EnvIsolation = null,
+    env_allow: []const []const u8 = &.{},
+    subagent_isolation: SubagentIsolation = .shared,
+    unattended: bool = false,
 };
 
 pub const Event = union(enum) {
@@ -271,6 +281,12 @@ pub const Harness = struct {
     request_grants: []bool,
     authorization_mutex: std.Io.Mutex = .init,
     audit_sink: zpi.audit.Sink,
+    sandbox: zpi.sandbox.Config = .{},
+    subagent_isolation: SubagentIsolation = .shared,
+    unattended: bool = false,
+    worktree_mutex: std.Io.Mutex = .init,
+    approval: ?*const fn (?*anyopaque, zpi.security.Request) anyerror!zpi.security.ApprovalOutcome = null,
+    approval_context: ?*anyopaque = null,
 
     pub fn create(
         gpa: std.mem.Allocator,
@@ -325,13 +341,27 @@ pub const Harness = struct {
             .grants = &.{},
             .request_grants = &.{},
             .audit_sink = undefined,
+            .sandbox = .{},
+            .subagent_isolation = options.subagent_isolation,
+            .unattended = options.unattended,
+            .approval = null,
+            .approval_context = null,
         };
         var arena_active = true;
         errdefer if (arena_active) self.arena.deinit();
         const a = self.arena.allocator();
+        if (options.unattended and options.security_mode != .secure) return error.UnattendedRequiresSecureMode;
         if (options.security_mode == .secure and options.audit_log == null) return error.SecureModeRequiresAuditLog;
+        if (options.unattended and options.security_policy_file == null) return error.UnattendedRequiresSecurityPolicy;
         if (options.security_policy_file != null and options.security_mode != .secure) return error.PersistentPolicyRequiresSecureMode;
         if (options.request_capabilities.len > 0 and options.audit_log == null) return error.RequestGrantRequiresAuditLog;
+        const effective_sandbox_mode: zpi.sandbox.Mode = options.sandbox_mode orelse if (options.security_mode == .secure or options.unattended) .workspace_write else .off;
+        if (options.unattended and effective_sandbox_mode == .off) return error.UnattendedRequiresSandbox;
+        const effective_env_isolation: zpi.sandbox.EnvIsolation = options.env_isolation orelse if (options.security_mode == .secure or effective_sandbox_mode != .off or options.unattended) .strict else .inherit;
+        if (options.unattended and effective_env_isolation != .strict) return error.UnattendedRequiresEnvIsolation;
+        if (effective_sandbox_mode != .off) {
+            _ = try zpi.sandbox.detectBackend(io, options.sandbox_backend);
+        }
         self.audit_sink = try zpi.audit.Sink.init(gpa, io, options.audit_log);
         errdefer self.audit_sink.deinit();
         const file_grants = if (options.security_policy_file) |path| blk: {
@@ -495,6 +525,21 @@ pub const Harness = struct {
         };
         errdefer self.store.deinit();
         self.cwd = cwd;
+        const env_allow = try a.alloc([]const u8, options.env_allow.len);
+        for (options.env_allow, env_allow) |entry, *dst| {
+            if (!zpi.sandbox.validateEnvVarName(entry)) return error.InvalidEnvAllowlist;
+            dst.* = try a.dupe(u8, entry);
+        }
+        const canonical_workspace = zpi.sandbox.canonicalizePath(a, io, host_cwd, cwd, false) catch try a.dupe(u8, cwd);
+        self.sandbox = .{
+            .mode = effective_sandbox_mode,
+            .network = options.sandbox_network,
+            .backend = options.sandbox_backend,
+            .env_isolation = effective_env_isolation,
+            .workspace = canonical_workspace,
+            .env_allow = env_allow,
+            .parent_environ = environ,
+        };
 
         self.mcp_clients = try a.alloc(zpi.mcp.Client, options.mcp_servers.len);
         errdefer for (self.mcp_clients[0..self.mcp_started]) |*client| client.deinit();
@@ -528,6 +573,7 @@ pub const Harness = struct {
             .allow_loopback_web_fetch = options.allow_loopback_web_fetch,
             .io = io,
             .cwd = cwd,
+            .sandbox = self.sandbox,
         });
         errdefer self.tool_set.deinit();
         if (self.tool_set.bg_manager) |mgr| {
@@ -535,7 +581,7 @@ pub const Harness = struct {
         }
 
         const delegation = try a.create(subagent.Context);
-        delegation.* = .{ .parent = self, .run_child = runChildErased };
+        delegation.* = .{ .parent = self, .run_child = runChildErased, .fail_stop = self.unattended };
         const builtins = try a.alloc(agent.Tool, self.tool_set.tools.len + 1);
         @memcpy(builtins[0..self.tool_set.tools.len], self.tool_set.tools);
         builtins[self.tool_set.tools.len] = try subagent.definition(a, delegation);
@@ -584,13 +630,13 @@ pub const Harness = struct {
         const mcp_names = try a.alloc([]const u8, options.mcp_servers.len);
         for (options.mcp_servers, mcp_names, self.mcp_clients) |server, *mname, *client| {
             mname.* = try a.dupe(u8, server.name);
-            const server_auth = try self.authorize(.mcp_start, .mcp, .server, null);
+            const server_auth = try self.authorizeTarget(.mcp_start, .mcp, .server, server.name, null);
             if (!server_auth.result.allowed()) return error.CapabilityDenied;
-            const process_auth = try self.authorize(.process_exec, .mcp, .command, server_auth.event_id);
+            const process_auth = try self.authorizeTarget(.process_exec, .mcp, .command, server.argv[0], server_auth.event_id);
             if (!process_auth.result.allowed()) return error.CapabilityDenied;
             const command = try a.alloc([]const u8, server.argv.len);
             for (server.argv, command) |arg, *value| value.* = arg;
-            client.* = zpi.mcp.Client.start(gpa, io, .{ .argv = command, .cwd = cwd }) catch |err| {
+            client.* = zpi.mcp.Client.start(gpa, io, .{ .argv = command, .cwd = cwd, .sandbox = self.sandbox }) catch |err| {
                 try self.auditOutcome(.failed, process_auth);
                 try self.auditOutcome(.failed, server_auth);
                 return err;
@@ -630,14 +676,20 @@ pub const Harness = struct {
             for (options.extensions, paths) |path, *resolved| {
                 resolved.* = try std.fs.path.resolveAlloc(a, &.{ host_cwd, path });
             }
+            const ext_read_dirs = try a.alloc([]const u8, paths.len);
+            for (paths, ext_read_dirs) |p, *dst| {
+                dst.* = std.fs.path.dirname(p) orelse p;
+            }
             const extension_auth = try self.authorize(.extension_load, .typescript, .plugin, null);
             if (!extension_auth.result.allowed()) return error.CapabilityDenied;
-            const process_auth = try self.authorize(.process_exec, .typescript, .command, extension_auth.event_id);
+            const process_auth = try self.authorizeTarget(.process_exec, .typescript, .command, "node", extension_auth.event_id);
             if (!process_auth.result.allowed()) return error.CapabilityDenied;
             self.extension_host = zpi.extensions.Host.start(gpa, io, .{
                 .host_script = script,
                 .sdk_directory = sdk_directory,
                 .cwd = cwd,
+                .sandbox = self.sandbox,
+                .extra_read_paths = ext_read_dirs,
             }) catch |err| {
                 try self.auditOutcome(.failed, process_auth);
                 try self.auditOutcome(.failed, extension_auth);
@@ -1210,11 +1262,58 @@ pub const Harness = struct {
         };
     }
 
-    fn runChildErased(parent: *anyopaque, ctx: agent.ToolContext, request: subagent.Request, sink: agent.Sink) anyerror![]const u8 {
+    fn runChildErased(parent: *anyopaque, ctx: agent.ToolContext, request: subagent.Request, sink: agent.Sink) anyerror!subagent.ChildOutput {
         const self: *Harness = @ptrCast(@alignCast(parent));
+        var active_wt: ?worktree.Worktree = null;
+        var child_cwd = ctx.cwd;
+        var extra_reads_storage: [1][]const u8 = undefined;
+        var extra_reads: []const []const u8 = &.{};
+
+        const want_worktree = switch (self.subagent_isolation) {
+            .worktree => true,
+            .shared => request.isolation == .worktree,
+            .auto => request.isolation == .worktree or (request.isolation == .inherit and request.parallel_count > 1),
+        };
+        const require_worktree = self.subagent_isolation == .worktree or request.isolation == .worktree;
+
+        if (want_worktree) {
+            self.worktree_mutex.lockUncancelable(ctx.io);
+            defer self.worktree_mutex.unlock(ctx.io);
+            const repo_opt: ?worktree.RepoInfo = worktree.verifyGitRepo(ctx.allocator, ctx.io, ctx.cwd) catch |err| blk: {
+                if (require_worktree) return err;
+                break :blk null;
+            };
+            if (repo_opt) |repo| {
+                const wt_base = try std.fs.path.join(ctx.allocator, &.{ self.tool_set.temp_dir, "zpi-worktrees" });
+                const wt = try worktree.create(ctx.allocator, ctx.io, repo, wt_base, request.name);
+                active_wt = wt;
+                child_cwd = wt.path;
+                extra_reads_storage[0] = wt.git_common_dir;
+                extra_reads = extra_reads_storage[0..1];
+            }
+        }
+        var wt_cleaned = false;
+        defer if (active_wt) |wt| {
+            if (!wt_cleaned) {
+                self.worktree_mutex.lockUncancelable(ctx.io);
+                defer self.worktree_mutex.unlock(ctx.io);
+                worktree.remove(ctx.allocator, ctx.io, wt);
+            }
+        };
+
+        var child_sandbox = self.sandbox;
+        child_sandbox.workspace = zpi.sandbox.canonicalizePath(ctx.allocator, ctx.io, child_cwd, child_cwd, false) catch child_cwd;
+        if (extra_reads.len > 0) {
+            var merged: std.ArrayList([]const u8) = .empty;
+            for (self.sandbox.extra_read_paths) |p| try merged.append(ctx.allocator, p);
+            for (extra_reads) |p| try merged.append(ctx.allocator, p);
+            child_sandbox.extra_read_paths = merged.items;
+        }
         var tools = try zpi.tools.ToolSet.initWithOptions(ctx.allocator, .{
             .temp_dir = self.tool_set.temp_dir,
             .allow_loopback_web_fetch = self.tool_set.web_fetch_store.allow_loopback,
+            .cwd = child_cwd,
+            .sandbox = child_sandbox,
         });
         defer tools.deinit();
         var enabled: std.ArrayList(agent.Tool) = .empty;
@@ -1240,9 +1339,10 @@ pub const Harness = struct {
             .openai_responses => responses.provider(),
             .anthropic_messages => anthropic.provider(),
         };
-        var child = agent.Agent.init(ctx.allocator, ctx.io, provider, enabled.items, ctx.cwd);
+        var child = agent.Agent.init(ctx.allocator, ctx.io, provider, enabled.items, child_cwd);
         defer child.deinit();
         self.configureSecurity(&child);
+        if (active_wt) |wt| child.policy_root_override = wt.repo_root;
         child.cancel = ctx.cancel;
         child.retry = self.runtime.retry;
         child.max_turns = request.max_turns;
@@ -1257,19 +1357,47 @@ pub const Harness = struct {
             .text => |value| try text.appendSlice(ctx.allocator, value),
             else => {},
         };
-        return ctx.allocator.dupe(u8, text.items);
+
+        var wt_info: ?subagent.WorktreeInfo = null;
+        if (active_wt) |wt| {
+            self.worktree_mutex.lockUncancelable(ctx.io);
+            defer self.worktree_mutex.unlock(ctx.io);
+            const summary = try worktree.inspect(ctx.allocator, ctx.io, wt, request.keep_worktree);
+            wt_info = .{
+                .isolated = summary.isolated,
+                .head = summary.head,
+                .changedFiles = summary.changed_files,
+                .diff = summary.diff,
+                .diffTruncated = summary.diff_truncated,
+                .preserved = summary.preserved,
+                .path = summary.path,
+            };
+            if (!request.keep_worktree) {
+                worktree.remove(ctx.allocator, ctx.io, wt);
+            }
+            wt_cleaned = true;
+        }
+        return .{
+            .text = try ctx.allocator.dupe(u8, text.items),
+            .worktree = wt_info,
+        };
     }
 
     fn configureSecurity(self: *Harness, runtime: *agent.Agent) void {
         if (self.security_policy.mode == .compatibility and !self.audit_sink.enabled() and self.security_policy.grants.len == 0) return;
         runtime.security_context = self;
         runtime.authorize_tool = authorizeToolErased;
+        runtime.authorize_url = authorizeUrlErased;
         runtime.audit_tool_outcome = auditToolOutcomeErased;
+        runtime.fail_stop_on_denial = self.unattended;
     }
 
-    fn authorizeToolErased(context: ?*anyopaque, tool: agent.Tool, authorization: *?zpi.security.Authorization) anyerror!void {
+    fn authorizeToolErased(context: ?*anyopaque, tool: agent.Tool, tool_context: agent.ToolContext, arguments: std.json.Value, authorization: *?zpi.security.Authorization) anyerror!void {
         const self: *Harness = @ptrCast(@alignCast(context.?));
         const capability = tool.capability orelse return error.UnclassifiedTool;
+        // Web fetch authorizes each actual destination immediately before use,
+        // including extension-rewritten URLs and redirects.
+        if (tool.builtin and std.mem.eql(u8, tool.definition.name, "web_fetch")) return;
         const target: zpi.security.TargetKind = switch (capability) {
             .filesystem_read, .filesystem_write => .path,
             .process_exec => .command,
@@ -1278,8 +1406,69 @@ pub const Harness = struct {
             .extension_load, .native_plugin_load => .plugin,
             else => .tool,
         };
-        authorization.* = try self.authorize(capability, tool.source, target, null);
-        if (!authorization.*.?.result.allowed()) return error.CapabilityDenied;
+        var owned_target: ?[]const u8 = null;
+        defer if (owned_target) |v| tool_context.allocator.free(v);
+        const target_value: ?[]const u8 = switch (target) {
+            .path => if (tool.builtin and arguments == .object) blk: {
+                const name = tool.definition.name;
+                if (std.mem.eql(u8, name, "get_content")) break :blk null;
+                const input = if (arguments.object.get("path")) |value| input: {
+                    if (value != .string) break :blk null;
+                    break :input value.string;
+                } else if (std.mem.eql(u8, name, "ls") or std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "grep")) "." else break :blk null;
+                const canonical = canonicalPolicyPath(tool_context, input, std.mem.eql(u8, name, "write")) catch |err| switch (err) {
+                    error.OutOfMemory, error.Canceled => return err,
+                    else => {
+                        authorization.* = try self.recordAuthorization(.{ .capability = capability, .source = tool.source, .target = .{ .kind = .path } }, .{
+                            .decision = .deny,
+                            .policy_source = .validation,
+                            .reason = "unresolved-path",
+                        }, null);
+                        return error.CapabilityDenied;
+                    },
+                };
+                owned_target = canonical;
+                break :blk canonical;
+            } else null,
+            .command => if (arguments == .object) blk: {
+                const value = arguments.object.get("command") orelse break :blk tool.definition.name;
+                break :blk if (value == .string) value.string else tool.definition.name;
+            } else tool.definition.name,
+            .url => if (arguments == .object) blk: {
+                const value = arguments.object.get("url") orelse break :blk null;
+                break :blk if (value == .string) value.string else null;
+            } else null,
+            else => tool.definition.name,
+        };
+        var recorded = try self.authorizeTarget(capability, tool.source, target, target_value, null);
+        // Never retain transient target_value pointers after authorization returns.
+        recorded.request.target.value = null;
+        authorization.* = recorded;
+        if (!recorded.result.allowed()) return error.CapabilityDenied;
+    }
+
+    fn canonicalPolicyPath(ctx: agent.ToolContext, input: []const u8, allow_missing: bool) ![]const u8 {
+        const a = ctx.allocator;
+        const canonical = try zpi.sandbox.canonicalizePath(a, ctx.io, ctx.cwd, input, allow_missing);
+        if (ctx.policy_root_override) |policy_root| {
+            const cwd_canon = zpi.sandbox.canonicalizePath(a, ctx.io, ctx.cwd, ctx.cwd, false) catch return canonical;
+            defer a.free(cwd_canon);
+            if (zpi.sandbox.isWithinSubtree(canonical, cwd_canon)) {
+                defer a.free(canonical);
+                const rel = std.mem.trimStart(u8, canonical[cwd_canon.len..], "/");
+                if (rel.len == 0) return a.dupe(u8, policy_root);
+                return std.fs.path.join(a, &.{ policy_root, rel });
+            }
+        }
+        return canonical;
+    }
+
+    fn authorizeUrlErased(context: ?*anyopaque, url: []const u8, authorization: *?zpi.security.Authorization) anyerror!void {
+        const self: *Harness = @ptrCast(@alignCast(context.?));
+        var recorded = try self.authorizeTarget(.network_connect, .builtin_tool, .url, url, null);
+        recorded.request.target.value = null;
+        authorization.* = recorded;
+        if (!recorded.result.allowed()) return error.CapabilityDenied;
     }
 
     fn expireSessionGrants(self: *Harness) void {
@@ -1291,24 +1480,48 @@ pub const Harness = struct {
     fn auditToolOutcomeErased(context: ?*anyopaque, tool: agent.Tool, authorization: ?zpi.security.Authorization, outcome: zpi.security.Outcome) anyerror!void {
         const self: *Harness = @ptrCast(@alignCast(context.?));
         _ = tool.capability orelse return error.UnclassifiedTool;
-        try self.auditOutcome(outcome, authorization orelse return);
+        const recorded = authorization orelse return;
+        if (!recorded.result.allowed()) return;
+        try self.auditOutcome(outcome, recorded);
     }
 
     pub const Authorization = zpi.security.Authorization;
 
     pub fn authorize(self: *Harness, capability: zpi.security.Capability, source: zpi.security.Source, target: zpi.security.TargetKind, parent_id: ?u64) !Authorization {
+        return self.authorizeTarget(capability, source, target, null, parent_id);
+    }
+
+    pub fn authorizeTarget(self: *Harness, capability: zpi.security.Capability, source: zpi.security.Source, target: zpi.security.TargetKind, target_value: ?[]const u8, parent_id: ?u64) !Authorization {
         self.authorization_mutex.lockUncancelable(self.io);
         defer self.authorization_mutex.unlock(self.io);
-        const request: zpi.security.Request = .{ .capability = capability, .source = source, .target = .{ .kind = target } };
-        const policy = zpi.security.Policy{ .mode = self.security_policy.mode, .grants = self.grants, .active_scopes = self.security_policy.active_scopes, .consumed_request_grants = self.request_grants };
-        const result = zpi.security.evaluate(policy, request);
+        const request: zpi.security.Request = .{ .capability = capability, .source = source, .target = .{ .kind = target, .value = target_value } };
+        var result = self.evaluateAuthorization(request);
+        if (std.mem.eql(u8, result.reason, "missing-grant")) {
+            if (self.approval) |approve| {
+                self.authorization_mutex.unlock(self.io);
+                const outcome = approve(self.approval_context, request) catch .denied;
+                self.authorization_mutex.lockUncancelable(self.io);
+                result = self.evaluateAuthorization(request);
+                if (std.mem.eql(u8, result.reason, "missing-grant")) {
+                    result = switch (outcome) {
+                        .approved => .{ .decision = .allow, .policy_source = .approval, .reason = "interactive-approval" },
+                        .denied => .{ .decision = .deny, .policy_source = .approval, .reason = "interactive-denial" },
+                        .unavailable => result,
+                    };
+                }
+            }
+        }
+        return self.recordAuthorization(request, result, parent_id);
+    }
+
+    fn recordAuthorization(self: *Harness, request: zpi.security.Request, result: zpi.security.Result, parent_id: ?u64) !Authorization {
         if (result.decision == .invalid) return error.InvalidSecurityPolicy;
         const event_id = try self.audit_sink.append(.{
             .event = .authorization,
             .parent_id = parent_id,
-            .source = source,
-            .capability = capability,
-            .target_kind = target,
+            .source = request.source,
+            .capability = request.capability,
+            .target_kind = request.target.kind,
             .mode = self.security_policy.mode,
             .decision = result.decision,
             .outcome = if (result.allowed()) .allowed else .denied,
@@ -1320,6 +1533,15 @@ pub const Harness = struct {
             self.request_grants[index] = true;
         }
         return .{ .request = request, .result = result, .event_id = event_id };
+    }
+
+    fn evaluateAuthorization(self: *const Harness, request: zpi.security.Request) zpi.security.Result {
+        return zpi.security.evaluate(.{
+            .mode = self.security_policy.mode,
+            .grants = self.grants,
+            .active_scopes = self.security_policy.active_scopes,
+            .consumed_request_grants = self.request_grants,
+        }, request);
     }
 
     pub fn auditOutcome(self: *Harness, outcome: zpi.security.Outcome, authorization: Authorization) !void {
@@ -1344,7 +1566,7 @@ pub const Harness = struct {
 
     pub fn executeUserShell(self: *Harness, allocator: std.mem.Allocator, command: []const u8, cancel: ?zpi.model.Cancel) !agent.ToolResult {
         if (command.len == 0 or command.len > 16 * 1024) return error.InvalidCommand;
-        const authorization = try self.authorize(.process_exec, .system, .command, null);
+        const authorization = try self.authorizeTarget(.process_exec, .system, .command, command, null);
         if (!authorization.result.allowed()) return error.CapabilityDenied;
         const tool = for (self.tool_set.tools) |candidate| {
             if (std.mem.eql(u8, candidate.definition.name, "bash")) break candidate;
@@ -2050,4 +2272,98 @@ test "new session revokes its grants without restoring consumed grants" {
     try std.testing.expect(!(try h.authorizeClipboard()).result.allowed());
     try std.testing.expect(!(try h.authorize(.process_exec, .system, .command, null)).result.allowed());
     try std.testing.expectEqual(zpi.security.PolicySource.invocation, (try h.authorize(.filesystem_read, .builtin_tool, .path, null)).result.policy_source);
+}
+
+test "phase 1: target rules, one-time interactive approvals/denials, and headless audit records" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const ws = try std.fs.path.join(a, &.{ dir, "ws" });
+    defer a.free(ws);
+    try std.Io.Dir.cwd().createDirPath(io, ws);
+    const audit_path = try std.fs.path.join(a, &.{ dir, "phase1-audit.jsonl" });
+    defer a.free(audit_path);
+    const policy_path = try std.fs.path.join(a, &.{ dir, "phase1-policy.json" });
+    defer a.free(policy_path);
+
+    const policy_json = try a.print(
+        \\{{"version":1,"grants":[
+        \\  {{"capability":"filesystem.write","effect":"allow","target":{{"kind":"path","value":"{s}","match":"subtree"}}}},
+        \\  {{"capability":"process.exec","effect":"allow","target":{{"kind":"command","value":"git","match":"prefix"}}}},
+        \\  {{"capability":"network.connect","effect":"allow","target":{{"kind":"url","value":"https://api.example.com","match":"origin"}}}}
+        \\]}}
+    , .{ws});
+    defer a.free(policy_json);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, policy_path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer f.close(io);
+        try f.writeStreamingAll(io, policy_json);
+    }
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    const h = try Harness.create(a, io, &env, .{
+        .host_cwd = ws,
+        .session_dir = dir,
+        .security_mode = .secure,
+        .security_policy_file = policy_path,
+        .audit_log = audit_path,
+        .no_tools = true,
+        .no_skills = true,
+        .no_prompt_templates = true,
+    }, null);
+    defer h.deinit();
+
+    // Persistent target-scoped rules allow matching path, command, and URL origin.
+    const ws_file = try std.fs.path.join(a, &.{ ws, "ok.txt" });
+    defer a.free(ws_file);
+    try std.testing.expect((try h.authorizeTarget(.filesystem_write, .builtin_tool, .path, ws_file, null)).result.allowed());
+    try std.testing.expect((try h.authorizeTarget(.process_exec, .builtin_tool, .command, "git status", null)).result.allowed());
+    try std.testing.expect((try h.authorizeTarget(.network_connect, .builtin_tool, .url, "https://api.example.com/v1", null)).result.allowed());
+
+    // Headless (approval == null) fails closed on non-matching targets.
+    const headless_denied = try h.authorizeTarget(.process_exec, .builtin_tool, .command, "curl https://evil.test", null);
+    try std.testing.expect(!headless_denied.result.allowed());
+    try std.testing.expectEqual(zpi.security.PolicySource.validation, headless_denied.result.policy_source);
+    try std.testing.expectEqualStrings("missing-grant", headless_denied.result.reason);
+
+    // Interactive one-time approval: approve once, then deny next time (does not persist).
+    const PromptStub = struct {
+        next: zpi.security.ApprovalOutcome = .approved,
+        calls: usize = 0,
+        fn approve(raw: ?*anyopaque, _: zpi.security.Request) anyerror!zpi.security.ApprovalOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return self.next;
+        }
+    };
+    var stub: PromptStub = .{ .next = .approved };
+    h.approval = PromptStub.approve;
+    h.approval_context = &stub;
+
+    const approved_once = try h.authorizeTarget(.process_exec, .builtin_tool, .command, "echo once", null);
+    try std.testing.expect(approved_once.result.allowed());
+    try std.testing.expectEqual(zpi.security.PolicySource.approval, approved_once.result.policy_source);
+    try std.testing.expectEqualStrings("interactive-approval", approved_once.result.reason);
+
+    stub.next = .denied;
+    const denied_once = try h.authorizeTarget(.process_exec, .builtin_tool, .command, "echo once", null);
+    try std.testing.expect(!denied_once.result.allowed());
+    try std.testing.expectEqual(zpi.security.PolicySource.approval, denied_once.result.policy_source);
+    try std.testing.expectEqualStrings("interactive-denial", denied_once.result.reason);
+    try std.testing.expectEqual(@as(usize, 2), stub.calls);
+
+    // Audit log records every approval and denial without leaking raw paths, commands, or URLs.
+    const audit_bytes = try std.Io.Dir.cwd().readFileAlloc(io, audit_path, a, .limited(64 * 1024));
+    defer a.free(audit_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, audit_bytes, "\"reason\":\"interactive-approval\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_bytes, "\"reason\":\"interactive-denial\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_bytes, "\"reason\":\"missing-grant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_bytes, "\"policySource\":\"approval\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_bytes, "evil.test") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_bytes, "echo once") == null);
+    try std.testing.expect(std.mem.indexOf(u8, audit_bytes, ws_file) == null);
 }

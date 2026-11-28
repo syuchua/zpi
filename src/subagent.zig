@@ -8,20 +8,41 @@ const max_output_bytes = 8 * 1024;
 const max_stream_bytes = 128 * 1024;
 const max_progress_bytes = 32 * 1024;
 
+pub const Isolation = enum { inherit, shared, worktree };
+
+pub const WorktreeInfo = struct {
+    isolated: bool = true,
+    head: []const u8,
+    changedFiles: []const []const u8,
+    diff: []const u8 = "",
+    diffTruncated: bool = false,
+    preserved: bool = false,
+    path: ?[]const u8 = null,
+};
+
+pub const ChildOutput = struct {
+    text: []const u8,
+    worktree: ?WorktreeInfo = null,
+};
+
 pub const Request = struct {
     name: []const u8,
     task: []const u8,
     max_turns: usize = 16,
+    isolation: Isolation = .inherit,
+    keep_worktree: bool = false,
+    parallel_count: usize = 1,
 };
 
 pub const Context = struct {
     parent: *anyopaque,
-    run_child: *const fn (*anyopaque, agent.ToolContext, Request, agent.Sink) anyerror![]const u8,
+    run_child: *const fn (*anyopaque, agent.ToolContext, Request, agent.Sink) anyerror!ChildOutput,
+    fail_stop: bool = false,
 };
 
 pub fn definition(a: std.mem.Allocator, context: *Context) !agent.Tool {
     const schema =
-        \\{"type":"object","properties":{"task":{"type":"string","description":"Self-contained task for one child"},"name":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"name":{"type":"string"},"task":{"type":"string"}},"required":["task"],"additionalProperties":false}},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600},"maxTurns":{"type":"integer","minimum":1,"maximum":32}},"additionalProperties":false}
+        \\{"type":"object","properties":{"task":{"type":"string","description":"Self-contained task for one child"},"name":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":4,"items":{"type":"object","properties":{"name":{"type":"string"},"task":{"type":"string"},"isolation":{"type":"string","enum":["shared","worktree"]},"keepWorktree":{"type":"boolean"}},"required":["task"],"additionalProperties":false}},"isolation":{"type":"string","enum":["shared","worktree"]},"keepWorktree":{"type":"boolean"},"timeoutSeconds":{"type":"integer","minimum":1,"maximum":3600},"maxTurns":{"type":"integer","minimum":1,"maximum":32}},"additionalProperties":false}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, a, schema, .{});
     return .{
@@ -30,7 +51,7 @@ pub fn definition(a: std.mem.Allocator, context: *Context) !agent.Tool {
         .context = context,
         .definition = .{
             .name = "subagent",
-            .description = "Run a self-contained task, or up to 4 independent tasks concurrently, in native child agents. Children inherit current model and system instructions, start fresh conversations, and use eligible parent-enabled native tools. Working directory is shared. Provide task or tasks. Returns bounded named results and live progress. timeoutSeconds applies to the whole batch. Child conversations are in memory.",
+            .description = "Run a self-contained task, or up to 4 independent tasks concurrently, in native child agents. Children inherit current model and system instructions, start fresh conversations, and use eligible parent-enabled native tools. Optional isolation=\"worktree\" runs each child in an isolated detached git worktree and returns changedFiles/diff without modifying the parent working tree. Provide task or tasks. Returns bounded named results and live progress. timeoutSeconds applies to the whole batch. Child conversations are in memory.",
             .parameters = parsed.value,
         },
         .execute = execute,
@@ -43,35 +64,41 @@ const Result = struct {
     text: []const u8 = "",
     error_code: ?[]const u8 = null,
     truncated: bool = false,
+    worktree: ?WorktreeInfo = null,
 };
 
 const Worker = struct {
     batch: *Batch,
     request: Request,
     cancel: *agent.model.Interrupt,
+    arena: std.heap.ArenaAllocator,
     result: Result,
     output: [max_output_bytes]u8 = undefined,
     streamed: usize = 0,
+    fail_stop_err: ?anyerror = null,
 
     fn run(self: *Worker) void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
         var ctx = self.batch.ctx;
-        ctx.allocator = arena.allocator();
+        ctx.allocator = self.arena.allocator();
         ctx.cancel = self.cancel.cancel();
         ctx.on_update = null;
         ctx.update_context = null;
-        const text = self.batch.context.run_child(self.batch.context.parent, ctx, self.request, .{
+        const child_out = self.batch.context.run_child(self.batch.context.parent, ctx, self.request, .{
             .context = self,
             .emit = emit,
         }) catch |err| {
             self.result.error_code = @errorName(err);
+            if (self.batch.context.fail_stop and (err == error.CapabilityDenied or err == error.PathOutsideWorkspace or err == error.SandboxWriteDenied)) {
+                self.fail_stop_err = err;
+                self.batch.stop();
+            }
             return;
         };
-        const len = clippedLength(text, self.output.len);
-        @memcpy(self.output[0..len], text[0..len]);
+        const len = clippedLength(child_out.text, self.output.len);
+        @memcpy(self.output[0..len], child_out.text[0..len]);
         self.result.text = self.output[0..len];
-        self.result.truncated = len < text.len;
+        self.result.truncated = len < child_out.text.len;
+        self.result.worktree = child_out.worktree;
         self.result.status = .completed;
     }
 
@@ -170,21 +197,32 @@ fn timer(io: std.Io, seconds: usize) std.Io.Cancelable!void {
 
 fn execute(raw: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     const context: *Context = @ptrCast(@alignCast(raw.?));
-    try keys(args, &.{ "task", "tasks", "name", "timeoutSeconds", "maxTurns" });
+    try keys(args, &.{ "task", "tasks", "name", "isolation", "keepWorktree", "timeoutSeconds", "maxTurns" });
     const max_turns = try number(args, "maxTurns", 16, 32);
     const timeout_seconds = try number(args, "timeoutSeconds", 300, 3600);
+    const default_isolation = try parseIsolation(args);
+    const default_keep_worktree = try parseBool(args, "keepWorktree", false);
     var requests: [max_tasks]Request = undefined;
     var count: usize = 0;
     if (args.object.get("tasks")) |tasks| {
         if (args.object.get("task") != null or args.object.get("name") != null) return error.ConflictingSubagentTasks;
         if (tasks != .array or tasks.array.items.len == 0 or tasks.array.items.len > max_tasks) return error.InvalidSubagentTasks;
         for (tasks.array.items) |item| {
-            try keys(item, &.{ "name", "task" });
-            requests[count] = try request(item, max_turns);
+            try keys(item, &.{ "name", "task", "isolation", "keepWorktree" });
+            var req = try request(item, max_turns);
+            const item_iso = try parseIsolation(item);
+            req.isolation = if (item_iso != .inherit) item_iso else default_isolation;
+            req.keep_worktree = try parseBool(item, "keepWorktree", default_keep_worktree);
+            req.parallel_count = tasks.array.items.len;
+            requests[count] = req;
             count += 1;
         }
     } else {
-        requests[0] = try request(args, max_turns);
+        var req = try request(args, max_turns);
+        req.isolation = default_isolation;
+        req.keep_worktree = default_keep_worktree;
+        req.parallel_count = 1;
+        requests[0] = req;
         count = 1;
     }
     if (ctx.cancel) |cancel| if (cancel.isCanceled()) return error.Canceled;
@@ -220,9 +258,16 @@ fn execute(raw: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyer
             batch.done.trigger();
             watchdog.join();
         }
+        for (workers[0..started]) |*worker| worker.arena.deinit();
     }
     for (requests[0..count], 0..) |req, i| {
-        workers[i] = .{ .batch = &batch, .request = req, .cancel = &child_interrupts[i], .result = .{ .name = req.name } };
+        workers[i] = .{
+            .batch = &batch,
+            .request = req,
+            .cancel = &child_interrupts[i],
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .result = .{ .name = req.name },
+        };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{&workers[i]});
         started += 1;
     }
@@ -233,6 +278,9 @@ fn execute(raw: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyer
     if (ctx.cancel) |cancel| if (cancel.isCanceled()) return error.Canceled;
     if (batch.progress_error) |err| return err;
     if (batch.monitor_error) |err| return err;
+    for (workers[0..count]) |*worker| {
+        if (worker.fail_stop_err) |err| return err;
+    }
     var results: [max_tasks]Result = undefined;
     var failed = batch.timed_out;
     for (workers[0..count], results[0..count]) |*worker, *result| {
@@ -242,6 +290,20 @@ fn execute(raw: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyer
     }
     const text = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .results = results[0..count], .timedOut = batch.timed_out }, .{ .emit_null_optional_fields = false });
     return .{ .text = text, .is_error = failed, .details = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, text, .{ .allocate = .alloc_always }) };
+}
+
+fn parseIsolation(args: std.json.Value) !Isolation {
+    const val = args.object.get("isolation") orelse return .inherit;
+    if (val != .string) return error.InvalidSubagentIsolation;
+    if (std.mem.eql(u8, val.string, "shared")) return .shared;
+    if (std.mem.eql(u8, val.string, "worktree")) return .worktree;
+    return error.InvalidSubagentIsolation;
+}
+
+fn parseBool(args: std.json.Value, key: []const u8, fallback: bool) !bool {
+    const val = args.object.get(key) orelse return fallback;
+    if (val != .bool) return error.ExpectedBoolean;
+    return val.bool;
 }
 
 fn clippedLength(text: []const u8, limit: usize) usize {

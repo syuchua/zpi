@@ -281,6 +281,9 @@ pub fn executeWebFetch(context: ?*anyopaque, ctx: agent.ToolContext, args: std.j
             timeout_sec,
             store.allow_loopback,
             ctx.cancel,
+            ctx.authorize_url,
+            ctx.authorization_context,
+            ctx.rewritten_authorization,
         );
         built += 1;
     }
@@ -438,11 +441,15 @@ fn fetchSingleUrl(
     timeout_sec: usize,
     allow_loopback: bool,
     cancel: ?model.Cancel,
+    authorize_url: ?*const fn (?*anyopaque, []const u8, *?agent.security.Authorization) anyerror!void,
+    authorization_context: ?*anyopaque,
+    authorization_slot: ?*?agent.security.Authorization,
 ) !PageRecord {
     const owned_url = try store_alloc.dupe(u8, raw_url);
     errdefer store_alloc.free(owned_url);
 
-    const res = fetchWithRedirects(scratch, io, raw_url, mode, redirect_mode, timeout_sec, allow_loopback, cancel) catch |err| {
+    const res = fetchWithRedirects(scratch, io, raw_url, mode, redirect_mode, timeout_sec, allow_loopback, cancel, authorize_url, authorization_context, authorization_slot) catch |err| {
+        if (err == error.CapabilityDenied) return err;
         const err_msg = try store_alloc.dupe(u8, @errorName(err));
         errdefer store_alloc.free(err_msg);
         return .{
@@ -491,6 +498,9 @@ fn fetchWithRedirects(
     timeout_sec: usize,
     allow_loopback: bool,
     cancel: ?model.Cancel,
+    authorize_url: ?*const fn (?*anyopaque, []const u8, *?agent.security.Authorization) anyerror!void,
+    authorization_context: ?*anyopaque,
+    authorization_slot: ?*?agent.security.Authorization,
 ) !FetchOutcome {
     if (std.mem.indexOfAny(u8, raw_url, "\x00\r\n") != null) return error.InvalidUrl;
     var current_url = try a.dupe(u8, raw_url);
@@ -507,6 +517,11 @@ fn fetchWithRedirects(
         const remain_ms: u64 = @intCast(deadline_ms - now_ms);
 
         try validateUriBasics(current_uri);
+        if (authorize_url) |authorize| {
+            var local_auth: ?agent.security.Authorization = null;
+            const slot = authorization_slot orelse &local_auth;
+            try authorize(authorization_context, current_url, slot);
+        }
         try validateUrlSsrf(io, current_uri, allow_loopback);
 
         var http: std.http.Client = .{ .allocator = a, .io = io };
@@ -598,7 +613,6 @@ fn fetchWithRedirects(
             if (redirect_mode == .same_origin and !sameOrigin(initial_uri, next_uri)) {
                 return error.CrossOriginRedirectBlocked;
             }
-            try validateUrlSsrf(io, next_uri, allow_loopback);
             current_url = next_url;
             current_uri = next_uri;
             hop += 1;
@@ -1186,7 +1200,7 @@ test "web_fetch and get_content handle loopback HTTP, redirects, SSRF, paginatio
         port: u16,
         fn serve(self: *@This()) void {
             var count: usize = 0;
-            while (count < 5) : (count += 1) {
+            while (count < 6) : (count += 1) {
                 var stream = self.srv.accept(self.io) catch return;
                 defer stream.close(self.io);
                 var rbuf: [4096]u8 = undefined;
@@ -1251,6 +1265,20 @@ test "web_fetch and get_content handle loopback HTTP, redirects, SSRF, paginatio
     defer test_store.deinit();
     const redir_ok = try std.fmt.allocPrint(arena.allocator(), "http://127.0.0.1:{d}/redir-ok", .{port});
     const args2 = try std.json.parseFromSlice(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"url\":\"{s}\"}}", .{redir_ok}), .{});
+    const DenyRedirect = struct {
+        calls: usize = 0,
+        fn authorize(raw: ?*anyopaque, url: []const u8, _: *?agent.security.Authorization) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (std.mem.endsWith(u8, url, "/page")) return error.CapabilityDenied;
+        }
+    };
+    var guard = DenyRedirect{};
+    var guarded_ctx = ctx;
+    guarded_ctx.authorize_url = DenyRedirect.authorize;
+    guarded_ctx.authorization_context = &guard;
+    try std.testing.expectError(error.CapabilityDenied, executeWebFetch(&test_store, guarded_ctx, args2.value));
+    try std.testing.expectEqual(@as(usize, 2), guard.calls);
     const res2 = try executeWebFetch(&test_store, ctx, args2.value);
     try std.testing.expect(!res2.is_error);
     try std.testing.expect(std.mem.indexOf(u8, res2.text, "Zpi Page") != null);

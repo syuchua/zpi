@@ -6,6 +6,8 @@ pub const OutputMode = enum { auto, interactive, print, json, rpc };
 pub const Mode = enum { tui, print, json };
 pub const McpServer = struct { name: []const u8, argv: []const [:0]const u8 };
 
+pub const SubagentIsolation = enum { shared, worktree, auto };
+
 pub const Options = struct {
     mode: OutputMode = .auto,
     prompt: std.ArrayList([]const u8) = .empty,
@@ -48,6 +50,13 @@ pub const Options = struct {
     request_capabilities: std.ArrayList(zpi.security.Capability) = .empty,
     session_capabilities: std.ArrayList(zpi.security.Capability) = .empty,
     security_policy_file: ?[]const u8 = null,
+    sandbox_mode: ?zpi.sandbox.Mode = null,
+    sandbox_network: zpi.sandbox.Network = .off,
+    sandbox_backend: zpi.sandbox.Backend = .auto,
+    env_isolation: ?zpi.sandbox.EnvIsolation = null,
+    env_allow: std.ArrayList([]const u8) = .empty,
+    subagent_isolation: SubagentIsolation = .shared,
+    unattended: bool = false,
     context_files: bool = false,
     no_context_files: bool = false,
     doctor_subcommand: bool = false,
@@ -76,6 +85,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
     errdefer result.allow_capabilities.deinit(allocator);
     errdefer result.request_capabilities.deinit(allocator);
     errdefer result.session_capabilities.deinit(allocator);
+    errdefer result.env_allow.deinit(allocator);
     var selected_mode: ?OutputMode = null;
     var positional_only = false;
     var i: usize = 0;
@@ -171,6 +181,53 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
             const value = if (std.mem.eql(u8, arg, "--audit-log")) try takeValue(args, &i) else arg[12..];
             if (value.len == 0) return error.InvalidAuditPath;
             result.audit_log = value;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--sandbox") or std.mem.startsWith(u8, arg, "--sandbox="))) {
+            const value = if (std.mem.eql(u8, arg, "--sandbox")) try takeValue(args, &i) else arg[10..];
+            result.sandbox_mode = zpi.sandbox.Mode.parse(value) orelse return error.InvalidSandboxMode;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--sandbox-network") or std.mem.startsWith(u8, arg, "--sandbox-network="))) {
+            const prefix = "--sandbox-network=";
+            const value = if (std.mem.eql(u8, arg, "--sandbox-network")) try takeValue(args, &i) else arg[prefix.len..];
+            result.sandbox_network = zpi.sandbox.Network.parse(value) orelse return error.InvalidSandboxNetwork;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--sandbox-backend") or std.mem.startsWith(u8, arg, "--sandbox-backend="))) {
+            const prefix = "--sandbox-backend=";
+            const value = if (std.mem.eql(u8, arg, "--sandbox-backend")) try takeValue(args, &i) else arg[prefix.len..];
+            result.sandbox_backend = zpi.sandbox.Backend.parse(value) orelse return error.InvalidSandboxBackend;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--env-isolation") or std.mem.startsWith(u8, arg, "--env-isolation="))) {
+            const prefix = "--env-isolation=";
+            const value = if (std.mem.eql(u8, arg, "--env-isolation")) try takeValue(args, &i) else arg[prefix.len..];
+            result.env_isolation = zpi.sandbox.EnvIsolation.parse(value) orelse return error.InvalidEnvIsolation;
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--env-allow") or std.mem.startsWith(u8, arg, "--env-allow="))) {
+            const prefix = "--env-allow=";
+            const value = if (std.mem.eql(u8, arg, "--env-allow")) try takeValue(args, &i) else arg[prefix.len..];
+            if (!zpi.sandbox.validateEnvVarName(value)) return error.InvalidEnvAllowlist;
+            if (result.env_allow.items.len >= 64) return error.TooManyEnvAllowEntries;
+            try result.env_allow.append(allocator, value);
+            continue;
+        }
+        if (!positional_only and (std.mem.eql(u8, arg, "--subagent-isolation") or std.mem.startsWith(u8, arg, "--subagent-isolation="))) {
+            const prefix = "--subagent-isolation=";
+            const value = if (std.mem.eql(u8, arg, "--subagent-isolation")) try takeValue(args, &i) else arg[prefix.len..];
+            if (std.mem.eql(u8, value, "shared")) {
+                result.subagent_isolation = .shared;
+            } else if (std.mem.eql(u8, value, "worktree")) {
+                result.subagent_isolation = .worktree;
+            } else if (std.mem.eql(u8, value, "auto")) {
+                result.subagent_isolation = .auto;
+            } else return error.InvalidSubagentIsolation;
+            continue;
+        }
+        if (!positional_only and std.mem.eql(u8, arg, "--unattended")) {
+            result.unattended = true;
             continue;
         }
         if (!positional_only and std.mem.eql(u8, arg, "--enable-project-context")) {
