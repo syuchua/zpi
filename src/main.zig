@@ -7,6 +7,8 @@ const initial_prompt = @import("cli/initial_prompt.zig");
 const rpc = @import("rpc.zig");
 const pi_session = @import("pi_session");
 const doctor = @import("doctor");
+const mcp_config = @import("mcp_config");
+const manage = @import("manage");
 const error_hint = @import("error_hint");
 const context_files = @import("context_files");
 const tui = if (build_options.enable_tui) @import("tui") else struct {};
@@ -19,6 +21,9 @@ const help =
     \\       zpi [options] --image PATH    Analyze an image with a text prompt
     \\       zpi [options]                 Interactive full-screen terminal UI
     \\       zpi doctor                    Offline configuration and runtime checks
+    \\       zpi auth status|set|remove    Manage provider credentials (0600 models.json)
+    \\       zpi models list|set-default   List models or set default provider/model
+    \\       zpi mcp list|add|remove       Manage ~/.zpi/agent/mcp.json servers
     \\       zpi --import-pi-session SOURCE --session DESTINATION
     \\
     \\Examples:
@@ -33,7 +38,7 @@ const help =
     \\  --mode text            Text output; print when stdin/stdout is redirected
     \\  --mode json            Write Zpi JSONL events and exit
     \\  --mode rpc             Serve experimental JSONL commands over stdin/stdout
-    \\  --provider ID          Provider from models.json, openai, or anthropic
+    \\  --provider ID          Provider from models.json, openai, anthropic, or gemini
     \\  --model ID             Exact ID or known PROVIDER/ID[:THINKING] (without --provider)
     \\  --thinking LEVEL       Reasoning level: off, minimal, low, medium, high, xhigh, max
     \\  --models-file PATH     Explicit models.json (e.g. ~/.pi/agent/models.json)
@@ -57,6 +62,8 @@ const help =
     \\  -np, --no-prompt-templates Disable default template discovery
     \\  --trust-project-prompts Load templates from .zpi/prompts in the project
     \\  --mcp-stdio NAME -- COMMAND [ARG...] Start a trusted MCP stdio server (repeatable)
+    \\  --trust-project-mcp    Load project MCP servers from .zpi/mcp.json or .mcp.json
+    \\  --no-mcp-config        Ignore user and project mcp.json files
     \\  --no-session           Keep the conversation in memory
     \\  --no-tools, -nt        Disable all tools by default
     \\  --no-builtin-tools, -nbt Disable built-ins by default; keep plugins
@@ -139,7 +146,21 @@ fn runDoctor(init: std.process.Init, a: std.mem.Allocator, options: *const args_
         .no_prompt_templates = options.no_prompt_templates,
         .prompt_templates = options.prompt_templates.items,
         .trust_project_prompts = options.trust_project_prompts,
+        .trust_project_mcp = options.trust_project_mcp,
+        .no_mcp_config = options.no_mcp_config,
     });
+    try stdout.interface.flush();
+}
+
+fn runManageSubcommand(init: std.process.Init, a: std.mem.Allocator, sub: args_module.Subcommand, sub_args: []const [:0]const u8) !void {
+    const host_cwd = try std.process.currentPathAlloc(init.io, a);
+    var buffer: [8192]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
+    switch (sub) {
+        .auth => try manage.runAuth(init.io, a, host_cwd, init.environ_map, sub_args, null, &stdout.interface),
+        .models => try manage.runModels(init.io, a, host_cwd, init.environ_map, sub_args, &stdout.interface),
+        .mcp => try manage.runMcp(init.io, a, host_cwd, init.environ_map, sub_args, &stdout.interface),
+    }
     try stdout.interface.flush();
 }
 
@@ -209,6 +230,7 @@ fn run(init: std.process.Init) !void {
         return std.Io.File.stdout().writeStreamingAll(init.io, "zpi " ++ zpi.VERSION ++ "\n");
     }
     if (options.doctor_subcommand) return runDoctor(init, a, &options);
+    if (options.subcommand) |sub| return runManageSubcommand(init, a, sub, options.subcommand_args);
     if (options.unattended and options.mode == .interactive) return error.UnattendedRequiresHeadlessMode;
     if (options.mode == .interactive and !build_options.enable_tui) return error.TuiDisabled;
 
@@ -252,8 +274,22 @@ fn run(init: std.process.Init) !void {
     }
     const cancel_token: ?zpi.model.Cancel = if (interrupt) |*int| int.cancel() else null;
 
-    const mcp_servers = try a.alloc(harness.McpServer, options.mcp_servers.items.len);
-    for (options.mcp_servers.items, mcp_servers) |server, *dst| {
+    const configured_mcp = try mcp_config.load(
+        a,
+        init.io,
+        host_cwd,
+        options.cwd orelse host_cwd,
+        init.environ_map,
+        options.trust_project_mcp,
+        options.no_mcp_config,
+    );
+    const cli_mcp = try a.alloc(mcp_config.CliServer, options.mcp_servers.items.len);
+    for (options.mcp_servers.items, cli_mcp) |server, *dst| {
+        dst.* = .{ .name = server.name, .argv = server.argv };
+    }
+    const merged_mcp = try mcp_config.mergeWithCli(a, configured_mcp, cli_mcp);
+    const mcp_servers = try a.alloc(harness.McpServer, merged_mcp.len);
+    for (merged_mcp, mcp_servers) |server, *dst| {
         dst.* = .{ .name = server.name, .argv = server.argv };
     }
 
@@ -371,6 +407,8 @@ fn run(init: std.process.Init) !void {
                 .run = CliAdapter.submitErased,
                 .new_session = CliAdapter.newSessionErased,
                 .session_info = CliAdapter.sessionInfoErased,
+                .cost_info = CliAdapter.costInfoErased,
+                .context_info = CliAdapter.contextInfoErased,
                 .copy_last_reply = CliAdapter.copyLastReplyErased,
                 .copy_selection = CliAdapter.copySelectionErased,
                 .render_initial_history = CliAdapter.renderInitialHistoryErased,
@@ -445,8 +483,13 @@ const CliAdapter = struct {
     cached_tokens: u64 = 0,
     committed_in_tokens: u64 = 0,
     committed_out_tokens: u64 = 0,
+    committed_cache_read_tokens: u64 = 0,
+    committed_cache_write_tokens: u64 = 0,
     req_in_tokens: u64 = 0,
     req_out_tokens: u64 = 0,
+    req_cache_read_tokens: u64 = 0,
+    req_cache_write_tokens: u64 = 0,
+    usage_requests: usize = 0,
     harness: ?*harness.Harness = null,
 
     fn writeSafe(io: std.Io, file: std.Io.File, text: []const u8) !void {
@@ -538,8 +581,13 @@ const CliAdapter = struct {
         self.has_live_usage = false;
         self.committed_in_tokens = 0;
         self.committed_out_tokens = 0;
+        self.committed_cache_read_tokens = 0;
+        self.committed_cache_write_tokens = 0;
         self.req_in_tokens = 0;
         self.req_out_tokens = 0;
+        self.req_cache_read_tokens = 0;
+        self.req_cache_write_tokens = 0;
+        self.usage_requests = 0;
         self.status_mutex.unlock(self.io);
         self.refreshCachedStats();
     }
@@ -889,6 +937,61 @@ const CliAdapter = struct {
         );
         defer self.allocator.free(info);
         try self.historyText(info, false);
+    }
+
+    fn costInfoErased(context: *anyopaque) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const h = self.harness.?;
+        const summary = h.statusSummary();
+        const cost_cfg = h.modelCost();
+        self.status_mutex.lockUncancelable(self.io);
+        const in_tok = self.committed_in_tokens +| self.req_in_tokens;
+        const out_tok = self.committed_out_tokens +| self.req_out_tokens;
+        const cache_r = self.committed_cache_read_tokens +| self.req_cache_read_tokens;
+        const cache_w = self.committed_cache_write_tokens +| self.req_cache_write_tokens;
+        const reqs = self.usage_requests;
+        self.status_mutex.unlock(self.io);
+        const total_tok = in_tok +| out_tok +| cache_r +| cache_w;
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.print(self.allocator, "Usage & Cost\n\nModel: {s}/{s}\nRequests: {d}\nInput tokens: {d}\nOutput tokens: {d}\n", .{ summary.provider, summary.model, reqs, in_tok, out_tok });
+        if (cache_r > 0 or cache_w > 0) {
+            try buf.print(self.allocator, "Cache read: {d}\nCache write: {d}\n", .{ cache_r, cache_w });
+        }
+        try buf.print(self.allocator, "Total tokens: {d}\n", .{total_tok});
+        if (cost_cfg) |pricing| {
+            const usd = pricing.estimateUsd(in_tok, out_tok, cache_r, cache_w);
+            try buf.print(self.allocator, "Estimated cost: ${d:.6} (rates/1M: in=${d:.3}, out=${d:.3})\n", .{ usd, pricing.input, pricing.output });
+        } else {
+            try buf.appendSlice(self.allocator, "Estimated cost: pricing not configured in models.json\n");
+        }
+        try self.historyText(buf.items, false);
+    }
+
+    fn contextInfoErased(context: *anyopaque) anyerror!void {
+        const self: *CliAdapter = @ptrCast(@alignCast(context));
+        const ctx = try self.harness.?.contextSummary();
+        const b = ctx.breakdown;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.print(self.allocator, "Context Breakdown\n\nModel: {s}/{s}\n", .{ ctx.provider, ctx.model });
+        if (ctx.context_window > 0) {
+            const pct = @min(@as(u64, 100), (b.total_tokens *| 100) / @as(u64, ctx.context_window));
+            try buf.print(self.allocator, "Estimated usage: {d} / {d} tokens ({d}%)\n", .{ b.total_tokens, ctx.context_window, pct });
+        } else {
+            try buf.print(self.allocator, "Estimated usage: {d} tokens (context window not configured)\n", .{b.total_tokens});
+        }
+        try buf.print(self.allocator, "\n  System prompt:    ~{d} tok", .{b.system_tokens});
+        if (ctx.project_context_tokens > 0 or ctx.skills_tokens > 0) {
+            try buf.print(self.allocator, " (project context ~{d}, skills ~{d})", .{ ctx.project_context_tokens, ctx.skills_tokens });
+        }
+        try buf.print(
+            self.allocator,
+            "\n  User messages:    ~{d} tok ({d})\n  Assistant msgs:   ~{d} tok ({d})\n  Tool results:     ~{d} tok ({d})\n  Tool definitions: ~{d} tok ({d} enabled)\n",
+            .{ b.user_tokens, b.user_messages, b.assistant_tokens, b.assistant_messages, b.tool_result_tokens, b.tool_result_messages, b.tool_definition_tokens, b.tool_count },
+        );
+        try self.historyText(buf.items, false);
     }
 
     fn sessionSourceErased(context: *anyopaque) anyerror!?tui.SessionSource {
@@ -1379,8 +1482,13 @@ const CliAdapter = struct {
                             self.status_mutex.lockUncancelable(self.io);
                             self.committed_in_tokens +|= self.req_in_tokens;
                             self.committed_out_tokens +|= self.req_out_tokens;
+                            self.committed_cache_read_tokens +|= self.req_cache_read_tokens;
+                            self.committed_cache_write_tokens +|= self.req_cache_write_tokens;
                             self.req_in_tokens = 0;
                             self.req_out_tokens = 0;
+                            self.req_cache_read_tokens = 0;
+                            self.req_cache_write_tokens = 0;
+                            self.usage_requests += 1;
                             self.status_mutex.unlock(self.io);
                         },
                         .usage => |u| {
@@ -1392,6 +1500,8 @@ const CliAdapter = struct {
                             }
                             self.req_in_tokens = u.input_tokens;
                             self.req_out_tokens = u.output_tokens;
+                            self.req_cache_read_tokens = u.cache_read_tokens;
+                            self.req_cache_write_tokens = u.cache_write_tokens;
                             self.status_mutex.unlock(self.io);
                         },
                         else => {},

@@ -515,10 +515,15 @@ pub const Decoder = struct {
                 const input_tokens = try tokenCount(usage, "input_tokens");
                 const output_tokens = try tokenCount(usage, "output_tokens");
                 const raw_total = try tokenCount(usage, "total_tokens");
+                const cached = if (objectField(usage, "input_tokens_details")) |details|
+                    try tokenCount(details, "cached_tokens")
+                else
+                    0;
                 try self.emit(.{ .usage = .{
                     .input_tokens = input_tokens,
                     .output_tokens = output_tokens,
                     .total_tokens = if (raw_total > 0) raw_total else input_tokens +| output_tokens,
+                    .cache_read_tokens = cached,
                 } });
             }
             const status = stringField(response, "status") orelse "completed";

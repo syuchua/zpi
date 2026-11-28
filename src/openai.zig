@@ -390,11 +390,18 @@ pub const Decoder = struct {
             self.started = true;
         }
         if (root.object.get("usage")) |usage| {
-            if (usage == .object) try self.emit(.{ .usage = .{
-                .input_tokens = try tokenCount(usage, "prompt_tokens"),
-                .output_tokens = try tokenCount(usage, "completion_tokens"),
-                .total_tokens = try tokenCount(usage, "total_tokens"),
-            } });
+            if (usage == .object) {
+                const cached = if (usage.object.get("prompt_tokens_details")) |details|
+                    (if (details == .object) try tokenCount(details, "cached_tokens") else 0)
+                else
+                    0;
+                try self.emit(.{ .usage = .{
+                    .input_tokens = try tokenCount(usage, "prompt_tokens"),
+                    .output_tokens = try tokenCount(usage, "completion_tokens"),
+                    .total_tokens = try tokenCount(usage, "total_tokens"),
+                    .cache_read_tokens = cached,
+                } });
+            }
         }
         const choices = root.object.get("choices") orelse {
             if (root.object.get("usage") != null) return;

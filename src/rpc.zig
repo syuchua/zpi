@@ -281,6 +281,7 @@ fn apiName(api: harness.Api) []const u8 {
         .openai_completions => "openai-completions",
         .openai_responses => "openai-responses",
         .anthropic_messages => "anthropic-messages",
+        .gemini_generate_content => "gemini-generate-content",
     };
 }
 

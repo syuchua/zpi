@@ -577,6 +577,8 @@ pub const Submit = struct {
     run: *const fn (*anyopaque, []const u8) anyerror!void,
     new_session: ?*const fn (*anyopaque) anyerror!void = null,
     session_info: ?*const fn (*anyopaque) anyerror!void = null,
+    cost_info: ?*const fn (*anyopaque) anyerror!void = null,
+    context_info: ?*const fn (*anyopaque) anyerror!void = null,
     copy_last_reply: ?*const fn (*anyopaque) anyerror!void = null,
     copy_selection: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     render_initial_history: ?*const fn (*anyopaque) anyerror!bool = null,
@@ -1126,6 +1128,20 @@ pub fn run(io: std.Io, options: Submit) !void {
             }
             continue;
         }
+        if (std.mem.eql(u8, text, "/cost")) {
+            if (submit.cost_info) |show| {
+                tc.invalidate();
+                try show(submit.context);
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, text, "/context")) {
+            if (submit.context_info) |show| {
+                tc.invalidate();
+                try show(submit.context);
+            }
+            continue;
+        }
         if (std.mem.eql(u8, text, "/jobs") or std.mem.startsWith(u8, text, "/jobs ")) {
             const arg = if (text.len > "/jobs".len) std.mem.trim(u8, text["/jobs".len..], " \t") else "";
             if (submit.jobs_info) |show_jobs| {
@@ -1652,7 +1668,7 @@ const EditorState = struct {
     }
 };
 
-const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/search", "/copy", "/session", "/new", "/resume", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
+const builtin_commands = [_][]const u8{ "/help", "/hotkeys", "/search", "/copy", "/session", "/cost", "/context", "/new", "/resume", "/tree", "/model", "/thinking", "/compact", "/exit", "/quit" };
 
 fn handleTab(editor: *EditorState, io: std.Io, submit: Submit, cols: usize, color: bool, allow_list: bool) !bool {
     // Identify token immediately before cursor (bounded by whitespace).

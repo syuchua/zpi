@@ -496,7 +496,13 @@ pub const Decoder = struct {
                 target.* = try uint(v);
             };
         }
-        try self.emit(.{ .usage = .{ .input_tokens = self.input_tokens, .output_tokens = self.output_tokens, .total_tokens = self.input_tokens +| self.output_tokens +| self.cache_read +| self.cache_write } });
+        try self.emit(.{ .usage = .{
+            .input_tokens = self.input_tokens,
+            .output_tokens = self.output_tokens,
+            .total_tokens = self.input_tokens +| self.output_tokens +| self.cache_read +| self.cache_write,
+            .cache_read_tokens = self.cache_read,
+            .cache_write_tokens = self.cache_write,
+        } });
     }
 };
 fn knownEvent(name: []const u8) bool {

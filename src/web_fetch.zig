@@ -679,7 +679,7 @@ fn fetchWithRedirects(
     }
 }
 
-fn validateUriBasics(uri: std.Uri) !void {
+pub fn validateUriBasics(uri: std.Uri) !void {
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
         return error.UnsupportedUrlScheme;
     }
@@ -736,7 +736,7 @@ pub fn validateUrlSsrf(io: std.Io, uri: std.Uri, allow_loopback: bool) !void {
     if (!saw_any) return error.SsrfBlocked;
 }
 
-fn verifyConnectedPeerSsrf(stream: std.Io.net.Stream, allow_loopback: bool) !void {
+pub fn verifyConnectedPeerSsrf(stream: std.Io.net.Stream, allow_loopback: bool) !void {
     var storage: std.posix.sockaddr.storage = undefined;
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     std.posix.getpeername(stream.socket.handle, @ptrCast(&storage), &len) catch return error.SsrfBlocked;

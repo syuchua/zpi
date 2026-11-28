@@ -4,9 +4,25 @@ const std = @import("std");
 const http_headers = @import("http_headers");
 const models_json = @import("models_json");
 
-pub const Api = enum { openai_completions, openai_responses, anthropic_messages };
+pub const Api = enum { openai_completions, openai_responses, anthropic_messages, gemini_generate_content };
 const zpi = @import("zpi");
 const OpenAiCompat = zpi.openai.Compat;
+pub const ModelCost = struct {
+    /// USD per 1,000,000 tokens (matches pi models.json `cost` object).
+    input: f64 = 0,
+    output: f64 = 0,
+    cache_read: f64 = 0,
+    cache_write: f64 = 0,
+
+    pub fn estimateUsd(self: ModelCost, input_tokens: u64, output_tokens: u64, cache_read_tokens: u64, cache_write_tokens: u64) f64 {
+        const m: f64 = 1_000_000.0;
+        return (@as(f64, @floatFromInt(input_tokens)) / m) * self.input +
+            (@as(f64, @floatFromInt(output_tokens)) / m) * self.output +
+            (@as(f64, @floatFromInt(cache_read_tokens)) / m) * self.cache_read +
+            (@as(f64, @floatFromInt(cache_write_tokens)) / m) * self.cache_write;
+    }
+};
+
 pub const Selection = struct {
     api: Api = .openai_completions,
     provider: []const u8 = "openai",
@@ -16,6 +32,7 @@ pub const Selection = struct {
     headers: []const std.http.Header = &.{},
     max_tokens: u32 = 16384,
     context_window: u32 = 0,
+    cost: ?ModelCost = null,
     openai_compat: OpenAiCompat = .{},
     thinking_suffix: ?zpi.model.ThinkingLevel = null,
 };
@@ -109,15 +126,21 @@ fn loadFromProviders(allocator: std.mem.Allocator, io: std.Io, env: *const std.p
     }
     const is_openai = std.mem.eql(u8, provider, "openai");
     const is_anthropic = std.mem.eql(u8, provider, "anthropic");
+    const is_gemini = std.mem.eql(u8, provider, "gemini");
     var result: Selection = .{
-        .api = if (is_anthropic) .anthropic_messages else .openai_completions,
+        .api = if (is_anthropic) .anthropic_messages else if (is_gemini) .gemini_generate_content else .openai_completions,
         .provider = provider,
-        .model = model_override orelse (if (is_openai) env.get("OPENAI_MODEL") else if (is_anthropic) env.get("ANTHROPIC_MODEL") else null) orelse (if (is_anthropic) "claude-sonnet-4-5" else "gpt-4o-mini"),
-        .endpoint = if (is_anthropic) env.get("ANTHROPIC_BASE_URL") orelse "https://api.anthropic.com/v1" else (if (is_openai) env.get("OPENAI_BASE_URL") else null) orelse "https://api.openai.com/v1",
-        .api_key = (if (is_openai) env.get("OPENAI_API_KEY") else if (is_anthropic) env.get("ANTHROPIC_API_KEY") else null) orelse "",
+        .model = model_override orelse (if (is_openai) env.get("OPENAI_MODEL") else if (is_anthropic) env.get("ANTHROPIC_MODEL") else if (is_gemini) env.get("GEMINI_MODEL") else null) orelse (if (is_anthropic) "claude-sonnet-4-5" else if (is_gemini) "gemini-2.5-flash" else "gpt-4o-mini"),
+        .endpoint = if (is_anthropic)
+            env.get("ANTHROPIC_BASE_URL") orelse "https://api.anthropic.com/v1"
+        else if (is_gemini)
+            env.get("GEMINI_BASE_URL") orelse "https://generativelanguage.googleapis.com/v1beta"
+        else
+            (if (is_openai) env.get("OPENAI_BASE_URL") else null) orelse "https://api.openai.com/v1",
+        .api_key = (if (is_openai) env.get("OPENAI_API_KEY") else if (is_anthropic) env.get("ANTHROPIC_API_KEY") else if (is_gemini) (env.get("GEMINI_API_KEY") orelse env.get("GOOGLE_API_KEY")) else null) orelse "",
         .thinking_suffix = thinking_suffix,
     };
-    var found_provider = is_openai or is_anthropic;
+    var found_provider = is_openai or is_anthropic or is_gemini;
     if (providers) |configured| {
         if (configured.object.get(provider)) |entry| {
             if (entry != .object) return error.InvalidModelsConfig;
@@ -131,6 +154,7 @@ fn loadFromProviders(allocator: std.mem.Allocator, io: std.Io, env: *const std.p
             var model_compat: ?std.json.Value = null;
             var model_max_tokens: ?u32 = null;
             var model_context_window: ?u32 = null;
+            var model_cost: ?ModelCost = null;
             if (entry.object.get("models")) |models| {
                 if (models != .array) return error.InvalidModelsConfig;
                 if (model_override == null and models.array.items.len > 0) result.model = try str(try field(models.array.items[0], "id"));
@@ -143,12 +167,14 @@ fn loadFromProviders(allocator: std.mem.Allocator, io: std.Io, env: *const std.p
                     model_compat = model.object.get("compat");
                     if (model.object.get("maxTokens")) |tokens| model_max_tokens = try tokenLimit(tokens);
                     if (model.object.get("contextWindow")) |window| model_context_window = try contextWindowLimit(window);
+                    if (model.object.get("cost")) |cost_val| model_cost = try parseCost(cost_val);
                 }
             }
             var override_headers: ?std.json.Value = null;
             var override_compat: ?std.json.Value = null;
             var override_max_tokens: ?u32 = null;
             var override_context_window: ?u32 = null;
+            var override_cost: ?ModelCost = null;
             if (entry.object.get("modelOverrides")) |overrides_by_model| {
                 if (overrides_by_model != .object) return error.InvalidModelsConfig;
                 if (overrides_by_model.object.get(result.model)) |model_config| {
@@ -157,6 +183,7 @@ fn loadFromProviders(allocator: std.mem.Allocator, io: std.Io, env: *const std.p
                     override_compat = model_config.object.get("compat");
                     if (model_config.object.get("maxTokens")) |tokens| override_max_tokens = try tokenLimit(tokens);
                     if (model_config.object.get("contextWindow")) |window| override_context_window = try contextWindowLimit(window);
+                    if (model_config.object.get("cost")) |cost_val| override_cost = try parseCost(cost_val);
                 }
             }
             const provider_headers_resolved = try resolveHeaders(allocator, env, provider_headers, null, null);
@@ -164,12 +191,13 @@ fn loadFromProviders(allocator: std.mem.Allocator, io: std.Io, env: *const std.p
             result.headers = try http_headers.merge(allocator, provider_headers_resolved, model_headers_resolved);
             result.max_tokens = override_max_tokens orelse model_max_tokens orelse result.max_tokens;
             result.context_window = override_context_window orelse model_context_window orelse result.context_window;
+            result.cost = override_cost orelse model_cost;
             if (result.api == .openai_completions) {
                 try applyCompat(&result.openai_compat, provider_compat);
                 try applyCompat(&result.openai_compat, model_compat);
                 try applyCompat(&result.openai_compat, override_compat);
             }
-            if (!is_openai and !is_anthropic and entry.object.get("baseUrl") == null and overrides.endpoint == null)
+            if (!is_openai and !is_anthropic and !is_gemini and entry.object.get("baseUrl") == null and overrides.endpoint == null)
                 return error.MissingProviderEndpoint;
         }
     }
@@ -180,22 +208,61 @@ fn loadFromProviders(allocator: std.mem.Allocator, io: std.Io, env: *const std.p
     if (model_override) |model| result.model = model;
     if (result.model.len == 0) return error.InvalidModel;
     const base = std.mem.trimEnd(u8, result.endpoint, "/");
-    const suffix = switch (result.api) {
-        .anthropic_messages => "/messages",
-        .openai_responses => "/responses",
-        .openai_completions => "/chat/completions",
-    };
-    result.endpoint = if (std.mem.endsWith(u8, base, suffix))
-        try allocator.dupe(u8, base)
-    else if (result.api == .anthropic_messages and !std.mem.endsWith(u8, base, "/v1"))
-        try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{base})
-    else
-        try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
+    if (result.api == .gemini_generate_content) {
+        if (std.mem.indexOf(u8, base, ":streamGenerateContent") != null) {
+            result.endpoint = if (std.mem.indexOf(u8, base, "alt=sse") != null)
+                try allocator.dupe(u8, base)
+            else if (std.mem.indexOfScalar(u8, base, '?') != null)
+                try std.fmt.allocPrint(allocator, "{s}&alt=sse", .{base})
+            else
+                try std.fmt.allocPrint(allocator, "{s}?alt=sse", .{base});
+        } else {
+            const clean_model = if (std.mem.startsWith(u8, result.model, "models/")) result.model["models/".len..] else result.model;
+            result.endpoint = if (std.mem.endsWith(u8, base, "/models"))
+                try std.fmt.allocPrint(allocator, "{s}/{s}:streamGenerateContent?alt=sse", .{ base, clean_model })
+            else
+                try std.fmt.allocPrint(allocator, "{s}/models/{s}:streamGenerateContent?alt=sse", .{ base, clean_model });
+        }
+    } else {
+        const suffix = switch (result.api) {
+            .anthropic_messages => "/messages",
+            .openai_responses => "/responses",
+            .openai_completions => "/chat/completions",
+            .gemini_generate_content => unreachable,
+        };
+        result.endpoint = if (std.mem.endsWith(u8, base, suffix))
+            try allocator.dupe(u8, base)
+        else if (result.api == .anthropic_messages and !std.mem.endsWith(u8, base, "/v1"))
+            try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{base})
+        else
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
+    }
     result.provider = try allocator.dupe(u8, result.provider);
     result.model = try allocator.dupe(u8, result.model);
     result.api_key = try allocator.dupe(u8, result.api_key);
     return result;
 }
+fn parseCostNumber(value: std.json.Value) !f64 {
+    const num: f64 = switch (value) {
+        .integer => |n| @floatFromInt(n),
+        .float => |f| f,
+        .number_string => |s| std.fmt.parseFloat(f64, s) catch return error.InvalidModelsConfig,
+        else => return error.InvalidModelsConfig,
+    };
+    if (!std.math.isFinite(num) or num < 0 or num > 1_000_000) return error.InvalidModelsConfig;
+    return num;
+}
+
+fn parseCost(value: std.json.Value) !ModelCost {
+    if (value != .object) return error.InvalidModelsConfig;
+    var cost: ModelCost = .{};
+    if (value.object.get("input")) |v| cost.input = try parseCostNumber(v);
+    if (value.object.get("output")) |v| cost.output = try parseCostNumber(v);
+    if (value.object.get("cacheRead")) |v| cost.cache_read = try parseCostNumber(v);
+    if (value.object.get("cacheWrite")) |v| cost.cache_write = try parseCostNumber(v);
+    return cost;
+}
+
 const ModelRoute = struct { provider: []const u8, model: []const u8 };
 
 fn loadProvidersObject(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, models_file_override: ?[]const u8) !?std.json.Value {
@@ -216,6 +283,7 @@ pub fn listModels(allocator: std.mem.Allocator, io: std.Io, env: *const std.proc
     var choices: std.ArrayList(ModelChoice) = .empty;
     try choices.append(allocator, .{ .provider = "openai", .id = "gpt-4o-mini", .api = .openai_completions });
     try choices.append(allocator, .{ .provider = "anthropic", .id = "claude-sonnet-4-5", .api = .anthropic_messages });
+    try choices.append(allocator, .{ .provider = "gemini", .id = "gemini-2.5-flash", .api = .gemini_generate_content });
     if (providers) |configured| {
         var it = configured.object.iterator();
         while (it.next()) |entry| {
@@ -306,7 +374,7 @@ fn modelsFilePath(allocator: std.mem.Allocator, env: *const std.process.Environ.
 
 fn splitKnownProvider(providers: ?std.json.Value, reference: []const u8) !?ModelRoute {
     var best: ?ModelRoute = null;
-    for ([_][]const u8{ "openai", "anthropic" }) |known| {
+    for ([_][]const u8{ "openai", "anthropic", "gemini" }) |known| {
         if (providerPrefix(reference, known)) |model| best = .{ .provider = known, .model = model };
     }
     if (providers) |configured| {
@@ -661,6 +729,7 @@ fn parseApi(name: []const u8) !Api {
     if (std.mem.eql(u8, name, "openai-completions")) return .openai_completions;
     if (std.mem.eql(u8, name, "openai-responses")) return .openai_responses;
     if (std.mem.eql(u8, name, "anthropic-messages")) return .anthropic_messages;
+    if (std.mem.eql(u8, name, "gemini-generate-content") or std.mem.eql(u8, name, "google-generative-ai") or std.mem.eql(u8, name, "gemini")) return .gemini_generate_content;
     return error.UnsupportedProviderApi;
 }
 fn field(value: std.json.Value, name: []const u8) !std.json.Value {
@@ -1011,4 +1080,54 @@ test "model thinking suffix, literal colon preservation, default provider/model,
 
     const listed = try listModels(a, std.testing.io, &env, path);
     try std.testing.expect(listed.len >= 5);
+}
+
+test "model cost configuration parses pi pricing fields and estimates USD" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models.json", .data =
+        \\{"providers":{"anthropic":{"api":"anthropic-messages","baseUrl":"http://127.0.0.1/v1","models":[{"id":"claude-sonnet-4-5","cost":{"input":3,"output":15,"cacheRead":0.3,"cacheWrite":3.75}}]}}}
+    });
+    const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "models.json" });
+    defer std.testing.allocator.free(path);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const selected = try load(arena.allocator(), std.testing.io, &env, .{ .model = "anthropic/claude-sonnet-4-5", .models_file = path });
+    const cost = selected.cost.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), cost.input, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 15.0), cost.output, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), cost.cache_read, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.75), cost.cache_write, 1e-9);
+    // 1M input ($3) + 100k output ($1.5) + 500k cache read ($0.15) + 200k cache write ($0.75) = $5.40
+    try std.testing.expectApproxEqAbs(@as(f64, 5.40), cost.estimateUsd(1_000_000, 100_000, 500_000, 200_000), 1e-6);
+}
+
+test "gemini built-in provider resolves env keys and streamGenerateContent endpoint" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GOOGLE_API_KEY", "google-fallback-key");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fallback = try load(a, std.testing.io, &env, .{ .provider = "gemini" });
+    try std.testing.expectEqual(Api.gemini_generate_content, fallback.api);
+    try std.testing.expectEqualStrings("gemini-2.5-flash", fallback.model);
+    try std.testing.expectEqualStrings("google-fallback-key", fallback.api_key);
+    try std.testing.expectEqualStrings(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+        fallback.endpoint,
+    );
+
+    try env.put("GEMINI_API_KEY", "gemini-primary-key");
+    const slash = try load(a, std.testing.io, &env, .{ .model = "gemini/gemini-2.5-pro" });
+    try std.testing.expectEqualStrings("gemini", slash.provider);
+    try std.testing.expectEqualStrings("gemini-2.5-pro", slash.model);
+    try std.testing.expectEqualStrings("gemini-primary-key", slash.api_key);
+    try std.testing.expectEqualStrings(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
+        slash.endpoint,
+    );
 }

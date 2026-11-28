@@ -85,6 +85,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "model", .module = model } },
     });
+    const web_search = b.addModule("web_search", .{
+        .root_source_file = b.path("src/web_search.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "model", .module = model }, .{ .name = "web_fetch", .module = web_fetch } },
+    });
     const bg_tasks = b.addModule("bg_tasks", .{
         .root_source_file = b.path("src/bg_tasks.zig"),
         .target = target,
@@ -95,7 +101,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tools.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "replacements", .module = replacements }, .{ .name = "search", .module = search }, .{ .name = "web_fetch", .module = web_fetch }, .{ .name = "bg_tasks", .module = bg_tasks }, .{ .name = "sandbox", .module = sandbox } },
+        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "replacements", .module = replacements }, .{ .name = "search", .module = search }, .{ .name = "web_fetch", .module = web_fetch }, .{ .name = "web_search", .module = web_search }, .{ .name = "bg_tasks", .module = bg_tasks }, .{ .name = "sandbox", .module = sandbox } },
     });
     const openai = b.addModule("openai", .{
         .root_source_file = b.path("src/openai.zig"),
@@ -151,6 +157,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "http_transport", .module = http_transport }, .{ .name = "context_budget", .module = context_budget } },
     });
+    const gemini = b.addModule("gemini", .{
+        .root_source_file = b.path("src/gemini.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "sse", .module = sse }, .{ .name = "model", .module = model }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "http_transport", .module = http_transport }, .{ .name = "context_budget", .module = context_budget } },
+    });
     const tui = b.addModule("tui", .{
         .root_source_file = b.path("src/tui.zig"),
         .target = target,
@@ -187,12 +199,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "openai", .module = openai },
             .{ .name = "openai_responses", .module = openai_responses },
             .{ .name = "anthropic", .module = anthropic },
+            .{ .name = "gemini", .module = gemini },
             .{ .name = "extensions", .module = extensions },
             .{ .name = "extension_tools", .module = extension_tools },
             .{ .name = "native_runtime", .module = native_runtime },
             .{ .name = "native_tools", .module = native_tools },
             .{ .name = "agent", .module = agent },
             .{ .name = "tools", .module = tools },
+            .{ .name = "web_search", .module = web_search },
             .{ .name = "bg_tasks", .module = bg_tasks },
             .{ .name = "session", .module = session },
             .{ .name = "replacements", .module = replacements },
@@ -223,6 +237,23 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "models_json", .module = models_json } },
     });
     const context_files = b.createModule(.{ .root_source_file = b.path("src/cli/context_files.zig"), .target = target, .optimize = optimize });
+    const mcp_config = b.createModule(.{
+        .root_source_file = b.path("src/cli/mcp_config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "models_json", .module = models_json }},
+    });
+    const manage = b.createModule(.{
+        .root_source_file = b.path("src/cli/manage.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "config", .module = config },
+            .{ .name = "settings", .module = settings },
+            .{ .name = "models_json", .module = models_json },
+            .{ .name = "mcp_config", .module = mcp_config },
+        },
+    });
     const error_hint = b.createModule(.{ .root_source_file = b.path("src/cli/error_hint.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zpi", .module = core }} });
     const harness = b.addModule("harness", .{
         .root_source_file = b.path("src/harness.zig"),
@@ -245,7 +276,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cli/doctor.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "config", .module = config }, .{ .name = "settings", .module = settings }, .{ .name = "context_files", .module = context_files }, .{ .name = "error_hint", .module = error_hint }, .{ .name = "skills", .module = skills }, .{ .name = "prompt_templates", .module = prompt_templates } },
+        .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "config", .module = config }, .{ .name = "settings", .module = settings }, .{ .name = "context_files", .module = context_files }, .{ .name = "error_hint", .module = error_hint }, .{ .name = "skills", .module = skills }, .{ .name = "prompt_templates", .module = prompt_templates }, .{ .name = "mcp_config", .module = mcp_config } },
     });
     const pi_session = b.createModule(.{
         .root_source_file = b.path("src/pi_session.zig"),
@@ -265,6 +296,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
             .{ .name = "doctor", .module = doctor },
+            .{ .name = "mcp_config", .module = mcp_config },
+            .{ .name = "manage", .module = manage },
             .{ .name = "context_files", .module = context_files },
             .{ .name = "error_hint", .module = error_hint },
         } else &.{
@@ -274,6 +307,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
             .{ .name = "doctor", .module = doctor },
+            .{ .name = "mcp_config", .module = mcp_config },
+            .{ .name = "manage", .module = manage },
             .{ .name = "context_files", .module = context_files },
             .{ .name = "error_hint", .module = error_hint },
         },
@@ -344,6 +379,7 @@ pub fn build(b: *std.Build) void {
     const replacement_tests = b.addTest(.{ .name = "replacement-tests", .root_module = replacements });
     const search_tests = b.addTest(.{ .name = "search-tests", .root_module = search });
     const web_fetch_tests = b.addTest(.{ .name = "web-fetch-tests", .root_module = web_fetch });
+    const web_search_tests = b.addTest(.{ .name = "web-search-tests", .root_module = web_search });
     const bg_tasks_tests = b.addTest(.{ .name = "bg-tasks-tests", .root_module = bg_tasks });
     const session_tests = b.addTest(.{
         .name = "session-tests",
@@ -407,6 +443,18 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{ .{ .name = "anthropic", .module = anthropic }, .{ .name = "model", .module = model }, .{ .name = "sse", .module = sse }, .{ .name = "http_headers", .module = http_headers } },
         }),
+    });
+    const gemini_tests = b.addTest(.{
+        .name = "gemini-tests",
+        .root_module = gemini,
+    });
+    const mcp_config_tests = b.addTest(.{
+        .name = "mcp-config-tests",
+        .root_module = mcp_config,
+    });
+    const manage_tests = b.addTest(.{
+        .name = "manage-tests",
+        .root_module = manage,
     });
     const extension_tests = b.addTest(.{
         .name = "extension-tests",
@@ -533,12 +581,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(pi_session_tests).step);
     test_step.dependOn(&b.addRunArtifact(openai_tests).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_tests).step);
+    test_step.dependOn(&b.addRunArtifact(gemini_tests).step);
+    test_step.dependOn(&b.addRunArtifact(mcp_config_tests).step);
+    test_step.dependOn(&b.addRunArtifact(manage_tests).step);
     test_step.dependOn(&b.addRunArtifact(agent_tests).step);
     test_step.dependOn(&b.addRunArtifact(tool_tests).step);
     test_step.dependOn(&b.addRunArtifact(session_tests).step);
     test_step.dependOn(&b.addRunArtifact(replacement_tests).step);
     test_step.dependOn(&b.addRunArtifact(search_tests).step);
     test_step.dependOn(&b.addRunArtifact(web_fetch_tests).step);
+    test_step.dependOn(&b.addRunArtifact(web_search_tests).step);
     test_step.dependOn(&b.addRunArtifact(bg_tasks_tests).step);
 
     // Compile/install target tests without executing them on the build host.
@@ -575,11 +627,15 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(pi_session_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(openai_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(openai_responses_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(gemini_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(mcp_config_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(manage_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(agent_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(tool_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(session_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(replacement_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(search_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(web_fetch_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(web_search_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(bg_tasks_tests, .{}).step);
 }

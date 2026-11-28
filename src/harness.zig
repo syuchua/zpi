@@ -15,6 +15,7 @@ const subagent = @import("subagent.zig");
 const worktree = @import("worktree");
 
 pub const Api = config.Api;
+pub const ModelCost = config.ModelCost;
 pub const ModelChoice = config.ModelChoice;
 pub const Settings = settings_mod.Settings;
 pub const Selection = config.Selection;
@@ -172,6 +173,15 @@ pub const SessionStats = struct {
     context_window: u32,
 };
 
+pub const ContextSummary = struct {
+    provider: []const u8,
+    model: []const u8,
+    context_window: u32,
+    breakdown: zpi.context_budget.Breakdown,
+    project_context_tokens: u64 = 0,
+    skills_tokens: u64 = 0,
+};
+
 pub const TreeEntryView = struct {
     id: []const u8,
     parent_id: ?[]const u8,
@@ -251,6 +261,7 @@ pub const Harness = struct {
     openai_client: zpi.openai.Client,
     responses_client: zpi.openai_responses.Client,
     anthropic_client: zpi.anthropic.Client,
+    gemini_client: zpi.gemini.Client,
     provider: zpi.model.Provider,
     store: zpi.session.Store,
     mcp_clients: []zpi.mcp.Client,
@@ -322,6 +333,7 @@ pub const Harness = struct {
             .openai_client = undefined,
             .responses_client = undefined,
             .anthropic_client = undefined,
+            .gemini_client = undefined,
             .provider = undefined,
             .store = zpi.session.Store.memory(gpa, io),
             .mcp_clients = &.{},
@@ -442,6 +454,7 @@ pub const Harness = struct {
         const proxy_policy: zpi.openai.ProxyPolicy = if (options.no_proxy) .none else .system;
         const resp_proxy: zpi.openai_responses.ProxyPolicy = if (options.no_proxy) .none else .system;
         const anth_proxy: zpi.anthropic.ProxyPolicy = if (options.no_proxy) .none else .system;
+        const gem_proxy: zpi.gemini.ProxyPolicy = if (options.no_proxy) .none else .system;
 
         self.openai_client = .{
             .io = io,
@@ -488,10 +501,26 @@ pub const Harness = struct {
             .proxy_policy = anth_proxy,
             .cancel = options.cancel_token,
         };
+        self.gemini_client = .{
+            .io = io,
+            .config = .{
+                .endpoint = self.selection.endpoint,
+                .model_id = self.selection.model,
+                .api_key = self.selection.api_key,
+                .headers = self.selection.headers,
+                .max_tokens = self.selection.max_tokens,
+                .context_window = self.selection.context_window,
+                .thinking_level = self.thinking_level,
+            },
+            .environ = environ,
+            .proxy_policy = gem_proxy,
+            .cancel = options.cancel_token,
+        };
         self.provider = switch (self.selection.api) {
             .openai_completions => self.openai_client.provider(),
             .openai_responses => self.responses_client.provider(),
             .anthropic_messages => self.anthropic_client.provider(),
+            .gemini_generate_content => self.gemini_client.provider(),
         };
 
         var cwd: []const u8 = if (options.cwd) |path| try std.fs.path.resolveAlloc(a, &.{ host_cwd, path }) else host_cwd;
@@ -571,6 +600,7 @@ pub const Harness = struct {
         self.tool_set = try zpi.tools.ToolSet.initWithOptions(gpa, .{
             .temp_dir = environ.get("TMPDIR") orelse "/tmp",
             .allow_loopback_web_fetch = options.allow_loopback_web_fetch,
+            .web_search_config = zpi.web_search.Config.fromEnv(environ, options.allow_loopback_web_fetch),
             .io = io,
             .cwd = cwd,
             .sandbox = self.sandbox,
@@ -1262,6 +1292,27 @@ pub const Harness = struct {
         };
     }
 
+    pub fn modelCost(self: *const Harness) ?ModelCost {
+        return self.selection.cost;
+    }
+
+    pub fn contextSummary(self: *const Harness) !ContextSummary {
+        const defs = try self.gpa.alloc(zpi.model.ToolDefinition, self.enabled_tools.len);
+        defer self.gpa.free(defs);
+        for (self.enabled_tools, defs) |tool, *def| def.* = tool.definition;
+        const breakdown = try zpi.context_budget.estimateBreakdown(self.gpa, self.runtime.messages.items, defs);
+        const proj_tok: u64 = if (self.project_context) |ctx| (zpi.context_budget.estimateTextTokens(ctx) catch 0) else 0;
+        const skills_tok: u64 = if (self.skills_prompt.len > 0) (zpi.context_budget.estimateTextTokens(self.skills_prompt) catch 0) else 0;
+        return .{
+            .provider = self.selection.provider,
+            .model = self.selection.model,
+            .context_window = self.selection.context_window,
+            .breakdown = breakdown,
+            .project_context_tokens = proj_tok,
+            .skills_tokens = skills_tok,
+        };
+    }
+
     fn runChildErased(parent: *anyopaque, ctx: agent.ToolContext, request: subagent.Request, sink: agent.Sink) anyerror!subagent.ChildOutput {
         const self: *Harness = @ptrCast(@alignCast(parent));
         var active_wt: ?worktree.Worktree = null;
@@ -1312,6 +1363,7 @@ pub const Harness = struct {
         var tools = try zpi.tools.ToolSet.initWithOptions(ctx.allocator, .{
             .temp_dir = self.tool_set.temp_dir,
             .allow_loopback_web_fetch = self.tool_set.web_fetch_store.allow_loopback,
+            .web_search_config = self.tool_set.web_search_config,
             .cwd = child_cwd,
             .sandbox = child_sandbox,
         });
@@ -1331,13 +1383,16 @@ pub const Harness = struct {
         var chat = self.openai_client;
         var responses = self.responses_client;
         var anthropic = self.anthropic_client;
+        var gemini = self.gemini_client;
         chat.cancel = ctx.cancel;
         responses.cancel = ctx.cancel;
         anthropic.cancel = ctx.cancel;
+        gemini.cancel = ctx.cancel;
         const provider = switch (self.selection.api) {
             .openai_completions => chat.provider(),
             .openai_responses => responses.provider(),
             .anthropic_messages => anthropic.provider(),
+            .gemini_generate_content => gemini.provider(),
         };
         var child = agent.Agent.init(ctx.allocator, ctx.io, provider, enabled.items, child_cwd);
         defer child.deinit();
@@ -1395,9 +1450,9 @@ pub const Harness = struct {
     fn authorizeToolErased(context: ?*anyopaque, tool: agent.Tool, tool_context: agent.ToolContext, arguments: std.json.Value, authorization: *?zpi.security.Authorization) anyerror!void {
         const self: *Harness = @ptrCast(@alignCast(context.?));
         const capability = tool.capability orelse return error.UnclassifiedTool;
-        // Web fetch authorizes each actual destination immediately before use,
-        // including extension-rewritten URLs and redirects.
-        if (tool.builtin and std.mem.eql(u8, tool.definition.name, "web_fetch")) return;
+        // Web fetch and web search authorize each actual destination URL
+        // immediately before use, including extension-rewritten URLs and redirects.
+        if (tool.builtin and (std.mem.eql(u8, tool.definition.name, "web_fetch") or std.mem.eql(u8, tool.definition.name, "web_search"))) return;
         const target: zpi.security.TargetKind = switch (capability) {
             .filesystem_read, .filesystem_write => .path,
             .process_exec => .command,
@@ -1698,10 +1753,19 @@ pub const Harness = struct {
         self.anthropic_client.config.max_tokens = self.selection.max_tokens;
         self.anthropic_client.config.context_window = self.selection.context_window;
 
+        self.gemini_client.config.endpoint = self.selection.endpoint;
+        self.gemini_client.config.model_id = self.selection.model;
+        self.gemini_client.config.api_key = self.selection.api_key;
+        self.gemini_client.config.headers = self.selection.headers;
+        self.gemini_client.config.max_tokens = self.selection.max_tokens;
+        self.gemini_client.config.context_window = self.selection.context_window;
+        self.gemini_client.config.thinking_level = self.thinking_level;
+
         const next_provider = switch (self.selection.api) {
             .openai_completions => self.openai_client.provider(),
             .openai_responses => self.responses_client.provider(),
             .anthropic_messages => self.anthropic_client.provider(),
+            .gemini_generate_content => self.gemini_client.provider(),
         };
         self.provider = next_provider;
         self.runtime.provider = next_provider;

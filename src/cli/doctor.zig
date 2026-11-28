@@ -11,6 +11,7 @@ const settings_mod = @import("settings");
 const skills = @import("skills");
 const prompt_templates = @import("prompt_templates");
 const context_files = @import("context_files");
+const mcp_config = @import("mcp_config");
 
 pub const Options = struct {
     host_cwd: []const u8,
@@ -30,6 +31,8 @@ pub const Options = struct {
     no_prompt_templates: bool = false,
     prompt_templates: []const []const u8 = &.{},
     trust_project_prompts: bool = false,
+    trust_project_mcp: bool = false,
+    no_mcp_config: bool = false,
 };
 
 /// Warnings mark items that usually prevent a first request or make tools
@@ -47,6 +50,7 @@ pub fn run(io: std.Io, a: std.mem.Allocator, env: *const std.process.Environ.Map
         try writer.writeAll("  templates: disabled by --no-prompt-templates\n");
     } else try templatesReport(io, a, writer, options);
     try contextReport(io, a, writer, options);
+    try mcpReport(io, a, writer, options);
     try searchReport(io, a, writer, options, &warnings);
     try nodeReport(io, a, writer, options, &warnings);
     const sandbox_status = if (zpi.sandbox.detectBackend(io, .auto)) |backend| @tagName(backend) else |_| "unavailable";
@@ -137,6 +141,10 @@ fn credentialState(options: Options, default_provider: ?[]const u8) []const u8 {
     const provider = options.provider orelse default_provider orelse "openai";
     if (std.mem.eql(u8, provider, "anthropic")) return envState(options.environ, "ANTHROPIC_API_KEY");
     if (std.mem.eql(u8, provider, "openai")) return envState(options.environ, "OPENAI_API_KEY");
+    if (std.mem.eql(u8, provider, "gemini")) {
+        if (options.environ.get("GEMINI_API_KEY")) |v| return if (v.len == 0) "environment variable set but empty" else "available from environment";
+        return envState(options.environ, "GOOGLE_API_KEY");
+    }
     return "resolved from models.json for the configured provider";
 }
 
@@ -148,7 +156,7 @@ fn envState(env: *const std.process.Environ.Map, name: []const u8) []const u8 {
 fn hintFor(err: anyerror) ?[]const u8 {
     const name = @errorName(err);
     inline for (.{
-        .{ "ProviderNotConfigured", "set --provider openai or anthropic, or add a provider to models.json" },
+        .{ "ProviderNotConfigured", "set --provider openai, anthropic, or gemini, or add a provider to models.json" },
         .{ "MissingProviderEndpoint", "add baseUrl to the provider entry in models.json" },
         .{ "MissingCredentialEnvironment", "set the environment variable named by the models.json credential reference" },
         .{ "InvalidModelsConfig", "models.json must use the supported JSON-with-comments subset" },
@@ -159,6 +167,31 @@ fn hintFor(err: anyerror) ?[]const u8 {
         if (std.mem.eql(u8, name, rule[0])) return rule[1];
     }
     return null;
+}
+
+fn mcpReport(io: std.Io, a: std.mem.Allocator, writer: *std.Io.Writer, options: Options) !void {
+    if (options.no_mcp_config) {
+        try writer.writeAll("  mcp:      disabled by --no-mcp-config\n");
+        return;
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const entries = mcp_config.load(
+        arena.allocator(),
+        io,
+        options.host_cwd,
+        options.cwd orelse options.host_cwd,
+        options.environ,
+        options.trust_project_mcp,
+        false,
+    ) catch |err| {
+        try writer.print("  mcp:      unavailable ({s})\n", .{@errorName(err)});
+        return;
+    };
+    try writer.print("  mcp:      {d} configured{s}\n", .{
+        entries.len,
+        if (options.trust_project_mcp) " (project mcp.json trusted)" else "",
+    });
 }
 
 fn skillsReport(io: std.Io, a: std.mem.Allocator, writer: *std.Io.Writer, options: Options) !void {

@@ -46,6 +46,59 @@ fn estimateMessageTokens(allocator: std.mem.Allocator, message: model.Message) !
     return charsToTokens(chars);
 }
 
+pub const Breakdown = struct {
+    system_tokens: u64 = 0,
+    user_tokens: u64 = 0,
+    assistant_tokens: u64 = 0,
+    tool_result_tokens: u64 = 0,
+    tool_definition_tokens: u64 = 0,
+    total_tokens: u64 = 0,
+    message_count: usize = 0,
+    user_messages: usize = 0,
+    assistant_messages: usize = 0,
+    tool_result_messages: usize = 0,
+    tool_count: usize = 0,
+};
+
+pub fn estimateTextTokens(text: []const u8) !u64 {
+    return charsToTokens(try utf16Length(text));
+}
+
+pub fn estimateBreakdown(allocator: std.mem.Allocator, messages: []const model.Message, tools: []const model.ToolDefinition) !Breakdown {
+    const projected = try model.projectSystemPrompt(allocator, messages);
+    defer allocator.free(projected);
+    var out: Breakdown = .{ .tool_count = tools.len };
+    for (projected) |message| {
+        const tokens = try estimateMessageTokens(allocator, message);
+        out.total_tokens = saturatingAdd(out.total_tokens, tokens);
+        switch (message.role) {
+            .system => out.system_tokens = saturatingAdd(out.system_tokens, tokens),
+            .user => {
+                out.user_tokens = saturatingAdd(out.user_tokens, tokens);
+                out.user_messages += 1;
+                out.message_count += 1;
+            },
+            .assistant => {
+                out.assistant_tokens = saturatingAdd(out.assistant_tokens, tokens);
+                out.assistant_messages += 1;
+                out.message_count += 1;
+            },
+            .tool_result => {
+                out.tool_result_tokens = saturatingAdd(out.tool_result_tokens, tokens);
+                out.tool_result_messages += 1;
+                out.message_count += 1;
+            },
+        }
+    }
+    if (tools.len > 0) {
+        const json = try std.json.Stringify.valueAlloc(allocator, tools, .{});
+        defer allocator.free(json);
+        out.tool_definition_tokens = charsToTokens(try utf16Length(json));
+        out.total_tokens = saturatingAdd(out.total_tokens, out.tool_definition_tokens);
+    }
+    return out;
+}
+
 pub fn estimateInputTokens(allocator: std.mem.Allocator, messages: []const model.Message, tools: []const model.ToolDefinition) !u64 {
     var total: u64 = 0;
     for (messages) |message| total = saturatingAdd(total, try estimateMessageTokens(allocator, message));
@@ -141,4 +194,23 @@ test "ratio margin and fixed-margin fallback have independent expected budgets" 
     // Ratio room falls below 32768, so pi uses the fixed-margin fallback.
     try std.testing.expectEqual(@as(u32, 32768), try clampMaxTokens(std.testing.allocator, &messages, &.{}, 65_500, 100_000));
     try std.testing.expectEqual(@as(u32, 27332), try clampMaxTokens(std.testing.allocator, &messages, &.{}, 60_000, 100_000));
+}
+
+test "estimateBreakdown separates system, conversation roles, and tool definitions" {
+    const messages = [_]model.Message{
+        .{ .role = .system, .content = &.{.{ .text = "1234567" }} },
+        .{ .role = .user, .content = &.{.{ .text = "12345678901234" }} },
+        .{ .role = .assistant, .content = &.{.{ .text = "1234567" }} },
+        .{ .role = .tool_result, .content = &.{.{ .text = "1234567" }}, .tool_call_id = "c1" },
+    };
+    const tools = [_]model.ToolDefinition{.{ .name = "read", .description = "file", .parameters = .{ .object = .empty } }};
+    const b = try estimateBreakdown(std.testing.allocator, &messages, &tools);
+    try std.testing.expectEqual(@as(u64, 2), b.system_tokens);
+    try std.testing.expectEqual(@as(u64, 4), b.user_tokens);
+    try std.testing.expectEqual(@as(u64, 2), b.assistant_tokens);
+    try std.testing.expectEqual(@as(u64, 2), b.tool_result_tokens);
+    try std.testing.expect(b.tool_definition_tokens > 0);
+    try std.testing.expectEqual(b.system_tokens + b.user_tokens + b.assistant_tokens + b.tool_result_tokens + b.tool_definition_tokens, b.total_tokens);
+    try std.testing.expectEqual(@as(usize, 3), b.message_count);
+    try std.testing.expectEqual(@as(usize, 1), b.tool_count);
 }

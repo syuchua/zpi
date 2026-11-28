@@ -7,6 +7,7 @@ pub const Mode = enum { tui, print, json };
 pub const McpServer = struct { name: []const u8, argv: []const [:0]const u8 };
 
 pub const SubagentIsolation = enum { shared, worktree, auto };
+pub const Subcommand = enum { auth, models, mcp };
 
 pub const Options = struct {
     mode: OutputMode = .auto,
@@ -41,6 +42,8 @@ pub const Options = struct {
     prompt_templates: std.ArrayList([]const u8) = .empty,
     no_prompt_templates: bool = false,
     trust_project_prompts: bool = false,
+    trust_project_mcp: bool = false,
+    no_mcp_config: bool = false,
     no_proxy: bool = false,
     no_tools: bool = false,
     allow_loopback_web_fetch: bool = false,
@@ -60,6 +63,8 @@ pub const Options = struct {
     context_files: bool = false,
     no_context_files: bool = false,
     doctor_subcommand: bool = false,
+    subcommand: ?Subcommand = null,
+    subcommand_args: []const [:0]const u8 = &.{},
     verbose: bool = false,
     fullscreen: bool = true,
     print_version: bool = false,
@@ -72,6 +77,23 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
     if (args.len > 0 and std.mem.eql(u8, args[0], "doctor")) {
         result.doctor_subcommand = true;
         return result;
+    }
+    if (args.len > 0) {
+        if (std.mem.eql(u8, args[0], "auth")) {
+            result.subcommand = .auth;
+            result.subcommand_args = args[1..];
+            return result;
+        }
+        if (std.mem.eql(u8, args[0], "models")) {
+            result.subcommand = .models;
+            result.subcommand_args = args[1..];
+            return result;
+        }
+        if (std.mem.eql(u8, args[0], "mcp")) {
+            result.subcommand = .mcp;
+            result.subcommand_args = args[1..];
+            return result;
+        }
     }
     errdefer result.prompt.deinit(allocator);
     errdefer result.extensions.deinit(allocator);
@@ -284,6 +306,14 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
         }
         if (!positional_only and std.mem.eql(u8, arg, "--trust-project-prompts")) {
             result.trust_project_prompts = true;
+            continue;
+        }
+        if (!positional_only and std.mem.eql(u8, arg, "--trust-project-mcp")) {
+            result.trust_project_mcp = true;
+            continue;
+        }
+        if (!positional_only and std.mem.eql(u8, arg, "--no-mcp-config")) {
+            result.no_mcp_config = true;
             continue;
         }
         const template_prefix = "--prompt-template=";

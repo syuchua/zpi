@@ -27,6 +27,8 @@ pub const builtin_commands = [_]BuiltinCommandDesc{
     .{ .name = "/hotkeys", .description = "Show keyboard shortcuts" },
     .{ .name = "/search", .description = "Search transcript (Ctrl-F / Esc)" },
     .{ .name = "/session", .description = "Show session info" },
+    .{ .name = "/cost", .description = "Show token usage and estimated cost" },
+    .{ .name = "/context", .description = "Show context token breakdown" },
     .{ .name = "/resume", .description = "Switch session" },
     .{ .name = "/new", .description = "Start a fresh session" },
     .{ .name = "/tree", .description = "Browse session branches" },

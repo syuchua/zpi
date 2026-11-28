@@ -77,6 +77,8 @@ pub const Usage = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
     total_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
 };
 pub const Message = struct {
     role: Role,
