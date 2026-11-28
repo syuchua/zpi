@@ -6,6 +6,27 @@ For release tags, CI first completes the four-platform native test matrix, then 
 
 Install `rg` and `fd` (or `fdfind`) separately if you use the corresponding search tools. To run existing pi TypeScript extensions, provide Node and your own pi SDK (**1.5.2** or **1.6.0**) installation. The default installation includes the Zpi extension host scripts and native ABI headers. [TypeScript extension setup](spec/typescript-extension-host.md)
 
+## Install with the release script
+
+The release installer detects macOS or Linux and x64 or ARM64, selects the matching glibc or musl archive on Linux, verifies its SHA-256 checksum, and installs the validated tree under `~/.local/opt/zpi`. It switches `~/.local/bin/zpi` atomically and keeps previous version directories available for rollback. It refuses to replace a regular file at that link.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/syuchua/zpi/main/install.sh | bash
+```
+
+The script is POSIX `sh`-compatible, so `| sh` works identically. It checks for `rg` and `fd` or `fdfind`. These are optional dependencies for the `grep` and `find` tools. With a terminal, it asks before using the detected package manager. Use `--without-search-tools` to skip the question or `--with-search-tools` to request installation explicitly.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/syuchua/zpi/main/install.sh | bash -s -- --without-search-tools
+curl -fsSL https://raw.githubusercontent.com/syuchua/zpi/main/install.sh | bash -s -- --with-search-tools
+```
+
+Add `~/.local/bin` to `PATH` when needed:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 ## Install a release archive
 
 GitHub release archives cover Linux x64 and arm64 with separate glibc and musl builds, plus macOS x64 and arm64. Each versioned `.tar.gz` has a matching `.sha256` file and extracts to a version/platform-named directory containing `bin/`, `include/` and `share/`. Linux glibc archives target glibc 2.17 and run offline CLI smoke tests in manylinux2014 containers. The search-tool scenarios run in the standard Linux CI matrix, which installs `rg` and `fd`. Musl archives are tested on Alpine 3.24. The macOS x64 binary declares a Catalina 10.15 deployment target; Apple Silicon declares a Big Sur 11.0 target. CI checks these load-command minimums and runs the binaries on current macOS runners, not on macOS 10.15/11 systems. All binaries target baseline CPU features. Verify the checksum before extraction.
@@ -36,7 +57,7 @@ Run the following from the directory containing an archive you trust and its che
 )
 ```
 
-The archive contains `bin/zpi`, `LICENSE`, native plugin headers, and the `share/zpi` TypeScript host scripts. It does not install Zig, Node, the pi SDK, `rg`, or `fd`/`fdfind`. Linux builds link to the target C library. For glibc and musl, choose a build compatible with the target loader and libc baseline; a macOS cross-build is not evidence of native execution or a general Linux ABI guarantee.
+The archive contains `bin/zpi`, `LICENSE`, native plugin headers, and the `share/zpi` TypeScript host scripts. The installer validates the archive layout and binary version before switching the active link. It does not install Zig, Node, the pi SDK, `rg`, or `fd`/`fdfind`. Linux builds link to the target C library. For glibc and musl, choose a build compatible with the target loader and libc baseline; a macOS cross-build is not evidence of native execution or a general Linux ABI guarantee.
 
 ## Build from source
 

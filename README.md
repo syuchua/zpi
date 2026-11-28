@@ -12,7 +12,15 @@
 
 ## First five minutes
 
-Zpi needs Zig **0.17.0** and a supported provider credential. `rg` and `fd` (or `fdfind`) are optional and only power the `grep` and `find` tools.
+Zpi needs a supported provider credential. Building from source requires Zig **0.17.0**. `rg` and `fd` (or `fdfind`) power the optional `grep` and `find` tools.
+
+For a published release, the installer detects macOS or Linux (x64/arm64 and glibc/musl), verifies the matching archive checksum, extracts it under `~/.local/opt/zpi`, and updates `~/.local/bin/zpi` atomically without replacing a regular file. It also checks for `rg` and `fd` or `fdfind`. In a terminal it asks whether the detected package manager should install missing search tools. Use `--without-search-tools` to skip the question or `--with-search-tools` to request installation explicitly.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/syuchua/zpi/main/install.sh | bash
+```
+
+(The installer is POSIX `sh`-compatible and also works with `| sh`.) Add `~/.local/bin` to `PATH` if it is not already present.
 
 1. Build and check the install: `zig build` then `./zig-out/bin/zpi --version`. Plain `zig build` produces a ReleaseSafe binary; add `-Doptimize=Debug` for a debug build, or `--release=fast|small` for other modes. `-Dtui=none` builds a headless binary for `-p`, `--mode json` and `--mode rpc`.
 2. Configure a provider in `~/.zpi/agent/models.json` (or point at an existing file with `--models-file`), and provide its credential through the environment or that file.
