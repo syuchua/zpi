@@ -299,7 +299,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == '/settings-switch/v1/chat/completions':
                 tools = {t['function']['name'] for t in request.get('tools', [])}
-                assert tools == {'read', 'edit', 'write', 'grep', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}, tools
+                assert tools == {'read', 'edit', 'write', 'grep', 'web_fetch', 'get_content', 'web_search', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}, tools
                 user = [m['content'] for m in request['messages'] if m['role'] == 'user'][-1]
                 if user == 'settings-check':
                     assert request.get('reasoning_effort') == 'medium', request
@@ -2404,8 +2404,9 @@ def check_tui_components(root, environment, server):
         # 2d. Automatic / and @ autocomplete popup below editor + Down/Esc/Tab interaction.
         slash_mark = len(transcript)
         os.write(master, b'/')
+        expect(b'/context', slash_mark)
+        expect(b'/cost', slash_mark)
         expect(b'/help', slash_mark)
-        expect(b'/hotkeys', slash_mark)
         down_mark = len(transcript)
         os.write(master, b'\x1b[B')
         expect(b'\xe2\x96\xb8 ', down_mark)  # ▸ highlight indicator
@@ -2416,6 +2417,14 @@ def check_tui_components(root, environment, server):
         os.write(master, b'@c')
         expect(b'@comp.txt', at_mark)
         os.write(master, b'\t\x15')  # Tab accepts @comp.txt, Ctrl-U clears line
+
+        # 2e. /cost and /context inspection commands
+        cost_mark = len(transcript)
+        os.write(master, b'/cost\n')
+        expect(b'Usage & Cost', cost_mark)
+        ctx_mark = len(transcript)
+        os.write(master, b'/context\n')
+        expect(b'Context Breakdown', ctx_mark)
 
         os.write(master, b'/exit\n')
         while True:
@@ -4836,12 +4845,12 @@ for line in sys.stdin:
                                         input='', text=True, capture_output=True, env=environment, timeout=20)
                 assert result.returncode != 0 and expected in result.stderr, result.stderr
                 assert not rejected_path.exists()
-            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill', 'subagent'}
+            builtins = {'read', 'write', 'edit', 'bash', 'grep', 'find', 'ls', 'web_fetch', 'web_search', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill', 'subagent'}
             for index, (flags, expected) in enumerate([
                 (['--tools', 'read,ls'], {'read', 'ls'}),
                 (['-t', 'r*,*sh', '-xt', '*sh'], {'read'}),
-                (['--tools=+write,-write,-bash,-web_fetch,-get_content,-bg_run,-bg_status,-bg_logs,-bg_kill'], {'read', 'edit'}),
-                ([], {'read', 'write', 'edit', 'bash', 'web_fetch', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}),
+                (['--tools=+write,-write,-bash,-web_fetch,-web_search,-get_content,-bg_run,-bg_status,-bg_logs,-bg_kill'], {'read', 'edit'}),
+                ([], {'read', 'write', 'edit', 'bash', 'web_fetch', 'web_search', 'get_content', 'bg_run', 'bg_status', 'bg_logs', 'bg_kill'}),
                 (['-nt', '-t', '+read,+ls', '--exclude-tools=ls'], {'read'}),
                 (['-nbt'], set()), (['--tools', ''], set()),
                 (['--tools', 'unknown'], set()),

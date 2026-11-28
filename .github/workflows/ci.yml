@@ -136,6 +136,7 @@ jobs:
           python3 scripts/test-cli.py
           python3 scripts/test-rpc.py "$(pwd)/zig-out/bin/zpi"
           python3 scripts/test-trusted-execution.py "$(pwd)/zig-out/bin/zpi"
+          python3 scripts/test-usability-upgrades.py "$(pwd)/zig-out/bin/zpi"
           python3 scripts/test-ts-host.py "$ZPI_PI_SDK"
           python3 scripts/test-context-budget.py
 
