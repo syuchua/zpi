@@ -2,7 +2,17 @@
 
 Status: design and evidence map for the experimental implementation. This document describes existing behavior and boundaries. The opt-in policy contract is in [security-capabilities.md](security-capabilities.md); it does not change the default. Zpi runs with the OS permissions of its launching account. Tool selection controls which model-callable tools are registered; it is not a process sandbox and does not by itself prevent explicitly selected extensions, plugins, or MCP commands from loading.
 
-When `--security=secure` is explicitly selected, the host adds pre-effect capability checks to built-in tool dispatch, user shell, clipboard copy, RPC `prompt`, MCP startup, TypeScript host startup, native-plugin loading, and child-Agent tool dispatch. `--audit-log` is required in secure mode and for request-scoped grants. The default compatibility mode remains unchanged; a configured audit log records the same host-observed checks with policy source `compatibility`.
+When `--security=secure` is explicitly selected, the host adds pre-effect capability and target-rule checks to built-in tool dispatch, user shell, clipboard copy, RPC `prompt`, MCP startup, TypeScript host startup, native-plugin loading, and child-Agent tool dispatch; enables OS confinement (`--sandbox workspace-write`, `--sandbox-network off`) and strict child environment allowlisting (`--env-isolation strict`) by default; and enforces canonical-path workspace containment on built-in file tools. `--audit-log` is required in secure mode and for request-scoped grants. The default compatibility mode remains unchanged (`--sandbox off`, `--env-isolation inherit`, `--subagent-isolation shared`); a configured audit log records the same host-observed checks with policy source `compatibility`.
+
+## OS confinement and credential isolation
+
+The shared confinement boundary (`src/sandbox.zig`) covers process-capable execution across `bash`, interactive user shell, `bg_run`, `rg`/`fd`, MCP stdio servers, the TypeScript extension host, and subagent child processes:
+
+- **macOS**: Seatbelt (`/usr/bin/sandbox-exec`) with a default-deny SBPL profile allowing read-only system runtime trees and the canonical workspace, writes only inside the canonical workspace (or none in `read-only` mode), explicit deny rules for host credential directories under `$HOME` (`.ssh`, `.aws`, `.gnupg`, `.zpi`, `.pi`, `.kube`, `.docker`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`), and `(deny network*)` when `--sandbox-network off`.
+- **Linux**: Landlock LSM (ABI v1–v5) filesystem and TCP rules plus a classic-BPF seccomp filter denying `AF_INET`/`AF_INET6`/`AF_NETLINK`/`AF_PACKET` sockets via a self-exec trampoline (`--zpi-internal-sandbox-exec`), with automatic fallback to `bwrap` (`--unshare-net`, read-only system binds, private `/tmp` tmpfs, `--die-with-parent`) when Landlock is unavailable. Fails closed (`SandboxUnavailable`) if no backend is available.
+- **Built-in file tools**: canonical-path resolution (`resolveToolPath`) resolves symlinks and rejects traversal, symlink escapes, symlinked parent directories, dangling symlinks, and writes in `read-only` mode.
+- **Child environment allowlisting**: strict mode forwards only a minimal non-credential allowlist (`PATH`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `COLORTERM`, `NO_COLOR`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `DEVELOPER_DIR`) plus explicit `--env-allow` entries, isolates `HOME` and `TMPDIR` to the workspace, and strips provider API keys and ambient secrets.
+- **Worktree-isolated subagents (`src/worktree.zig`)**: `--subagent-isolation worktree` (or `auto` for parallel batches in a git repo) runs each child in its own detached git worktree with a workspace-confined sandbox and read-only parent `.git` metadata so parallel edits cannot race on the parent working tree or modify repository hooks.
 
 ## Threat model
 
@@ -49,12 +59,14 @@ Run the available regression suite on the current host with Zig 0.17.0:
 
 ```sh
 zig build test install
+python3 scripts/test-install.py
 python3 scripts/test-cli.py
 python3 scripts/test-rpc.py zig-out/bin/zpi
+python3 scripts/test-trusted-execution.py zig-out/bin/zpi
 python3 scripts/test-ts-host.py "$ZPI_PI_SDK"  # when the supported SDK is installed
 ```
 
-The test suite uses local fake providers/servers and temporary directories; it does not prove the absence of all side effects, provide a security audit, or test malicious native code. Linux execution of these security changes, Linux TypeScript SDK execution, and OS-level sandboxing are not established by these checks. The current black-box tests verify MCP and TypeScript process-start denial, native-plugin load denial, and `network.connect` denial before a local HTTP request. Effects made inside an already started component or arbitrary shell command remain outside host observation.
+`scripts/test-trusted-execution.py` verifies target-scoped path/command/network rules, TUI one-time approvals and denials in a real PTY, structured headless denials, OS sandbox + environment isolation escape regressions across out-of-workspace writes, network access, child/grandchild processes, symlinks, MCP stdio servers, and the TypeScript extension host, worktree-isolated parallel subagents, and `--unattended` fail-stop execution. Linux Landlock+seccomp and `bwrap` execution must still be validated on a Linux host/CI runner; cross-compilation for `x86_64-linux-musl` and `aarch64-linux-gnu` is checked locally. Native C/Zig libraries remain in-process trusted code without memory or crash isolation.
 
 ## Policy decisions intentionally deferred
 

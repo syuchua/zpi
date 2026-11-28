@@ -1,20 +1,14 @@
-# Capability authorization and audit contract
+# Capability authorization, confinement, and audit contract
 
-Status: MVP contract for the opt-in authorization and audit layer. This document defines policy and observability semantics; it does not claim OS sandboxing or memory isolation.
+Status: contract for the opt-in Trusted Execution layer (capability authorization, target rules, TUI one-time approvals, OS confinement, child environment isolation, worktree subagent isolation, unattended fail-stop mode, and redacted audit).
 
 ## Scope and compatibility
 
-Zpi keeps its existing behavior by default. A normal invocation uses `compatibility` policy mode: existing tool, MCP, TypeScript, native-plugin, and RPC behavior remains available according to the existing CLI/tool-selection rules. Authorization decisions are still observable through the audit sink when one is configured.
+Zpi keeps its existing behavior by default. A normal invocation uses `compatibility` policy mode with `--sandbox off`, `--env-isolation inherit`, and `--subagent-isolation shared`: existing tool, MCP, TypeScript, native-plugin, and RPC behavior remains available according to the existing CLI/tool-selection rules. Authorization decisions are still observable through the audit sink when one is configured.
 
-The opt-in `secure` policy mode is a reference-monitor layer inside Zpi. It denies sensitive effects unless a matching capability grant is present. It does not reduce the OS permissions of Zpi or any child process. A trusted native library can still execute constructors before Zpi validates its descriptor, and an already loaded extension or MCP process can use APIs outside this contract.
+The opt-in `secure` policy mode adds pre-effect capability checks, target-scoped policy rules, TUI one-time approvals (interactive only), fail-closed structured headless denials, OS confinement (`workspace-write`, `network=off` by default), canonical-path file-tool checks, and strict child environment allowlisting (`--env-isolation strict`).
 
-This MVP does not provide:
-
-- an OS-level sandbox, container, seccomp profile, MAC policy, or privilege drop;
-- memory or crash isolation for native plugins;
-- authentication or authorization for remote RPC clients;
-- automatic project trust or extension discovery;
-- a hidden approval prompt that claims to contain an already started process.
+In-process native C/Zig plugins still execute inside the Zpi process without memory or crash isolation; do not load untrusted native libraries. Remote RPC peer authentication and automatic project trust/extension discovery remain out of scope.
 
 The existing explicit executable paths and tool-selection rules remain in force in both modes.
 
@@ -58,16 +52,44 @@ Grant scopes are deliberately explicit:
 
 The current CLI accepts `--allow-capability ID` as an invocation grant, `--allow-capability-session ID` as a session grant, and `--allow-capability-once ID` as a request grant. A request grant can satisfy any covered check for its capability, including RPC `prompt` admission before prompt preparation. Any matching active deny takes precedence over allows. Among allows, the evaluator prefers a non-request grant to a request grant; therefore an invocation, session, or persistent allow can leave a redundant one-shot allow unused. A successful authorization consumes the selected one-shot grant even if the operation later fails or a subsequent check denies it. Restarting Zpi drops invocation, session, and request grants.
 
-Use `--security-policy PATH` with secure mode and a configured audit log to load a fresh policy snapshot at startup. Relative paths resolve from the launch directory. Select a trusted directory and a regular, single-link file owned by the effective user with no group or other permission bits. Zpi rejects final-component symlinks, bounds the file to 64 KiB, and rechecks regular-file type, owner-only permissions, link count, size, and timestamps after reading. The format is a JSON object with `version: 1` and a `grants` array. Each grant has `capability` and `effect` (`allow` or `deny`). An optional `scope` must be `persistent`.
+Use `--security-policy PATH` with secure mode and a configured audit log to load a fresh policy snapshot at startup. Relative paths resolve from the launch directory. Select a trusted directory and a regular, single-link file owned by the effective user with no group or other permission bits. Zpi rejects final-component symlinks, bounds the file to 64 KiB, and rechecks regular-file type, owner-only permissions, link count, size, and timestamps after reading. The format is a JSON object with `version: 1` and a `grants` array. Each grant has `capability`, `effect` (`allow` or `deny`), optional `scope` (`persistent`), and optional `target`:
 
-A grant matches the exact capability. Target-kind-specific grants are not yet accepted by the CLI; an unsupported target-scoped policy is invalid and fails closed. An absent grant is a deny in secure mode. A grant cannot grant a capability that the current invocation has disabled with `--no-tools`, `--exclude-tools`, or an equivalent surface-specific setting. Policy is an additional check, not a replacement for tool selection or input validation.
+```json
+{
+  "version": 1,
+  "grants": [
+    {
+      "capability": "filesystem.write",
+      "effect": "allow",
+      "target": { "kind": "path", "value": "/abs/canonical/workspace", "match": "subtree" }
+    },
+    {
+      "capability": "process.exec",
+      "effect": "allow",
+      "target": { "kind": "command", "value": "git", "match": "prefix" }
+    },
+    {
+      "capability": "network.connect",
+      "effect": "allow",
+      "target": { "kind": "url", "value": "https://api.example.com", "match": "origin" }
+    }
+  ]
+}
+```
+
+Supported target rule matchers:
+- `path` (`filesystem.read`, `filesystem.write`): canonical absolute path with `match: "exact"` or `match: "subtree"`. Dangling symlinks and unresolved paths fail closed with `unresolved-path`.
+- `command` (`process.exec`): `match: "exact"` or `match: "prefix"`. Allow-prefix rules match only at whitespace word boundaries and reject shell control/expansion/quoting metacharacters (`;|&$`()<>\'"#*?[]{}~`), preventing command chaining bypasses; deny-prefix rules still match across trailing shell separators.
+- `url` (`network.connect`): `match: "exact"`, `match: "origin"` (case-insensitive scheme/host + normalized effective port), or `match: "host"` (exact case-insensitive hostname). Checked before every HTTP request and every redirect hop.
+
+Legacy `targetKind`-only rules remain rejected (`UnsupportedTargetScopedGrant`). An absent grant is a deny in secure mode. A grant cannot enable a capability that the current invocation has disabled with `--no-tools`, `--exclude-tools`, or an equivalent surface-specific setting. Policy is an additional check, not a replacement for tool selection, canonical-path validation, or OS confinement.
 
 Policy evaluation applies these rules:
 
 1. Malformed policy and any matching active explicit deny are fail-closed.
-2. Active grant target constraints must match the request; this MVP rejects persisted target-scoped rules at load time.
+2. Target constraints on active grants must match the request target kind and canonical/validated target value.
 3. Among matching allow grants, invocation/session/persistent grants take precedence over request grants.
-4. With no explicit match, compatibility mode implicitly allows; secure mode denies.
+4. With no explicit match, compatibility mode implicitly allows; secure mode prompts once in interactive TUI mode (`policySource: "approval"`, recording `interactive-approval` or `interactive-denial`) or denies immediately in headless/unattended modes (`policySource: "validation"`, `reason: "missing-grant"`).
 5. Tool/surface selection remains an independent declaration and dispatch filter; a capability grant does not override it.
 
 The evaluator must not call an effectful callback before returning `allow`.
@@ -82,11 +104,11 @@ For a child process or external server, `allowed` means only that start was auth
 
 Authorization state is never inherited as a hidden ambient grant by a newly started external component. The host may pass an explicit policy context to a supported protocol, but a Node process, MCP server, or native library cannot self-authorize through an environment variable or callback.
 
-## Headless and interactive behavior
+## Headless, interactive, and unattended behavior
 
-Secure mode is deterministic in all output modes. Headless print, JSON, and RPC modes never wait for an interactive approval prompt. A missing grant returns a structured denial and exits or reports the request according to the existing mode protocol. Interactive TUI mode may later add a visible approval workflow, but this MVP must not silently fall back to compatibility mode when no prompt is possible.
-
-Denial is a tool or RPC result for a dispatch request and a startup error for a denied executable. The audit event carries the capability and machine-readable reason.
+- **Interactive TUI (`--security secure`)**: missing grants display a one-time `Allow once? [y/N]` prompt with the full capability and target label (wrapping long labels and requiring full visibility before `y` is accepted; `n`/Enter/cancel denies). Approvals never persist across calls. Both approvals (`policySource: "approval"`, `reason: "interactive-approval"`) and denials (`policySource: "approval"`, `reason: "interactive-denial"`) are written and synced to the audit log.
+- **Headless (`-p`, `--mode json`, `--mode rpc`, `-Dtui=none`)**: never waits for interactive input. Missing grants fail closed immediately. Tool denials return a structured redacted `details` object (`{ "type": "authorization_denied", "code": "CapabilityDenied", "capability", "targetKind", "policySource", "reason" }`). RPC `prompt` denials preserve the exact `{"type":"response","id":...,"command":"prompt","success":false,"error":"CapabilityDenied"}` frame.
+- **Unattended (`--unattended`)**: requires headless mode, `--security secure`, `--audit-log`, `--security-policy`, active OS sandbox (`workspace-write` or `read-only`), and strict environment isolation. Interactive approvals are disabled. The first policy denial or workspace boundary violation writes and syncs the audit record and immediately halts execution (fail-stop) with a non-zero exit code, canceling any active subagent batch or background task.
 
 ## Audit event schema
 
@@ -106,7 +128,7 @@ The audit sink receives bounded authorization events at control checks and termi
   "mode": "compatibility|secure",
   "decision": "allow|deny|invalid",
   "outcome": "allowed|denied|failed|cancelled|unknown",
-  "policySource": "compatibility|request|invocation|session|persistent|selection|validation|system",
+  "policySource": "compatibility|request|invocation|session|persistent|selection|validation|system|approval",
   "reason": "stable machine-readable reason code"
 }
 ```

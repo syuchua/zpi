@@ -2,9 +2,9 @@
 
 The opt-in capability and audit contract is defined in [security-capabilities.md](spec/security-capabilities.md). It adds a policy layer without changing the default compatibility behavior.
 
-## Enable secure mode
+## Enable secure mode and OS confinement
 
-Secure mode requires an audit log and denies covered operations without a grant. This example selects the `read` tool, grants `filesystem.read`, and records redacted authorization and operation events.
+Default `compatibility` mode preserves existing behavior (`--sandbox off`, `--env-isolation inherit`). Enabling `--security secure` turns on capability policy checks, requires `--audit-log`, defaults child processes to OS confinement (`--sandbox workspace-write`, `--sandbox-network off`), enforces canonical-path checks on built-in file tools, and enables strict child environment allowlisting (`--env-isolation strict`).
 
 ```sh
 mkdir -p -m 700 "$HOME/.zpi/audit"
@@ -15,9 +15,28 @@ zpi --security secure \
   -p "Read README.md and summarize this project"
 ```
 
-Keep the audit directory private. `--tools read` selects the model-callable tool. The `filesystem.read` grant permits that tool to read files accessible to your account. Use OS-level isolation to restrict accessible files. Grant lifetimes and persistent policies are documented in the [capability guide](spec/security-capabilities.md).
+Keep the audit directory private. In interactive TUI mode, `--security secure` offers one-time `[y/N]` approval prompts for missing grants (auditing both `interactive-approval` and `interactive-denial`). In headless modes (`-p`, `--mode json`, `--mode rpc`), missing grants fail closed with structured denial details and never prompt.
 
-Zpi runs with the permissions of the account that launches it. `--cwd` sets the working directory for tools. Enabled tools can read and change other files that the account can access, and `bash` can launch processes and use the network. Use an OS-level isolation boundary and a restricted account when running against untrusted projects or data.
+### Trusted Execution controls
+
+- **Target-scoped policy rules (`--security-policy PATH`)**: private (`0600`, single-link, owner-only) version-1 JSON policies support `allow`/`deny` rules for canonical paths (`exact`, `subtree`), commands (`exact`, metacharacter-guarded `prefix`), and network URLs (`exact`, `origin`, `host`). Explicit `deny` always wins.
+- **OS sandbox (`--sandbox off|read-only|workspace-write`, `--sandbox-network off|on`, `--sandbox-backend auto|seatbelt|landlock|bwrap`)**: applies a shared OS confinement boundary to `bash`, user shell, `bg_run`, `rg`/`fd`, MCP stdio servers, the TypeScript extension host, and subagent child processes, plus canonical-path symlink checks on built-in file tools (`read`, `write`, `edit`, `ls`, `find`, `grep`). Uses macOS Seatbelt, Linux Landlock + seccomp-bpf, or `bwrap` fallback on Linux; fails closed (`SandboxUnavailable`) when no backend is available.
+- **Credential & environment isolation (`--env-isolation strict|inherit`, `--env-allow NAME`)**: strict mode (default with `--security secure` or active `--sandbox`) forwards only a minimal non-credential allowlist (`PATH`, `LANG`, `TERM`, etc.), isolates `HOME` and `TMPDIR` to the workspace, strips ambient provider/cloud/SSH/GPG secrets, and denies reads to host credential directories (`~/.ssh`, `~/.aws`, `~/.zpi`, `~/.pi`, `~/.gnupg`, etc.).
+- **Worktree-isolated parallel subagents (`--subagent-isolation shared|worktree|auto`)**: runs concurrent subagents in detached git worktrees with read-only parent `.git` metadata so parallel edits never race on the parent working tree or tamper with repository hooks, returning bounded `changedFiles` and unified `diff` summaries before cleanup.
+- **Unattended fail-stop execution (`--unattended`)**: requires headless mode, `--security secure`, `--audit-log`, an explicit private `--security-policy`, an active OS sandbox, and strict environment isolation. Disables interactive prompts and halts immediately on the first policy denial or workspace boundary violation after syncing the audit record.
+
+```sh
+zpi --unattended \
+  --security secure \
+  --security-policy "$HOME/.zpi/policy.json" \
+  --audit-log "$HOME/.zpi/audit/unattended.jsonl" \
+  --subagent-isolation worktree \
+  -p "Run bounded workspace checks"
+```
+
+Grant lifetimes and persistent policy schemas are documented in [security-capabilities.md](spec/security-capabilities.md), and the threat model and confinement evidence are mapped in [security-boundaries.md](spec/security-boundaries.md).
+
+In default `compatibility` mode, Zpi runs with the permissions of the account that launches it. `--cwd` sets the working directory for tools, and enabled tools can read and change other files that the account can access unless `--sandbox` or `--security secure` is enabled.
 
 ## Select the resources and executables you trust
 

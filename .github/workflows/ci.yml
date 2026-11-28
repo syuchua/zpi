@@ -120,6 +120,9 @@ jobs:
           node --check scripts/pi-sdk.mjs
           node --check scripts/test-pi-session-parity.mjs
           node --check scripts/probe-ts-installed.mjs
+          sh -n install.sh
+          python3 -m py_compile scripts/test-install.py
+          python3 scripts/test-install.py
           rg --version
           if command -v fd >/dev/null; then fd --version; else fdfind --version; fi
 
@@ -132,6 +135,7 @@ jobs:
           export ZPI_TEST_NATIVE_PLUGINS="$PWD/zig-out/lib/libzpi-native-c-fixture.$extension:$PWD/zig-out/lib/libzpi-native-zig-fixture.$extension"
           python3 scripts/test-cli.py
           python3 scripts/test-rpc.py "$(pwd)/zig-out/bin/zpi"
+          python3 scripts/test-trusted-execution.py "$(pwd)/zig-out/bin/zpi"
           python3 scripts/test-ts-host.py "$ZPI_PI_SDK"
           python3 scripts/test-context-budget.py
 
