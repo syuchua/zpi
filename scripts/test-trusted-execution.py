@@ -281,6 +281,7 @@ def check_phase1_tui_one_time_approval(binary, server, root, ws, env):
         pos = read_until(b"\x1b[?2004l", pos)
         pos = read_until(b"\x1b[36m>\x1b[0m ", pos)
         os.write(master, b"\x04")
+        master_open = True
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             wpid, status = os.waitpid(pid, os.WNOHANG)
@@ -288,11 +289,16 @@ def check_phase1_tui_one_time_approval(binary, server, root, ws, env):
                 assert os.waitstatus_to_exitcode(status) == 0, status
                 pid = 0
                 break
-            if select.select([master], [], [], 0.1)[0]:
+            if master_open and select.select([master], [], [], 0.05)[0]:
                 try:
-                    os.read(master, 4096)
+                    data = os.read(master, 4096)
+                    if not data:
+                        master_open = False
                 except OSError:
-                    break
+                    # On Linux, PTY slave close raises EIO before waitpid(WNOHANG) sees the exit.
+                    master_open = False
+            else:
+                time.sleep(0.02)
         assert pid == 0, "TUI did not exit cleanly after Ctrl-D"
     finally:
         os.close(master)
