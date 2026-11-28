@@ -41,8 +41,8 @@ getconf GNU_LIBC_VERSION
 printf 'Zig version: '; zig version
 zig fmt --check build.zig src
 zig build install test-binaries -j2 --summary all
-cp scripts/test-cli.py scripts/test-context-budget.py zig-out/
+cp scripts/test-cli.py scripts/test-rpc.py scripts/test-context-budget.py zig-out/
 ldd zig-out/bin/zpi
 sh scripts/test-linux-artifacts.sh "$PWD/zig-out" --allow-search-skips
-sha256sum src/pi_session.zig zig-out/test-cli.py zig-out/test-context-budget.py
+sha256sum src/pi_session.zig zig-out/test-cli.py zig-out/test-rpc.py zig-out/test-context-budget.py
 GUEST

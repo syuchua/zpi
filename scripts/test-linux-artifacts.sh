@@ -21,7 +21,7 @@ else
     exit 1
 fi
 
-for suite in core cli harness skills tool-selection tui sse http-header http-transport model openai openai-responses anthropic anthropic-edge agent tool session pi-session replacement search web-fetch bg-tasks extension context-budget compaction mcp mcp-tool prompt-template native native-value native-json; do
+for suite in core cli harness skills tool-selection tui sse http-header http-transport model openai openai-responses anthropic anthropic-edge agent tool session pi-session replacement search web-fetch bg-tasks extension extension-tool security context-budget compaction mcp mcp-tool prompt-template doctor audit native native-value native-json; do
     "$artifacts/bin/$suite-tests"
 done
 ZPI_REJECTION_DIR="$artifacts/lib" "$artifacts/bin/native-rejection-tests"
@@ -37,4 +37,5 @@ fi
 ZPI_TEST_BINARY="$binary" \
     ZPI_TEST_NATIVE_PLUGINS="$artifacts/lib/libzpi-native-c-fixture.so:$artifacts/lib/libzpi-native-zig-fixture.so" \
     python3 "$artifacts/test-cli.py"
+python3 "$artifacts/test-rpc.py" "$binary"
 ZPI_TEST_BINARY="$binary" python3 "$artifacts/test-context-budget.py"

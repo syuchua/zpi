@@ -422,6 +422,16 @@ Subagent fixtures cover single-child file writes, parallel overlap, parent-enabl
 | `src/rpc.zig` | `4bf1f7d708e139f10a47b12d2e2b3962caea1c40ae016a4b716d1e11f9e267eb` |
 | `src/subagent.zig` | `b736df5797dc7e869f8bf25c8806567a23da46ab303e21ea7fe2c6b8bcee3ff4` |
 
+## Opt-in capability and audit regressions
+
+The Linux native-arm64 run `b72eda066` built in an Alpine 3.24.3 guest in Colima using Zig 0.17.0, completed 114/114 build steps, and ran the expanded installed Linux artifact suite. The suite included `security-tests`, doctor, audit, extension-tool, MCP, C/Zig native runtime, harness, CLI, RPC, and context-budget executables. It passed the installed CLI and standalone RPC security fixture, native `.so` workflows, and 84 context-budget checks. Three SDK-dependent TypeScript tests skipped because the guest has neither Node nor the Pi SDK. The native Linux script runs headless artifacts, not Linux TUI. This is Linux arm64/musl evidence; Linux GNU and Linux TypeScript SDK coverage remain separate.
+
+On macOS arm64 with Zig 0.17.0, the current-tree security run `b6ac816bf` completed 154/154 build steps and 154/154 tests with no skips. Formatting, diff checks, and Python fixture compilation passed. The RPC fixture, full CLI integration with Pi 1.6.0 and C/Zig native plugins, TypeScript host/deadline fixtures, and a separate `-Dtui=none` build (8/8 steps) plus headless RPC fixture all passed. This tree includes authorization append failure, conservative native-library-load `unknown` outcome, secure file/network/component denials, and clipboard `process.exec`/`clipboard.write` sequencing. The clipboard helper is injected; physical OS clipboard interaction and Linux security-path execution remain unverified.
+
+The focused RPC run `b7021a959` verified distinct operation records for `process.exec=allowed` and `extension.load=unknown` when a spawned TypeScript host disconnected during extension loading. Each operation references its own authorization event. The fixture also covers one-shot RPC admission, persistent-policy reload/rejection, audit redaction, and MCP child-start denial with `mcp.start` allowed but `process.exec` denied.
+
+The clipboard test in run `b5e026a58` runs with an injected helper runner, not an OS clipboard service. It verifies two independent pre-effect capabilities (`process.exec` and `clipboard.write`), that a rejected process grant does not consume the one-shot clipboard grant, that a successful copy consumes it, that a retry is denied without another helper call, and that clipboard content is absent from the audit log. Physical clipboard interaction remains unverified.
+
 ## Further acceptance
 
 - Extend the same build-installed test executables as real core behavior lands; preserve failures and distinguish compilation from execution.

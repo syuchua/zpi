@@ -34,9 +34,9 @@ printf "Zig version: "; zig version
 printf "Guest: "; uname -sm
 printf "Compiler: "; cc --version | head -n 1
 zig fmt --check build.zig src
-python3 -m py_compile scripts/test-cli.py scripts/test-context-budget.py
+python3 -m py_compile scripts/test-cli.py scripts/test-rpc.py scripts/test-context-budget.py
 zig build install test-binaries --summary all
-cp scripts/test-cli.py scripts/test-context-budget.py zig-out/
+cp scripts/test-cli.py scripts/test-rpc.py scripts/test-context-budget.py zig-out/
 sh scripts/test-linux-artifacts.sh "$PWD/zig-out"
-sha256sum zig-out/test-cli.py zig-out/test-context-budget.py
+sha256sum zig-out/test-cli.py zig-out/test-rpc.py zig-out/test-context-budget.py
 '

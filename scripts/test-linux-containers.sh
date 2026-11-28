@@ -25,7 +25,7 @@ run_tests() {
     tag="$image-$arch"
     zig build test-binaries "-Dtarget=$target" --prefix "$out"
     zig build "-Dtarget=$target" --prefix "$out"
-    cp scripts/test-cli.py scripts/test-context-budget.py scripts/test-linux-artifacts.sh "$out/"
+    cp scripts/test-cli.py scripts/test-rpc.py scripts/test-context-budget.py scripts/test-linux-artifacts.sh "$out/"
     if [ "${ZPI_BUILD_TEST_IMAGE:-1}" = 1 ]; then
         set --
         # A proxy address inside a guest may differ from the host's loopback.

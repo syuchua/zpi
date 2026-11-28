@@ -88,7 +88,7 @@ The performance benchmark document now includes same-host Zpi/pi/rpi measurement
 - [Compatibility matrix](docs/spec/compatibility-matrix.md)
 - [Performance baseline and comparison method](docs/spec/performance-baseline.md)
 - [Platform verification](docs/spec/platform-verification.md)
-- [Security notes](docs/security.md) and [execution policy boundaries](docs/spec/security-boundaries.md)
+- [Security notes](docs/security.md), [capability authorization and audit contract](docs/spec/security-capabilities.md), and [execution policy boundaries](docs/spec/security-boundaries.md)
 - [Install, upgrade and remove](docs/install.md)
 - [v0.1.2 release notes](docs/releases/v0.1.2.md), [v0.1.1 release notes](docs/releases/v0.1.1.md), and [v0.1.0 release notes](docs/releases/v0.1.0.md)
 - [Native plugin ABI](docs/spec/native-plugin-abi.md) and [runtime](docs/spec/native-plugin-runtime.md)

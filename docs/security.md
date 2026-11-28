@@ -1,5 +1,7 @@
 # Security and credentials
 
+The opt-in capability and audit contract is defined in [security-capabilities.md](spec/security-capabilities.md). It adds a policy layer without changing the default compatibility behavior.
+
 Zpi runs with the permissions of the account that launches it. `--cwd` sets the working directory for tools. Enabled tools can read and change other files that the account can access, and `bash` can launch processes and use the network. Use an OS-level isolation boundary and a restricted account when running against untrusted projects or data.
 
 ## Select the resources and executables you trust

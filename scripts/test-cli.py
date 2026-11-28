@@ -69,6 +69,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        self.server.get_paths.append(self.path)
         if self.path == '/web-fetch-doc':
             body = (b'<html><head><title>Native Fetch Doc</title></head>'
                     b'<body><script>evil()</script><h1>Heading One</h1>'
@@ -949,6 +950,18 @@ class Handler(BaseHTTPRequestHandler):
                         'path': 'filtered.txt', 'content': 'fixture',
                     })},
                 }]}, 'finish_reason': 'content_filter'}]}
+            elif user == 'secure-write-denied':
+                results = [m for m in messages if m['role'] == 'tool']
+                if not results:
+                    response = {'choices': [{'index': 0, 'delta': {'tool_calls': [{
+                        'index': 0, 'id': 'secure-denied-write', 'type': 'function',
+                        'function': {'name': 'write', 'arguments': json.dumps({
+                            'path': 'secure-forbidden.txt', 'content': 'must not write',
+                        })},
+                    }]}, 'finish_reason': 'tool_calls'}]}
+                else:
+                    assert 'Capability denied by security policy' in results[-1]['content'], results
+                    response = self.text('secure write denial handled')
             elif user == 'disabled-effect':
                 assert {t['function']['name'] for t in request.get('tools', [])} == {'read'}
                 results = [m for m in messages if m['role'] == 'tool']
@@ -983,7 +996,7 @@ class Handler(BaseHTTPRequestHandler):
                     assert completed[3]['content'] == 'Tool blocked by extension: fixture denied'
                     assert 'Wrote' in completed[4]['content']
                     response = self.text('extension complete')
-            elif user == 'web-fetch-ssrf':
+            elif user in ('web-fetch-ssrf', 'web-fetch-secure-denied'):
                 results = [m for m in messages if m['role'] == 'tool']
                 if not results:
                     url = f'http://127.0.0.1:{self.server.server_port}/web-fetch-doc'
@@ -992,8 +1005,12 @@ class Handler(BaseHTTPRequestHandler):
                         'function': {'name': 'web_fetch', 'arguments': json.dumps({'url': url})},
                     }]}, 'finish_reason': 'tool_calls'}]}
                 else:
-                    assert 'SsrfBlocked' in results[-1]['content'], results
-                    response = self.text('ssrf blocked ok')
+                    if user == 'web-fetch-ssrf':
+                        assert 'SsrfBlocked' in results[-1]['content'], results
+                        response = self.text('ssrf blocked ok')
+                    else:
+                        assert 'Capability denied by security policy' in results[-1]['content'], results
+                        response = self.text('web fetch policy handled')
             elif user == 'web-fetch-loopback':
                 results = [m for m in messages if m['role'] == 'tool']
                 if not results:
@@ -4003,6 +4020,7 @@ def check_fullscreen_viewport(root, environment, server):
 def main():
     server = Server(('127.0.0.1', 0), Handler)
     server.failures = []
+    server.get_paths = []
     server.expected_file_prompts = set()
     server.expected_tool_sets = {}
     server.expected_system_prompts = {}
@@ -4799,9 +4817,40 @@ for line in sys.stdin:
             wf_ssrf = run_repo_cli(common[:-2] + ['--no-session', '-p', 'web-fetch-ssrf'], input='', text=True,
                                    capture_output=True, env=environment, timeout=20)
             assert wf_ssrf.returncode == 0 and wf_ssrf.stdout == 'ssrf blocked ok\n', (wf_ssrf.stderr, server.failures)
+            secure_audit = root / 'secure-web-fetch-audit.jsonl'
+            web_before = len(server.get_paths)
+            secure_web = run_repo_cli(common[:-2] + ['--no-session', '--security=secure', '--audit-log', str(secure_audit),
+                                                     '--allow-loopback-web-fetch', '-p', 'web-fetch-secure-denied'],
+                                      input='', text=True, capture_output=True, env=environment, timeout=20)
+            assert secure_web.returncode == 0 and secure_web.stdout == 'web fetch policy handled\n', (secure_web.stderr, server.failures)
+            assert len(server.get_paths) == web_before, server.get_paths[web_before:]
+            audit_text = secure_audit.read_text()
+            denied_web, = [json.loads(line) for line in audit_text.splitlines()]
+            assert (denied_web['event'], denied_web['capability'], denied_web['source']) == (
+                'authorization', 'network.connect', 'builtin_tool')
+            assert (denied_web['decision'], denied_web['outcome'], denied_web['policySource']) == (
+                'deny', 'denied', 'validation')
+            assert denied_web['target'] == {'kind': 'url', 'summary': ''}
+            assert 'web-fetch-doc' not in audit_text and '127.0.0.1' not in audit_text
             wf_loop = run_repo_cli(common[:-2] + ['--no-session', '--allow-loopback-web-fetch', '-p', 'web-fetch-loopback'], input='', text=True,
                                    capture_output=True, env=environment, timeout=20)
             assert wf_loop.returncode == 0 and wf_loop.stdout == 'web fetch loopback ok\n', (wf_loop.stderr, server.failures)
+            assert server.get_paths[web_before:] == ['/web-fetch-redir', '/web-fetch-doc']
+            secure_write_path = root / 'secure-forbidden.txt'
+            secure_write_audit = root / 'secure-write-audit.jsonl'
+            secure_write = run_repo_cli(common[:-2] + ['--no-session', '--security=secure', '--audit-log', str(secure_write_audit),
+                                                       '--allow-capability=process.exec', '-p', 'secure-write-denied'],
+                                        input='', text=True, capture_output=True, env=environment, timeout=20)
+            assert secure_write.returncode == 0 and secure_write.stdout == 'secure write denial handled\n', secure_write.stderr
+            assert not secure_write_path.exists()
+            secure_write_events = [json.loads(line) for line in secure_write_audit.read_text().splitlines()]
+            write_denial, = [event for event in secure_write_events if event.get('event') == 'authorization'
+                             and event.get('capability') == 'filesystem.write']
+            assert (write_denial['decision'], write_denial['outcome'], write_denial['target']['kind']) == ('deny', 'denied', 'path')
+            assert not any(event.get('event') == 'operation' and event.get('capability') == 'filesystem.write'
+                           for event in secure_write_events)
+            assert str(secure_write_path) not in secure_write_audit.read_text()
+
             disabled_session = root / 'disabled.jsonl'
             disabled_args = common.copy()
             disabled_args[-1] = str(disabled_session)
