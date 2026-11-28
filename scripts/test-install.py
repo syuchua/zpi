@@ -100,8 +100,10 @@ esac
 ''')
         (server / 'latest-url').write_text('https://github.com/syuchua/zpi/releases/tag/v9.8.7')
         write_executable(fakebin / 'uname', 'case $1 in -m) echo arm64 ;; -s) echo Darwin ;; *) exit 1 ;; esac\n')
-        for utility in ('awk', 'tar', 'mkdir', 'mktemp', 'mv', 'rm', 'chmod', 'ln', 'readlink', 'cp', 'cat', 'rmdir'):
-            (fakebin / utility).symlink_to(shutil.which(utility))
+        for utility in ('awk', 'tar', 'gzip', 'mkdir', 'mktemp', 'mv', 'rm', 'chmod', 'ln', 'readlink', 'cp', 'cat', 'rmdir'):
+            found = shutil.which(utility)
+            if found:
+                (fakebin / utility).symlink_to(found)
         hasher = 'sha256sum' if shutil.which('sha256sum') else 'shasum'
         (fakebin / hasher).symlink_to(shutil.which(hasher))
         # Exercise the Darwin installer on GNU hosts too. GNU mv spells -h as -T.
