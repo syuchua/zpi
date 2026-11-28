@@ -2,6 +2,7 @@
 const std = @import("std");
 const model = @import("model");
 const build_version = @import("version");
+const sandbox_mod = @import("sandbox");
 
 const max_line = 1024 * 1024;
 const max_inbound_frames = 128;
@@ -12,6 +13,7 @@ pub const Config = struct {
     argv: []const []const u8,
     cwd: []const u8,
     timeout_ms: u32 = 60_000,
+    sandbox: sandbox_mod.Config = .{},
 };
 
 pub const Reply = struct {
@@ -47,13 +49,29 @@ pub const Client = struct {
         for (config.argv) |arg| {
             if (arg.len > 16 * 1024 or std.mem.indexOfScalar(u8, arg, 0) != null or !std.unicode.utf8ValidateSlice(arg)) return error.InvalidMcpConfig;
         }
-        const child = try std.process.spawn(io, .{
+        var extra_reads: [2][]const u8 = undefined;
+        var extra_read_count: usize = 0;
+        // Allow reading an explicit script/executable argument directory if supplied as an absolute path
+        // (e.g. `python3 /path/to/mcp_server.py`), while never broadening to `$HOME` or `/`.
+        for (config.argv[1..]) |arg| {
+            if (extra_read_count >= extra_reads.len) break;
+            if (std.fs.path.isAbsolute(arg)) {
+                if (std.fs.path.dirname(arg)) |parent| {
+                    if (!std.mem.eql(u8, parent, "/")) {
+                        extra_reads[extra_read_count] = parent;
+                        extra_read_count += 1;
+                    }
+                }
+            }
+        }
+        const child = try sandbox_mod.spawn(a, io, config.sandbox, .{
             .argv = config.argv,
-            .cwd = .{ .path = config.cwd },
+            .cwd = config.cwd,
             .pgid = 0,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
+            .extra_read_paths = extra_reads[0..extra_read_count],
         });
         return .{ .allocator = a, .io = io, .child = child, .timeout_ms = config.timeout_ms };
     }

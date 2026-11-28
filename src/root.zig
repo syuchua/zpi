@@ -18,6 +18,7 @@ pub const mcp_tools = @import("mcp_tools");
 pub const context_budget = @import("context_budget");
 pub const compaction = @import("compaction");
 pub const security = @import("security");
+pub const sandbox = @import("sandbox");
 pub const audit = @import("audit");
 
 pub const ProviderError = error{

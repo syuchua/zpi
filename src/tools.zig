@@ -6,12 +6,14 @@ const replacements = @import("replacements");
 const search = @import("search");
 const web_fetch = @import("web_fetch");
 const bg_tasks = @import("bg_tasks");
+const sandbox_mod = @import("sandbox");
 
 pub const Options = struct {
     temp_dir: []const u8 = "/tmp",
     allow_loopback_web_fetch: bool = false,
     io: ?std.Io = null,
     cwd: []const u8 = ".",
+    sandbox: sandbox_mod.Config = .{},
 };
 
 pub const ToolSet = struct {
@@ -34,26 +36,26 @@ pub const ToolSet = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
         const owned_temp = try a.dupe(u8, if (opts.temp_dir.len > 0) opts.temp_dir else "/tmp");
-        const bash_ctx: *BashContext = try a.create(BashContext);
-        bash_ctx.* = .{ .temp_dir = owned_temp };
+        const runtime_ctx: *RuntimeContext = try a.create(RuntimeContext);
+        runtime_ctx.* = .{ .temp_dir = owned_temp, .sandbox = opts.sandbox };
 
         const wf_store = try allocator.create(web_fetch.Store);
         errdefer allocator.destroy(wf_store);
         wf_store.* = web_fetch.Store.init(allocator, opts.allow_loopback_web_fetch);
         errdefer wf_store.deinit();
 
-        const bg_mgr: ?*bg_tasks.Manager = if (opts.io) |io| try bg_tasks.Manager.init(allocator, io, opts.cwd) else null;
+        const bg_mgr: ?*bg_tasks.Manager = if (opts.io) |io| try bg_tasks.Manager.initWithSandbox(allocator, io, opts.cwd, opts.sandbox) else null;
         errdefer if (bg_mgr) |mgr| mgr.deinit();
 
         const tool_count: usize = if (bg_mgr != null) 13 else 9;
         const definitions = try a.alloc(agent.Tool, tool_count);
-        definitions[0] = try definition(a, "read", "Read a text file. Output is truncated to 2000 lines or 50 KiB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Maximum number of lines to read\"}},\"required\":[\"path\"],\"additionalProperties\":false}", null, read);
-        definitions[1] = try definition(a, "write", "Create or overwrite a text file, creating parent directories.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}", null, write);
-        definitions[2] = try definition(a, "edit", "Make precise unique exact replacements. All edits match the original file; overlapping edits, duplicates and no-ops are rejected.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"oldText\",\"newText\"],\"additionalProperties\":false},\"minItems\":1,\"maxItems\":1024}},\"required\":[\"path\"],\"additionalProperties\":false}", null, edit);
-        definitions[3] = try definition(a, "bash", "Execute a shell command in the project directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optional timeout in seconds (default 60, maximum 3600).", "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":3600}},\"required\":[\"command\"],\"additionalProperties\":false}", bash_ctx, bash);
-        definitions[4] = try definition(a, "grep", "Search with installed ripgrep, respecting gitignore. Returns paths and line numbers; bounded to 50 KiB and an optional match limit.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"ignoreCase\":{\"type\":\"boolean\"},\"literal\":{\"type\":\"boolean\"},\"context\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, grep);
-        definitions[5] = try definition(a, "find", "Find paths with installed fd/fdfind using glob patterns and gitignore rules. Results are relative to the search directory.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", null, find);
-        definitions[6] = try definition(a, "ls", "List directory entries including dotfiles, sorted by ASCII case-insensitive name; directory names end with a slash.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"additionalProperties\":false}", null, ls);
+        definitions[0] = try definition(a, "read", "Read a text file. Output is truncated to 2000 lines or 50 KiB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Path to the file to read (relative or absolute)\"},\"offset\":{\"type\":\"integer\",\"minimum\":1,\"description\":\"Line number to start reading from (1-indexed)\"},\"limit\":{\"type\":\"integer\",\"minimum\":0,\"description\":\"Maximum number of lines to read\"}},\"required\":[\"path\"],\"additionalProperties\":false}", runtime_ctx, read);
+        definitions[1] = try definition(a, "write", "Create or overwrite a text file, creating parent directories.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"],\"additionalProperties\":false}", runtime_ctx, write);
+        definitions[2] = try definition(a, "edit", "Make precise unique exact replacements. All edits match the original file; overlapping edits, duplicates and no-ops are rejected.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"},\"edits\":{\"type\":\"array\",\"items\":{\"type\":\"object\",\"properties\":{\"oldText\":{\"type\":\"string\"},\"newText\":{\"type\":\"string\"}},\"required\":[\"oldText\",\"newText\"],\"additionalProperties\":false},\"minItems\":1,\"maxItems\":1024}},\"required\":[\"path\"],\"additionalProperties\":false}", runtime_ctx, edit);
+        definitions[3] = try definition(a, "bash", "Execute a shell command in the project directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optional timeout in seconds (default 60, maximum 3600).", "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":3600}},\"required\":[\"command\"],\"additionalProperties\":false}", runtime_ctx, bash);
+        definitions[4] = try definition(a, "grep", "Search with installed ripgrep, respecting gitignore. Returns paths and line numbers; bounded to 50 KiB and an optional match limit.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"glob\":{\"type\":\"string\"},\"ignoreCase\":{\"type\":\"boolean\"},\"literal\":{\"type\":\"boolean\"},\"context\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10000},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", runtime_ctx, grep);
+        definitions[5] = try definition(a, "find", "Find paths with installed fd/fdfind using glob patterns and gitignore rules. Results are relative to the search directory.", "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"required\":[\"pattern\"],\"additionalProperties\":false}", runtime_ctx, find);
+        definitions[6] = try definition(a, "ls", "List directory entries including dotfiles, sorted by ASCII case-insensitive name; directory names end with a slash.", "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100000}},\"additionalProperties\":false}", runtime_ctx, ls);
         definitions[7] = try definition(a, "web_fetch", "Fetch public HTTP(S) web pages with SSRF protection, returning readable text/markdown or raw content plus a cached responseId for pagination via get_content.", "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\",\"description\":\"Public http(s) URL to fetch\"},\"urls\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"maxItems\":10},\"mode\":{\"type\":\"string\",\"enum\":[\"readable\",\"raw\"]},\"redirects\":{\"type\":\"string\",\"enum\":[\"follow\",\"same-origin\"]},\"timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":120}},\"additionalProperties\":false}", wf_store, web_fetch.executeWebFetch);
         definitions[8] = try definition(a, "get_content", "Page through or search stored content returned by web_fetch using responseId.", "{\"type\":\"object\",\"properties\":{\"responseId\":{\"type\":\"string\"},\"url\":{\"type\":\"string\"},\"urlIndex\":{\"type\":\"integer\",\"minimum\":0},\"offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":50000},\"findText\":{\"oneOf\":[{\"type\":\"string\"},{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"minItems\":1,\"maxItems\":10}]},\"findMode\":{\"type\":\"string\",\"enum\":[\"exact\",\"case-insensitive\"]}},\"required\":[\"responseId\"],\"additionalProperties\":false}", wf_store, web_fetch.executeGetContent);
         if (bg_mgr) |mgr| {
@@ -73,9 +75,15 @@ pub const ToolSet = struct {
     }
 };
 
-const BashContext = struct {
+const RuntimeContext = struct {
     temp_dir: []const u8,
+    sandbox: sandbox_mod.Config = .{},
 };
+
+fn sandboxFromContext(context: ?*anyopaque) sandbox_mod.Config {
+    const rt: ?*const RuntimeContext = if (context) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    return if (rt) |r| r.sandbox else .{};
+}
 
 fn definition(a: std.mem.Allocator, name: []const u8, description: []const u8, schema: []const u8, context: ?*anyopaque, execute: @FieldType(agent.Tool, "execute")) !agent.Tool {
     const parsed = try std.json.parseFromSlice(std.json.Value, a, schema, .{});
@@ -121,9 +129,8 @@ fn validate(args: std.json.Value, keys: []const []const u8) !void {
         if (!allowed) return error.UnknownArgument;
     }
 }
-fn resolve(ctx: agent.ToolContext, input: []const u8) ![]u8 {
-    if (input.len == 0 or std.mem.indexOfScalar(u8, input, 0) != null) return error.InvalidPath;
-    return std.fs.path.resolveAlloc(ctx.allocator, &.{ ctx.cwd, input });
+fn resolve(context: ?*anyopaque, ctx: agent.ToolContext, input: []const u8, write_access: bool) ![]u8 {
+    return sandbox_mod.resolveToolPath(ctx.allocator, ctx.io, sandboxFromContext(context), ctx.cwd, input, write_access);
 }
 fn load(ctx: agent.ToolContext, path: []const u8) ![]u8 {
     const stat = try std.Io.Dir.cwd().statFile(ctx.io, path, .{});
@@ -137,9 +144,9 @@ fn load(ctx: agent.ToolContext, path: []const u8) ![]u8 {
     if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.NotUtf8Text;
     return bytes;
 }
-fn read(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+fn read(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     try validate(args, &.{ "path", "offset", "limit" });
-    const path = try resolve(ctx, try string(args, "path"));
+    const path = try resolve(context, ctx, try string(args, "path"), false);
     defer ctx.allocator.free(path);
     const bytes = try load(ctx, path);
     const offset = try positive(args, "offset", 1);
@@ -242,17 +249,17 @@ fn save(ctx: agent.ToolContext, path: []const u8, content: []const u8) !void {
     try file.file.writeStreamingAll(ctx.io, content);
     try file.replace(ctx.io);
 }
-fn write(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+fn write(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     try validate(args, &.{ "path", "content" });
-    const path = try resolve(ctx, try string(args, "path"));
+    const path = try resolve(context, ctx, try string(args, "path"), true);
     defer ctx.allocator.free(path);
     const content = try string(args, "content");
     try save(ctx, path, content);
     return .{ .text = try std.fmt.allocPrint(ctx.allocator, "Wrote {d} bytes to {s}", .{ content.len, path }) };
 }
-fn edit(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+fn edit(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     try validate(args, &.{ "path", "oldText", "newText", "edits" });
-    const path = try resolve(ctx, try string(args, "path"));
+    const path = try resolve(context, ctx, try string(args, "path"), true);
     defer ctx.allocator.free(path);
     const content = try load(ctx, path);
     var entries: std.ArrayList(replacements.Edit) = .empty;
@@ -292,11 +299,11 @@ fn edit(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!a
         .details = try std.json.parseFromSliceLeaky(std.json.Value, ctx.allocator, encoded, .{ .allocate = .alloc_always }),
     };
 }
-fn grep(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+fn grep(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     try validate(args, &.{ "pattern", "path", "glob", "ignoreCase", "literal", "context", "limit" });
     const pattern = try string(args, "pattern");
     const path = if (args.object.get("path") != null) try string(args, "path") else ".";
-    const resolved = try resolve(ctx, path);
+    const resolved = try resolve(context, ctx, path, false);
     defer ctx.allocator.free(resolved);
     const glob = if (args.object.get("glob") != null) try string(args, "glob") else null;
     const ignore_case = if (args.object.get("ignoreCase")) |v| switch (v) {
@@ -307,37 +314,38 @@ fn grep(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!a
         .bool => |b| b,
         else => return error.ExpectedBoolean,
     } else false;
-    const context = if (args.object.get("context")) |v| blk: {
+    const context_lines = if (args.object.get("context")) |v| blk: {
         if (v == .integer and v.integer == 0) break :blk 0;
         if (v == .number_string and std.mem.eql(u8, v.number_string, "0")) break :blk 0;
         break :blk try positive(args, "context", 0);
     } else 0;
     const limit = @min(try positive(args, "limit", 100), 100000);
-    const result = try search.grep(ctx.allocator, ctx.io, .{ .pattern = pattern, .path = resolved, .glob = glob, .ignore_case = ignore_case, .literal = literal, .context = context, .limit = limit });
+    const result = try search.grep(ctx.allocator, ctx.io, .{ .pattern = pattern, .path = resolved, .glob = glob, .ignore_case = ignore_case, .literal = literal, .context = context_lines, .limit = limit, .sandbox = sandboxFromContext(context) });
     return .{ .text = result.text };
 }
-fn find(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+fn find(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     try validate(args, &.{ "pattern", "path", "limit" });
     const pattern = try string(args, "pattern");
     const path = if (args.object.get("path") != null) try string(args, "path") else ".";
-    const resolved = try resolve(ctx, path);
+    const resolved = try resolve(context, ctx, path, false);
     defer ctx.allocator.free(resolved);
     const limit = @min(try positive(args, "limit", 1000), 100000);
-    const result = try search.find(ctx.allocator, ctx.io, .{ .pattern = pattern, .path = resolved, .limit = limit });
+    const result = try search.find(ctx.allocator, ctx.io, .{ .pattern = pattern, .path = resolved, .limit = limit, .sandbox = sandboxFromContext(context) });
     return .{ .text = result.text };
 }
-fn ls(_: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
+fn ls(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
     try validate(args, &.{ "path", "limit" });
     const path = if (args.object.get("path") != null) try string(args, "path") else ".";
-    const resolved = try resolve(ctx, path);
+    const resolved = try resolve(context, ctx, path, false);
     defer ctx.allocator.free(resolved);
     const limit = @min(try positive(args, "limit", 500), 100000);
-    const result = try search.ls(ctx.allocator, ctx.io, .{ .path = resolved, .limit = limit });
+    const result = try search.ls(ctx.allocator, ctx.io, .{ .path = resolved, .limit = limit, .sandbox = sandboxFromContext(context) });
     return .{ .text = result.text };
 }
 fn bash(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anyerror!agent.ToolResult {
-    const bash_ctx: ?*const BashContext = if (context) |ptr| @ptrCast(@alignCast(ptr)) else null;
-    const temp_dir = if (bash_ctx) |b| b.temp_dir else "/tmp";
+    const rt: ?*const RuntimeContext = if (context) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    const temp_dir = if (rt) |r| r.temp_dir else "/tmp";
+    const sb = if (rt) |r| r.sandbox else sandbox_mod.Config{};
     try validate(args, &.{ "command", "timeout" });
     const command = try string(args, "command");
     const seconds = try positive(args, "timeout", 60);
@@ -351,7 +359,7 @@ fn bash(context: ?*anyopaque, ctx: agent.ToolContext, args: std.json.Value) anye
     var select = std.Io.Select(Completion).init(ctx.io, &storage);
     defer select.cancelDiscard();
     try select.concurrent(.timer, shellTimer, .{ ctx.io, seconds });
-    try select.concurrent(.process, shellRun, .{ ctx, temp_dir, command });
+    try select.concurrent(.process, shellRun, .{ ctx, temp_dir, sb, command });
     if (ctx.cancel) |cancel| try select.concurrent(.cancel, shellCancel, .{ cancel, ctx.io });
     return switch (try select.await()) {
         .process => |result| result,
@@ -628,10 +636,10 @@ fn truncateTailText(a: std.mem.Allocator, acc: *const BashAccumulator) !struct {
     };
 }
 
-fn shellRun(ctx: agent.ToolContext, temp_dir: []const u8, command: []const u8) anyerror!agent.ToolResult {
-    var child = try std.process.spawn(ctx.io, .{
+fn shellRun(ctx: agent.ToolContext, temp_dir: []const u8, sb: sandbox_mod.Config, command: []const u8) anyerror!agent.ToolResult {
+    var child = try sandbox_mod.spawn(ctx.allocator, ctx.io, sb, .{
         .argv = &.{ "/bin/sh", "-c", "exec /bin/sh -c \"$1\" 2>&1", "zpi-bash", command },
-        .cwd = .{ .path = ctx.cwd },
+        .cwd = ctx.cwd,
         .pgid = 0,
         .stdin = .ignore,
         .stdout = .pipe,

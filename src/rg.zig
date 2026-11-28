@@ -1,10 +1,11 @@
 //! Read-only grep/find/ls adapters for installed ripgrep and fd. No tool binary
 //! is downloaded; gitignore/glob semantics are delegated to these dependencies.
 const std = @import("std");
+const sandbox_mod = @import("sandbox");
 pub const max_output_bytes = 50 * 1024;
-pub const GrepOptions = struct { pattern: []const u8, path: []const u8 = ".", glob: ?[]const u8 = null, ignore_case: bool = false, literal: bool = false, context: usize = 0, limit: usize = 100 };
-pub const FindOptions = struct { pattern: []const u8, path: []const u8 = ".", limit: usize = 1000 };
-pub const LsOptions = struct { path: []const u8 = ".", limit: usize = 500 };
+pub const GrepOptions = struct { pattern: []const u8, path: []const u8 = ".", glob: ?[]const u8 = null, ignore_case: bool = false, literal: bool = false, context: usize = 0, limit: usize = 100, sandbox: sandbox_mod.Config = .{} };
+pub const FindOptions = struct { pattern: []const u8, path: []const u8 = ".", limit: usize = 1000, sandbox: sandbox_mod.Config = .{} };
+pub const LsOptions = struct { path: []const u8 = ".", limit: usize = 500, sandbox: sandbox_mod.Config = .{} };
 pub const Result = struct { text: []u8, limited: bool = false, matches: usize = 0 };
 
 const Process = struct {
@@ -12,10 +13,13 @@ const Process = struct {
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     cwd: []const u8,
+    sandbox: sandbox_mod.Config = .{},
     fn execute(self: *const Process) anyerror!std.process.RunResult {
-        return std.process.run(self.allocator, self.io, .{
+        var cfg = self.sandbox;
+        if (cfg.isConfined()) cfg.mode = .read_only;
+        return sandbox_mod.run(self.allocator, self.io, cfg, .{
             .argv = self.argv,
-            .cwd = .{ .path = self.cwd },
+            .cwd = self.cwd,
             .stdout_limit = .limited(32 * 1024 * 1024),
             .stderr_limit = .limited(1024 * 1024),
         });
@@ -24,8 +28,8 @@ const Process = struct {
 fn timer(io: std.Io, seconds: i64) std.Io.Cancelable!void {
     try io.sleep(.fromSeconds(seconds), .awake);
 }
-fn runProcess(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8) anyerror!std.process.RunResult {
-    var process = Process{ .allocator = allocator, .io = io, .argv = argv, .cwd = cwd };
+fn runProcess(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8, sb: sandbox_mod.Config) anyerror!std.process.RunResult {
+    var process = Process{ .allocator = allocator, .io = io, .argv = argv, .cwd = cwd, .sandbox = sb };
     const Completion = union(enum) { process: anyerror!std.process.RunResult, timer: std.Io.Cancelable!void };
     var storage: [2]Completion = undefined;
     var selection = std.Io.Select(Completion).init(io, &storage);
@@ -128,7 +132,7 @@ pub fn grep(a: std.mem.Allocator, io: std.Io, options: GrepOptions) !Result {
     defer a.free(context);
     if (options.context > 0) try argv.appendSlice(a, &.{ "--context", context });
     try argv.appendSlice(a, &.{ "--", options.pattern, if (directory) "." else root });
-    const result = runProcess(a, io, argv.items, cwd) catch |err| {
+    const result = runProcess(a, io, argv.items, cwd, options.sandbox) catch |err| {
         if (err == error.FileNotFound) return error.RipgrepNotInstalled;
         return err;
     };
@@ -224,10 +228,10 @@ pub fn find(a: std.mem.Allocator, io: std.Io, options: FindOptions) !Result {
     if (has_path) try argv.append(a, "--full-path");
     if (has_path and !is_absolute and allLower(pattern)) try argv.append(a, "--ignore-case");
     try argv.appendSlice(a, &.{ "--", effective, root });
-    const result = runProcess(a, io, argv.items, root) catch |err| blk: {
+    const result = runProcess(a, io, argv.items, root, options.sandbox) catch |err| blk: {
         if (err != error.FileNotFound) return err;
         argv.items[0] = "fdfind";
-        break :blk runProcess(a, io, argv.items, root) catch |fallback_err| {
+        break :blk runProcess(a, io, argv.items, root, options.sandbox) catch |fallback_err| {
             if (fallback_err == error.FileNotFound) return error.FdNotInstalled;
             return fallback_err;
         };

@@ -53,6 +53,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "context_budget", .module = context_budget } },
     });
     const security = b.addModule("security", .{ .root_source_file = b.path("src/security.zig"), .target = target, .optimize = optimize });
+    const sandbox = b.addModule("sandbox", .{ .root_source_file = b.path("src/sandbox.zig"), .target = target, .optimize = optimize });
+    const worktree = b.addModule("worktree", .{ .root_source_file = b.path("src/worktree.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "sandbox", .module = sandbox }} });
     const audit = b.addModule("audit", .{ .root_source_file = b.path("src/audit.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "security", .module = security }} });
     const agent = b.addModule("agent", .{
         .root_source_file = b.path("src/agent.zig"),
@@ -75,6 +77,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/rg.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "sandbox", .module = sandbox }},
     });
     const web_fetch = b.addModule("web_fetch", .{
         .root_source_file = b.path("src/web_fetch.zig"),
@@ -86,13 +89,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/bg_tasks.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "model", .module = model } },
+        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "model", .module = model }, .{ .name = "sandbox", .module = sandbox } },
     });
     const tools = b.addModule("tools", .{
         .root_source_file = b.path("src/tools.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "replacements", .module = replacements }, .{ .name = "search", .module = search }, .{ .name = "web_fetch", .module = web_fetch }, .{ .name = "bg_tasks", .module = bg_tasks } },
+        .imports = &.{ .{ .name = "agent", .module = agent }, .{ .name = "replacements", .module = replacements }, .{ .name = "search", .module = search }, .{ .name = "web_fetch", .module = web_fetch }, .{ .name = "bg_tasks", .module = bg_tasks }, .{ .name = "sandbox", .module = sandbox } },
     });
     const openai = b.addModule("openai", .{
         .root_source_file = b.path("src/openai.zig"),
@@ -134,7 +137,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/extensions.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "model", .module = model }},
+        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "sandbox", .module = sandbox } },
     });
     const extension_tools = b.addModule("extension_tools", .{
         .root_source_file = b.path("src/extension_tools.zig"),
@@ -166,7 +169,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/mcp.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "version", .module = version } },
+        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "version", .module = version }, .{ .name = "sandbox", .module = sandbox } },
     });
     const mcp_tools = b.addModule("mcp_tools", .{
         .root_source_file = b.path("src/mcp_tools.zig"),
@@ -198,6 +201,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "context_budget", .module = context_budget },
             .{ .name = "compaction", .module = compaction },
             .{ .name = "security", .module = security },
+            .{ .name = "sandbox", .module = sandbox },
             .{ .name = "audit", .module = audit },
             .{ .name = "version", .module = version },
         },
@@ -234,6 +238,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "settings", .module = settings },
             .{ .name = "models_json", .module = models_json },
             .{ .name = "context_files", .module = context_files },
+            .{ .name = "worktree", .module = worktree },
         },
     });
     const doctor = b.createModule(.{
@@ -309,6 +314,8 @@ pub fn build(b: *std.Build) void {
     const skills_tests = b.addTest(.{ .name = "skills-tests", .root_module = skills });
     const tool_selection_tests = b.addTest(.{ .name = "tool-selection-tests", .root_module = tool_selection });
     const security_tests = b.addTest(.{ .name = "security-tests", .root_module = security });
+    const sandbox_tests = b.addTest(.{ .name = "sandbox-tests", .root_module = sandbox });
+    const worktree_tests = b.addTest(.{ .name = "worktree-tests", .root_module = worktree });
     const doctor_tests = b.addTest(.{ .name = "doctor-tests", .root_module = doctor });
     const context_files_tests = b.addTest(.{ .name = "context-files-tests", .root_module = context_files });
     const error_hint_tests = b.addTest(.{ .name = "error-hint-tests", .root_module = error_hint });
@@ -505,6 +512,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(skills_tests).step);
     test_step.dependOn(&b.addRunArtifact(tool_selection_tests).step);
     test_step.dependOn(&b.addRunArtifact(security_tests).step);
+    test_step.dependOn(&b.addRunArtifact(sandbox_tests).step);
+    test_step.dependOn(&b.addRunArtifact(worktree_tests).step);
     test_step.dependOn(&b.addRunArtifact(doctor_tests).step);
     test_step.dependOn(&b.addRunArtifact(context_files_tests).step);
     test_step.dependOn(&b.addRunArtifact(error_hint_tests).step);
@@ -545,6 +554,8 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(skills_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(tool_selection_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(security_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(sandbox_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(worktree_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(doctor_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(context_files_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(error_hint_tests, .{}).step);

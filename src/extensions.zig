@@ -2,6 +2,7 @@
 //! This protocol is a Zpi JSONL boundary, not a pi protocol or security sandbox.
 const std = @import("std");
 const model = @import("model");
+const sandbox_mod = @import("sandbox");
 
 pub const max_line_bytes = 1024 * 1024;
 pub const Config = struct {
@@ -10,6 +11,8 @@ pub const Config = struct {
     sdk_directory: []const u8,
     cwd: []const u8,
     timeout_ms: u32 = 30000,
+    sandbox: sandbox_mod.Config = .{},
+    extra_read_paths: []const []const u8 = &.{},
 };
 pub const Response = struct {
     parsed: std.json.Parsed(std.json.Value),
@@ -39,13 +42,19 @@ pub const Host = struct {
     /// Paths are explicit and absolute. Config strings must outlive Host.
     pub fn start(a: std.mem.Allocator, io: std.Io, config: Config) !Host {
         if (config.timeout_ms == 0 or config.timeout_ms > 300000 or !std.fs.path.isAbsolute(config.host_script) or !std.fs.path.isAbsolute(config.sdk_directory) or !std.fs.path.isAbsolute(config.cwd)) return error.InvalidExtensionConfig;
-        const child = try std.process.spawn(io, .{
+        var extra_reads: std.ArrayList([]const u8) = .empty;
+        defer extra_reads.deinit(a);
+        if (std.fs.path.dirname(config.host_script)) |host_dir| try extra_reads.append(a, host_dir);
+        try extra_reads.append(a, config.sdk_directory);
+        for (config.extra_read_paths) |p| try extra_reads.append(a, p);
+        const child = try sandbox_mod.spawn(a, io, config.sandbox, .{
             .argv = &.{ config.node_exe, config.host_script, config.sdk_directory },
-            .cwd = .{ .path = config.cwd },
+            .cwd = config.cwd,
             .pgid = 0,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .ignore,
+            .extra_read_paths = extra_reads.items,
         });
         return .{ .allocator = a, .io = io, .config = config, .child = child };
     }

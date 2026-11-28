@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const agent = @import("agent");
 const model = @import("model");
+const sandbox_mod = @import("sandbox");
 
 pub const max_log_bytes: usize = 32 * 1024 * 1024;
 pub const max_logs_read_bytes: usize = 50 * 1024;
@@ -90,15 +91,21 @@ pub const Manager = struct {
     tasks: std.ArrayList(*Task) = .empty,
     notifications: std.ArrayList(Notification) = .empty,
     wake_hook: ?WakeHook = null,
+    sandbox: sandbox_mod.Config = .{},
     shutting_down: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8) !*Manager {
+        return initWithSandbox(allocator, io, cwd, .{});
+    }
+
+    pub fn initWithSandbox(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, sb: sandbox_mod.Config) !*Manager {
         const self = try allocator.create(Manager);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .io = io,
             .cwd = try allocator.dupe(u8, if (cwd.len > 0) cwd else "."),
+            .sandbox = sb,
         };
         return self;
     }
@@ -239,9 +246,9 @@ pub const Manager = struct {
         const owned_desc = if (description) |d| try self.allocator.dupe(u8, d) else null;
         errdefer if (owned_desc) |d| self.allocator.free(d);
 
-        var child = try std.process.spawn(self.io, .{
+        var child = try sandbox_mod.spawn(self.allocator, self.io, self.sandbox, .{
             .argv = &.{ "/bin/sh", "-c", "exec /bin/sh -c \"$1\" 2>&1", "zpi-bg", command },
-            .cwd = .{ .path = effective_cwd },
+            .cwd = effective_cwd,
             .pgid = 0,
             .stdin = .ignore,
             .stdout = .pipe,
