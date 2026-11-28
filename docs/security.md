@@ -2,6 +2,21 @@
 
 The opt-in capability and audit contract is defined in [security-capabilities.md](spec/security-capabilities.md). It adds a policy layer without changing the default compatibility behavior.
 
+## Enable secure mode
+
+Secure mode requires an audit log and denies covered operations without a grant. This example selects the `read` tool, grants `filesystem.read`, and records redacted authorization and operation events.
+
+```sh
+mkdir -p -m 700 "$HOME/.zpi/audit"
+zpi --security secure \
+  --audit-log "$HOME/.zpi/audit/review.jsonl" \
+  --tools read \
+  --allow-capability filesystem.read \
+  -p "Read README.md and summarize this project"
+```
+
+Keep the audit directory private. `--tools read` selects the model-callable tool. The `filesystem.read` grant permits that tool to read files accessible to your account. Use OS-level isolation to restrict accessible files. Grant lifetimes and persistent policies are documented in the [capability guide](spec/security-capabilities.md).
+
 Zpi runs with the permissions of the account that launches it. `--cwd` sets the working directory for tools. Enabled tools can read and change other files that the account can access, and `bash` can launch processes and use the network. Use an OS-level isolation boundary and a restricted account when running against untrusted projects or data.
 
 ## Select the resources and executables you trust

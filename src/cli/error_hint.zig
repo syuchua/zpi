@@ -37,6 +37,24 @@ const rules = [_]Rule{
     .{ .name = "EmptyPrompt", .text = "pass a prompt, pipe text on stdin, or run without arguments in a terminal for the TUI", .exit_code = 2 },
     .{ .name = "ConflictingSessionOptions", .text = "--continue, --session and --no-session cannot be combined", .exit_code = 2 },
     .{ .name = "TuiDisabled", .text = "this binary was built with -Dtui=none; use -p, --mode json or --mode rpc", .exit_code = 2 },
+    .{ .name = "InvalidSecurityMode", .text = "choose --security compatibility or --security secure" },
+    .{ .name = "InvalidCapability", .text = "use an exact capability ID such as filesystem.read (see docs/spec/security-capabilities.md)" },
+    .{ .name = "InvalidSecurityPolicy", .text = "pass a policy file with version 1 JSON and a grants array containing valid persistent rules" },
+    .{ .name = "InvalidAuditPath", .text = "--audit-log needs a writable path to a private regular file" },
+    .{ .name = "AuditIdExhausted", .text = "the audit event sequence is exhausted. Start a new audit run" },
+    .{ .name = "InvalidAuditTime", .text = "check the system clock for a timestamp within the audit format range" },
+    .{ .name = "SecureModeRequiresAuditLog", .text = "secure mode requires --audit-log PATH so decisions can be recorded" },
+    .{ .name = "RequestGrantRequiresAuditLog", .text = "one-shot grants require --audit-log PATH for durable authorization records" },
+    .{ .name = "PersistentPolicyRequiresSecureMode", .text = "use --security-policy with --security secure and --audit-log PATH" },
+    .{ .name = "InsecureSecurityPolicyPermissions", .text = "use a regular policy file you own with one hard link and owner-only permissions" },
+    .{ .name = "SecurityPolicyTooLarge", .text = "reduce the policy file to 64 KiB or less" },
+    .{ .name = "SecurityPolicyChanged", .text = "the policy file changed during validation. Inspect it before retrying" },
+    .{ .name = "CapabilityDenied", .text = "check for an explicit deny or a missing grant for the operation" },
+    .{ .name = "UnsupportedTargetScopedGrant", .text = "grant a capability without a target scope" },
+    .{ .name = "AuditLogBusy", .text = "wait for the other process to release the log or select a separate log" },
+    .{ .name = "InvalidAuditFile", .text = "use a regular audit file you own with one hard link and owner-only permissions" },
+    .{ .name = "IncompleteAuditLog", .text = "preserve the log with the partial final record and select a valid log" },
+    .{ .name = "AuditLogFailed", .text = "check write permissions and free space for the audit log" },
     .{ .name = "ProviderNotConfigured", .text = "configure a provider in models.json or choose openai/anthropic; run `zpi doctor` to inspect configuration", .exit_code = 2 },
     .{ .name = "MissingProviderEndpoint", .text = "a configured provider needs baseUrl in models.json or --endpoint", .exit_code = 2 },
     .{ .name = "MissingCredentialEnvironment", .text = "a credential environment variable is unset or empty; run `zpi doctor` to check availability", .exit_code = 2 },
@@ -83,6 +101,13 @@ test "diagnostics keep the error-name line and add static detail only when verbo
     try std.testing.expectEqualStrings("use --mode text|json|print|rpc", hintFor("InvalidMode").?.text);
     try std.testing.expectEqual(@as(u8, 2), hintFor("UnknownOption").?.exit_code);
     try std.testing.expectEqual(@as(u8, 1), hintFor("HttpRequestFailed").?.exit_code);
+    inline for (.{
+        "InvalidSecurityMode",                "InvalidCapability",                 "InvalidSecurityPolicy",      "InvalidAuditPath",
+        "AuditIdExhausted",                   "InvalidAuditTime",                  "SecureModeRequiresAuditLog", "RequestGrantRequiresAuditLog",
+        "PersistentPolicyRequiresSecureMode", "InsecureSecurityPolicyPermissions", "SecurityPolicyTooLarge",     "SecurityPolicyChanged",
+        "CapabilityDenied",                   "UnsupportedTargetScopedGrant",      "AuditLogBusy",               "InvalidAuditFile",
+        "IncompleteAuditLog",                 "AuditLogFailed",
+    }) |name| try std.testing.expect(hintFor(name) != null);
     try std.testing.expect(hintFor("SomeUnlistedError") == null);
     for (&rules) |*rule| {
         try std.testing.expect(rule.text.len > 0);

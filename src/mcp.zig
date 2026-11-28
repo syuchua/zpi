@@ -1,6 +1,7 @@
 //! Experimental MCP stdio transport. One request at a time; no automatic retry.
 const std = @import("std");
 const model = @import("model");
+const build_version = @import("version");
 
 const max_line = 1024 * 1024;
 const max_inbound_frames = 128;
@@ -77,7 +78,7 @@ pub const Client = struct {
             .jsonrpc = "2.0",
             .id = self.next_id,
             .method = "initialize",
-            .params = .{ .protocolVersion = preferred_version, .capabilities = .{}, .clientInfo = .{ .name = "zpi", .version = "0.1.2" } },
+            .params = .{ .protocolVersion = preferred_version, .capabilities = .{}, .clientInfo = .{ .name = "zpi", .version = build_version.VERSION } },
         })).?;
         self.next_id += 1;
         defer reply.deinit();
@@ -290,13 +291,14 @@ fn fixture(script: []const u8, timeout_ms: u32) !Client {
     });
 }
 
-const fixture_handshake_prefix =
+const fixture_handshake_prefix = std.fmt.comptimePrint(
     \\IFS= read -r init
     \\case "$init" in *'"id":1'*'"method":"initialize"'*'"protocolVersion":"2025-11-25"'*) ;; *) exit 12;; esac
-    \\printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"fixture","version":"1"},"capabilities":{"tools":{}}}}'
+    \\case "$init" in *'"clientInfo":{{"name":"zpi","version":"{s}"}}'*) ;; *) exit 14;; esac
+    \\printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","serverInfo":{{"name":"fixture","version":"1"}},"capabilities":{{"tools":{{}}}}}}}}'
     \\IFS= read -r initialized
     \\case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 13;; esac
-;
+, .{build_version.VERSION});
 
 const fixture_handshake = fixture_handshake_prefix ++ "\n" ++
     \\IFS= read -r request

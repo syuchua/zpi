@@ -2716,7 +2716,7 @@ def check_resume_picker(root, environment):
         return transcript.find(marker, start)
 
     try:
-        expect(b'v0.1.2')
+        expect(b'v' + installed_version())
         expect(b'|__ / |  _ \\|_ _|')
         expect(b'[Tools]')
         expect(b'first task alpha')
@@ -4017,6 +4017,39 @@ def check_fullscreen_viewport(root, environment, server):
         os.close(master)
 
 
+def installed_version():
+    output = subprocess.check_output([str(BINARY), '--version'], timeout=5).strip()
+    assert output.startswith(b'zpi '), output
+    return output.removeprefix(b'zpi ')
+
+
+def check_option_diagnostics(root, environment):
+    for args, expected in [
+        (['--bad-flag'], b'zpi: UnknownOption\n'),
+        (['--api-key'], b'zpi: MissingValue\n'),
+    ]:
+        result = run_cli([str(BINARY), *args], input=b'', capture_output=True, timeout=5)
+        assert result.returncode == 2 and result.stderr == expected and not result.stdout, result
+
+    policy = root / 'fixture-private-policy.json'
+    policy.write_text('{"version":2,"grants":[]}')
+    policy.chmod(0o600)
+    for args, error, hint in [
+        (['--security', 'secure'], b'SecureModeRequiresAuditLog', b'secure mode requires --audit-log'),
+        (['--allow-capability=fixture-unknown-id'], b'InvalidCapability', b'use an exact capability ID such as filesystem.read'),
+        (['--security', 'secure', '--audit-log', str(root / 'diagnostic-audit.jsonl'), '--security-policy', str(policy)],
+         b'InvalidSecurityPolicy', b'pass a policy file with version 1 JSON'),
+    ]:
+        command = [str(BINARY), '--no-session', *args]
+        plain = run_cli(command + ['-p', 'fixture-private-prompt'], env=environment, input=b'', capture_output=True, timeout=5)
+        assert plain.returncode == 1 and plain.stderr == b'zpi: ' + error + b'\n' and not plain.stdout, plain
+        verbose = run_cli(command + ['--verbose', '-p', 'fixture-private-prompt'], env=environment, input=b'', capture_output=True, timeout=5)
+        assert verbose.returncode == 1 and not verbose.stdout, verbose
+        assert verbose.stderr.startswith(plain.stderr) and b'zpi: hint: ' + hint in verbose.stderr, verbose
+        for private in (b'fixture-unknown-id', b'fixture-private-prompt', os.fsencode(policy)):
+            assert private not in verbose.stderr, verbose
+
+
 def main():
     server = Server(('127.0.0.1', 0), Handler)
     server.failures = []
@@ -4081,6 +4114,7 @@ def main():
             if sys.argv[1:] == ['--rpc-only']:
                 print('RPC integration passed')
                 return
+            check_option_diagnostics(root, environment)
             check_subagent(root, environment, server)
             check_pi_import(root, common[:-4], environment, server)
             image_provider_config = root / 'image-models.json'
@@ -4303,14 +4337,15 @@ def main():
             mcp_server = root / 'mcp-fixture.py'
             mcp_server.write_text('''import json, sys
 from pathlib import Path
-label = sys.argv[1]
-assert sys.argv[2:] == ["--", "@literal"]
+label, version = sys.argv[1:3]
+assert sys.argv[3:] == ["--", "@literal"]
 initialized = False
 for line in sys.stdin:
     message = json.loads(line)
     assert message["jsonrpc"] == "2.0"
     method = message["method"]
     if method == "initialize":
+        assert message["params"]["clientInfo"] == {"name": "zpi", "version": version}
         result = {"protocolVersion": "2025-06-18", "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": {"tools": {}}}
     elif method == "notifications/initialized":
         assert "id" not in message
@@ -4336,8 +4371,10 @@ for line in sys.stdin:
         raise AssertionError(method)
     print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
 ''')
+            version = installed_version().decode('ascii')
+
             def mcp_child(name):
-                return ['--mcp-stdio', name, '--', sys.executable, str(mcp_server), name, '--', '@literal']
+                return ['--mcp-stdio', name, '--', sys.executable, str(mcp_server), name, version, '--', '@literal']
 
             mcp_common = common[:-1] + [str(root / 'mcp.jsonl')]
             server_fail_session = root / 'mcp-server-error.jsonl'

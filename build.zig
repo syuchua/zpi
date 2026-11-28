@@ -159,11 +159,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const version_options = b.addOptions();
+    version_options.addOption([]const u8, "VERSION", @import("build.zig.zon").version);
+    const version = version_options.createModule();
     const mcp = b.addModule("mcp", .{
         .root_source_file = b.path("src/mcp.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "model", .module = model }},
+        .imports = &.{ .{ .name = "model", .module = model }, .{ .name = "version", .module = version } },
     });
     const mcp_tools = b.addModule("mcp_tools", .{
         .root_source_file = b.path("src/mcp_tools.zig"),
@@ -196,6 +199,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "compaction", .module = compaction },
             .{ .name = "security", .module = security },
             .{ .name = "audit", .module = audit },
+            .{ .name = "version", .module = version },
         },
     });
     const skills = b.createModule(.{ .root_source_file = b.path("src/cli/skills.zig"), .target = target, .optimize = optimize });

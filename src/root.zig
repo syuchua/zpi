@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const VERSION = @import("version").VERSION;
 pub const sse = @import("sse");
 pub const model = @import("model");
 pub const openai = @import("openai");
@@ -19,7 +20,6 @@ pub const compaction = @import("compaction");
 pub const security = @import("security");
 pub const audit = @import("audit");
 
-pub const VERSION = "0.1.2";
 pub const ProviderError = error{
     MissingApiKey,
     HttpRequestFailed,

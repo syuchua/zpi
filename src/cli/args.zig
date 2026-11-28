@@ -294,14 +294,24 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
         if (!positional_only and std.mem.startsWith(u8, arg, "--")) {
             const equals = std.mem.indexOfScalar(u8, arg, '=');
             const name = if (equals) |offset| arg[2..offset] else arg[2..];
+            const option = std.meta.stringToEnum(ValueOption, name) orelse return error.UnknownOption;
             const value = if (equals) |offset| arg[offset + 1 ..] else try takeValue(args, &i);
-            if (std.mem.eql(u8, name, "session-dir")) result.session_dir = value else if (std.mem.eql(u8, name, "system-prompt")) result.system_prompt = value else if (std.mem.eql(u8, name, "tools")) result.tools = value else if (std.mem.eql(u8, name, "exclude-tools")) result.exclude_tools = value else if (std.mem.eql(u8, name, "provider")) {
-                result.provider = value;
-            } else if (std.mem.eql(u8, name, "model")) {
-                result.model = value;
-            } else if (std.mem.eql(u8, name, "thinking")) {
-                result.thinking = zpi.model.ThinkingLevel.parse(value) orelse return error.InvalidThinkingLevel;
-            } else if (std.mem.eql(u8, name, "endpoint")) result.endpoint = value else if (std.mem.eql(u8, name, "api-key")) result.api_key = value else if (std.mem.eql(u8, name, "models-file")) result.models_file = value else if (std.mem.eql(u8, name, "cwd")) result.cwd = value else if (std.mem.eql(u8, name, "session")) result.session = value else if (std.mem.eql(u8, name, "pi-sdk")) result.pi_sdk = value else if (std.mem.eql(u8, name, "extension-host")) result.extension_host = value else return error.UnknownOption;
+            switch (option) {
+                .@"session-dir" => result.session_dir = value,
+                .@"system-prompt" => result.system_prompt = value,
+                .tools => result.tools = value,
+                .@"exclude-tools" => result.exclude_tools = value,
+                .provider => result.provider = value,
+                .model => result.model = value,
+                .thinking => result.thinking = zpi.model.ThinkingLevel.parse(value) orelse return error.InvalidThinkingLevel,
+                .endpoint => result.endpoint = value,
+                .@"api-key" => result.api_key = value,
+                .@"models-file" => result.models_file = value,
+                .cwd => result.cwd = value,
+                .session => result.session = value,
+                .@"pi-sdk" => result.pi_sdk = value,
+                .@"extension-host" => result.extension_host = value,
+            }
             continue;
         }
         if (!positional_only and std.mem.startsWith(u8, arg, "-") and arg.len > 1) return error.UnknownOption;
@@ -333,6 +343,23 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
     if (result.prompt.items.len == 0 and result.include_files.items.len == 0 and result.image_files.items.len == 0 and result.mode != .interactive and result.mode != .rpc and stdin_is_tty) return error.EmptyPrompt;
     return result;
 }
+const ValueOption = enum {
+    @"session-dir",
+    @"system-prompt",
+    tools,
+    @"exclude-tools",
+    provider,
+    model,
+    thinking,
+    endpoint,
+    @"api-key",
+    @"models-file",
+    cwd,
+    session,
+    @"pi-sdk",
+    @"extension-host",
+};
+
 fn sameMcpNamespace(left: []const u8, right: []const u8) bool {
     if (left.len != right.len) return false;
     for (left, right) |a, b| {
@@ -490,6 +517,9 @@ test "CLI parses modes, overrides, positionals and conflicts" {
     try std.testing.expectEqualStrings("three", skills.skills.items[2]);
     try std.testing.expectEqualStrings("four", skills.skills.items[3]);
     try std.testing.expectError(error.MissingValue, parse(std.testing.allocator, &.{"--skills"}, false, false));
+    try std.testing.expectError(error.UnknownOption, parse(std.testing.allocator, &.{"--bad-flag"}, false, false));
+    try std.testing.expectError(error.UnknownOption, parse(std.testing.allocator, &.{"--bad-flag=value"}, false, false));
+    try std.testing.expectError(error.MissingValue, parse(std.testing.allocator, &.{"--api-key"}, false, false));
     try std.testing.expect(skills.no_skills and skills.trust_project_skills);
     var mcp = try parse(std.testing.allocator, &.{ "-p", "prompt", "--mcp-stdio", "demo", "--", "/bin/fixture", "--", "@literal" }, true, true);
     defer mcp.prompt.deinit(std.testing.allocator);
