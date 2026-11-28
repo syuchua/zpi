@@ -1,8 +1,8 @@
 .{
     .name = .zpi,
-    .version = "0.1.3",
+    .version = "0.1.4",
     .fingerprint = 0xbd76949e10dbf1c7,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
-    .paths = .{ "build.zig", "build.zig.zon", "src", "scripts", "docs", "include", "README.md", ".gitignore", "LICENSE" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "scripts", "docs", "include", "install.sh", "README.md", ".gitignore", "LICENSE" },
 }
