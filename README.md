@@ -114,7 +114,7 @@ The performance benchmark document now includes same-host Zpi/pi/rpi measurement
 - [Platform verification](docs/spec/platform-verification.md)
 - [Security notes](docs/security.md), [capability authorization and audit contract](docs/spec/security-capabilities.md), and [execution policy boundaries](docs/spec/security-boundaries.md)
 - [Install, upgrade and remove](docs/install.md)
-- [v0.1.4 release notes](docs/releases/v0.1.4.md), [v0.1.3 release notes](docs/releases/v0.1.3.md), [v0.1.2 release notes](docs/releases/v0.1.2.md), [v0.1.1 release notes](docs/releases/v0.1.1.md), and [v0.1.0 release notes](docs/releases/v0.1.0.md)
+- [v0.1.5 release notes](docs/releases/v0.1.5.md), [v0.1.4 release notes](docs/releases/v0.1.4.md), [v0.1.3 release notes](docs/releases/v0.1.3.md), [v0.1.2 release notes](docs/releases/v0.1.2.md), [v0.1.1 release notes](docs/releases/v0.1.1.md), and [v0.1.0 release notes](docs/releases/v0.1.0.md)
 - [Native plugin ABI](docs/spec/native-plugin-abi.md) and [runtime](docs/spec/native-plugin-runtime.md)
 - [TypeScript extension host](docs/spec/typescript-extension-host.md)
 - [Implementation specification](docs/spec/implementation-spec.md)
