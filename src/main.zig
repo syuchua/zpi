@@ -177,6 +177,7 @@ fn warnUnmatchedTools(io: std.Io, a: std.mem.Allocator, h: *harness.Harness, too
 }
 
 fn run(init: std.process.Init) !void {
+    zpi.sandbox.linux_self_exec_available = true;
     const a = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(a);
     if (argv.len >= 5 and std.mem.eql(u8, argv[1], zpi.sandbox.internal_exec_flag) and std.mem.eql(u8, argv[3], "--")) {

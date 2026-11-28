@@ -2088,6 +2088,7 @@ test "harness lists and resumes sessions in session_dir without mutating state o
         .session = s1_path,
         .session_dir = dir,
         .security_mode = .secure,
+        .sandbox_mode = .off,
         .audit_log = audit_path,
         .allow_capabilities = &.{.process_exec},
         .request_capabilities = &.{.filesystem_write},

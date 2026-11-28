@@ -677,6 +677,7 @@ fn prepareCommand(
         },
         .landlock => blk: {
             if (comptime builtin.target.os.tag != .linux) return error.SandboxBackendUnsupported;
+            if (!linux_self_exec_available) return error.SandboxUnavailable;
             const self_exe = try std.process.executablePathAlloc(io, a);
             const spec_json = try std.json.Stringify.valueAlloc(a, LinuxSandboxSpec{
                 .mode = config.mode.name(),
@@ -728,6 +729,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, config: Config, req: RunRequest) 
 }
 
 pub const internal_exec_flag = "--zpi-internal-sandbox-exec";
+
+/// Set to `true` by executables (such as `src/main.zig`) that dispatch
+/// `internal_exec_flag` to `execInternalLinuxSandbox`. Prevents test binaries
+/// and library embedders without the trampoline from self-execing blindly.
+pub var linux_self_exec_available: bool = false;
 
 const LinuxSandboxSpec = struct {
     mode: []const u8,
@@ -811,13 +817,32 @@ fn linuxAddLandlockPath(ruleset_fd: i32, path: []const u8, access: u64) void {
         .allowed_access = access,
         .parent_fd = @intCast(fd),
     };
-    _ = std.os.linux.syscall4(
+    const rc = std.os.linux.syscall4(
         .landlock_add_rule,
         @as(usize, @intCast(ruleset_fd)),
         LANDLOCK_RULE_PATH_BENEATH,
         @intFromPtr(&attr),
         0,
     );
+    if (@as(isize, @bitCast(rc)) < 0) {
+        // Non-directory files reject directory-only Landlock access flags with EINVAL.
+        const file_only_mask: u64 = LANDLOCK_ACCESS_FS_EXECUTE |
+            LANDLOCK_ACCESS_FS_WRITE_FILE |
+            LANDLOCK_ACCESS_FS_READ_FILE |
+            LANDLOCK_ACCESS_FS_TRUNCATE |
+            LANDLOCK_ACCESS_FS_IOCTL_DEV;
+        const masked = access & file_only_mask;
+        if (masked != 0 and masked != access) {
+            attr.allowed_access = masked;
+            _ = std.os.linux.syscall4(
+                .landlock_add_rule,
+                @as(usize, @intCast(ruleset_fd)),
+                LANDLOCK_RULE_PATH_BENEATH,
+                @intFromPtr(&attr),
+                0,
+            );
+        }
+    }
 }
 
 const SockFilter = extern struct {
@@ -969,6 +994,7 @@ fn execInternalLinuxSandboxImpl(
     inline for (.{ "/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/dev", "/proc", "/sys", "/opt" }) |sys_dir| {
         linuxAddLandlockPath(ruleset_fd, sys_dir, fs_read);
     }
+    if (spec.network) linuxAddLandlockPath(ruleset_fd, "/run", fs_read);
     linuxAddLandlockPath(ruleset_fd, "/dev/null", fs_write_file);
     linuxAddLandlockPath(ruleset_fd, "/dev/zero", fs_write_file);
 
