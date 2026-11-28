@@ -45,7 +45,8 @@ From the root of the source tree, choose a new directory dedicated to this build
 ```sh
 zpi_prefix="$HOME/.local/opt/zpi/local-1"
 zig version
-zig build -Doptimize=ReleaseSafe --prefix "$zpi_prefix"
+zig build --prefix "$zpi_prefix"            # ReleaseSafe by default
+zig build -Doptimize=Debug --prefix "$zpi_prefix-debug"   # separate explicit Debug build
 "$zpi_prefix/bin/zpi" --version
 "$zpi_prefix/bin/zpi" --help
 ```

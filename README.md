@@ -10,6 +10,22 @@
 
 **Zpi is an experimental terminal coding agent written in Zig.** It takes inspiration from [pi](https://github.com/earendil-works/pi) and [pi-rust](https://github.com/bigfish1913/pi-rust), with a focus on native startup, a small standalone executable, and a Zig-native interactive terminal. Zpi is an independent implementation, not a drop-in replacement for pi; the compatibility matrix documents the supported subset.
 
+## First five minutes
+
+Zpi needs Zig **0.17.0** and a supported provider credential. `rg` and `fd` (or `fdfind`) are optional and only power the `grep` and `find` tools.
+
+1. Build and check the install: `zig build` then `./zig-out/bin/zpi --version`. Plain `zig build` produces a ReleaseSafe binary; add `-Doptimize=Debug` for a debug build, or `--release=fast|small` for other modes. `-Dtui=none` builds a headless binary for `-p`, `--mode json` and `--mode rpc`.
+2. Configure a provider in `~/.zpi/agent/models.json` (or point at an existing file with `--models-file`), and provide its credential through the environment or that file.
+3. Run `zpi doctor`. It reports the build mode, the effective provider/model and which file supplied it, whether a credential is available (never its value), `rg`/`fd` availability, Node and the configured pi SDK version, project context opt-in, and terminal capabilities. It makes no network requests, runs no project or user code, and exits 0 with advisories.
+4. Make a first request: `zpi -p "Explain this project"`, or start the interactive UI with `zpi`.
+5. When something fails, rerun with `--verbose`. Diagnostics print the error name plus a static hint and, with `--verbose`, the build mode. They never print configuration values, credentials, URLs, commands, project contents, or child/provider output.
+
+Optional next steps: `zpi --continue` resumes the newest session in this directory; `-s/--skills PATH` and `--prompt-template PATH` add Skills and Markdown commands; run `zpi --help` for the complete flag list and worked examples.
+
+### Project context files
+
+`AGENTS.md` and `CLAUDE.md` in the project root are **untrusted project data**, not commands or authorization. Zpi never loads them implicitly: either pass `--enable-project-context`, or set `"loadProjectContext": true` in the project's own `.zpi/agent/settings.json`. A user-level settings file cannot opt a project in. Loading is bounded to those two regular files, 64 KiB each and 128 KiB total, skips symlinks and oversized or non-UTF-8 files rather than truncating them, and frames the text in the system prompt as data. `--no-context-files` always disables them, overriding either opt-in.
+
 ## At A Glance
 
 | | Zpi | pi |
@@ -95,4 +111,4 @@ The performance benchmark document now includes same-host Zpi/pi/rpi measurement
 - [TypeScript extension host](docs/spec/typescript-extension-host.md)
 - [Implementation specification](docs/spec/implementation-spec.md)
 
-Run the core checks with `zig build test`, `zig build`, `zig fmt --check build.zig build.zig.zon src`, and `python3 scripts/test-cli.py`. The platform verification document lists additional SDK, native-plugin, release, and Linux guest checks.
+Run the core checks with `zig build test`, `zig build`, `zig fmt --check build.zig build.zig.zon src`, and `python3 scripts/test-cli.py`. Plain `zig build` emits ReleaseSafe; use `-Doptimize=Debug` for a debug build or `zig build -Dtui=none` for a headless binary. The platform verification document lists additional SDK, native-plugin, release, and Linux guest checks.

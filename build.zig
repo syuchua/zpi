@@ -189,6 +189,21 @@ pub fn build(b: *std.Build) void {
     const skills = b.createModule(.{ .root_source_file = b.path("src/cli/skills.zig"), .target = target, .optimize = optimize });
     const prompt_templates = b.createModule(.{ .root_source_file = b.path("src/cli/prompt_templates.zig"), .target = target, .optimize = optimize });
     const tool_selection = b.createModule(.{ .root_source_file = b.path("src/cli/tool_selection.zig"), .target = target, .optimize = optimize });
+    const models_json = b.createModule(.{ .root_source_file = b.path("src/cli/models_json.zig"), .target = target, .optimize = optimize });
+    const config = b.createModule(.{
+        .root_source_file = b.path("src/cli/config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "http_headers", .module = http_headers }, .{ .name = "models_json", .module = models_json } },
+    });
+    const settings = b.createModule(.{
+        .root_source_file = b.path("src/cli/settings.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "models_json", .module = models_json } },
+    });
+    const context_files = b.createModule(.{ .root_source_file = b.path("src/cli/context_files.zig"), .target = target, .optimize = optimize });
+    const error_hint = b.createModule(.{ .root_source_file = b.path("src/cli/error_hint.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zpi", .module = core }} });
     const harness = b.addModule("harness", .{
         .root_source_file = b.path("src/harness.zig"),
         .target = target,
@@ -199,13 +214,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "skills", .module = skills },
             .{ .name = "prompt_templates", .module = prompt_templates },
             .{ .name = "tool_selection", .module = tool_selection },
+            .{ .name = "config", .module = config },
+            .{ .name = "settings", .module = settings },
+            .{ .name = "models_json", .module = models_json },
+            .{ .name = "context_files", .module = context_files },
         },
     });
     const doctor = b.createModule(.{
         .root_source_file = b.path("src/cli/doctor.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "harness", .module = harness } },
+        .imports = &.{ .{ .name = "zpi", .module = core }, .{ .name = "config", .module = config }, .{ .name = "settings", .module = settings }, .{ .name = "context_files", .module = context_files }, .{ .name = "error_hint", .module = error_hint }, .{ .name = "skills", .module = skills }, .{ .name = "prompt_templates", .module = prompt_templates } },
     });
     const pi_session = b.createModule(.{
         .root_source_file = b.path("src/pi_session.zig"),
@@ -225,6 +244,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
             .{ .name = "doctor", .module = doctor },
+            .{ .name = "context_files", .module = context_files },
+            .{ .name = "error_hint", .module = error_hint },
         } else &.{
             .{ .name = "zpi", .module = core },
             .{ .name = "harness", .module = harness },
@@ -232,6 +253,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tool_selection", .module = tool_selection },
             .{ .name = "pi_session", .module = pi_session },
             .{ .name = "doctor", .module = doctor },
+            .{ .name = "context_files", .module = context_files },
+            .{ .name = "error_hint", .module = error_hint },
         },
     });
     exe_module.addOptions("build_options", build_options);
@@ -271,6 +294,8 @@ pub fn build(b: *std.Build) void {
     const tool_selection_tests = b.addTest(.{ .name = "tool-selection-tests", .root_module = tool_selection });
     const security_tests = b.addTest(.{ .name = "security-tests", .root_module = security });
     const doctor_tests = b.addTest(.{ .name = "doctor-tests", .root_module = doctor });
+    const context_files_tests = b.addTest(.{ .name = "context-files-tests", .root_module = context_files });
+    const error_hint_tests = b.addTest(.{ .name = "error-hint-tests", .root_module = error_hint });
     const audit_tests = b.addTest(.{ .name = "audit-tests", .root_module = audit });
     const tui_tests = b.addTest(.{ .name = "tui-tests", .root_module = tui });
     const clipboard_tests = b.addTest(.{ .name = "clipboard-tests", .root_module = clipboard });
@@ -465,6 +490,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tool_selection_tests).step);
     test_step.dependOn(&b.addRunArtifact(security_tests).step);
     test_step.dependOn(&b.addRunArtifact(doctor_tests).step);
+    test_step.dependOn(&b.addRunArtifact(context_files_tests).step);
+    test_step.dependOn(&b.addRunArtifact(error_hint_tests).step);
     test_step.dependOn(&b.addRunArtifact(audit_tests).step);
     if (tui_mode == .native) test_step.dependOn(&b.addRunArtifact(tui_tests).step);
     test_step.dependOn(&b.addRunArtifact(clipboard_tests).step);
@@ -503,6 +530,8 @@ pub fn build(b: *std.Build) void {
     test_binaries.dependOn(&b.addInstallArtifact(tool_selection_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(security_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(doctor_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(context_files_tests, .{}).step);
+    test_binaries.dependOn(&b.addInstallArtifact(error_hint_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(audit_tests, .{}).step);
     if (tui_mode == .native) test_binaries.dependOn(&b.addInstallArtifact(tui_tests, .{}).step);
     test_binaries.dependOn(&b.addInstallArtifact(clipboard_tests, .{}).step);

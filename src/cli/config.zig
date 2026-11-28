@@ -2,7 +2,7 @@
 //! auto-loaded by this MVP. Credentials stay in process memory only.
 const std = @import("std");
 const http_headers = @import("http_headers");
-const models_json = @import("models_json.zig");
+const models_json = @import("models_json");
 
 pub const Api = enum { openai_completions, openai_responses, anthropic_messages };
 const zpi = @import("zpi");
@@ -34,8 +34,57 @@ pub const ModelChoice = struct {
     api: Api,
 };
 
+/// Where the effective models configuration came from. Labels are fixed text;
+/// no path or credential value is included.
+pub const Source = enum {
+    default_agent_dir,
+    agent_dir_env,
+    models_file_env,
+    models_file_flag,
+
+    pub fn label(self: Source) []const u8 {
+        return switch (self) {
+            .default_agent_dir => "default ~/.zpi/agent/models.json",
+            .agent_dir_env => "PI_CODING_AGENT_DIR",
+            .models_file_env => "ZPI_MODELS_FILE",
+            .models_file_flag => "--models-file",
+        };
+    }
+};
+
+pub const Loaded = struct {
+    /// Holds the error when loading fails, so callers can report both.
+    selection: Result,
+    source: Source,
+
+    pub const Result = union(enum) {
+        ok: Selection,
+        err: anyerror,
+    };
+};
+
 /// allocator is an invocation arena. All returned slices share its lifetime.
 pub fn load(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, overrides: Overrides) !Selection {
+    return try loadFromProviders(allocator, io, env, overrides);
+}
+
+/// Precedence matches loadProvidersObject; only fixed labels are exposed.
+pub fn loadWithSource(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, overrides: Overrides) Loaded {
+    const source: Source = if (overrides.models_file != null)
+        .models_file_flag
+    else if (env.get("ZPI_MODELS_FILE") != null)
+        .models_file_env
+    else if (env.get("PI_CODING_AGENT_DIR")) |dir|
+        (if (dir.len == 0) Source.default_agent_dir else Source.agent_dir_env)
+    else
+        .default_agent_dir;
+    return .{
+        .selection = if (loadFromProviders(allocator, io, env, overrides)) |selection| .{ .ok = selection } else |err| .{ .err = err },
+        .source = source,
+    };
+}
+
+fn loadFromProviders(allocator: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, overrides: Overrides) anyerror!Selection {
     const providers = try loadProvidersObject(allocator, io, env, overrides.models_file);
     var provider: []const u8 = overrides.provider orelse overrides.default_provider orelse "openai";
     var model_override = overrides.model orelse if (overrides.provider == null or (overrides.default_provider != null and std.mem.eql(u8, overrides.provider.?, overrides.default_provider.?))) overrides.default_model else null;

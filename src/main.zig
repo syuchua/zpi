@@ -7,6 +7,8 @@ const initial_prompt = @import("cli/initial_prompt.zig");
 const rpc = @import("rpc.zig");
 const pi_session = @import("pi_session");
 const doctor = @import("doctor");
+const error_hint = @import("error_hint");
+const context_files = @import("context_files");
 const tui = if (build_options.enable_tui) @import("tui") else struct {};
 const agent = zpi.agent;
 
@@ -72,7 +74,10 @@ const help =
     \\  --audit-log PATH           Append redacted JSONL events (required by secure)
     \\  --enable-project-context   Load AGENTS.md/CLAUDE.md as inert data
     \\  --no-context-files         Disable project context loading
-    \\  --verbose                  Include static, redacted error hints
+    \\  --verbose                  Static build details and hints for every error (stderr)
+    \\  doctor                 Report build mode, models, credentials, search, Node/SDK
+    \\  --enable-project-context Load AGENTS.md/CLAUDE.md from the project root as data
+    \\  --no-context-files     Disable project context files, overriding opt-in
     \\  -h, --help             Show help
     \\  -v, --version          Show version
     \\
@@ -98,33 +103,69 @@ pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
         var buffer: [2048]u8 = undefined;
         var stderr = std.Io.File.stderr().writerStreaming(init.io, &buffer);
-        stderr.interface.print("zpi: {s}\n", .{@errorName(err)}) catch {};
-        var verbose = false;
-        var args = init.minimal.args.iterate();
-        while (args.next()) |arg| if (std.mem.eql(u8, arg, "--verbose")) {
-            verbose = true;
-            break;
-        };
-        if (verbose) {
-            stderr.interface.writeAll("zpi: diagnostics omit paths, credentials, URLs and content\n") catch {};
-            const hint: ?[]const u8 = if (err == error.HttpRequestFailed) "check endpoint connectivity and credential presence; run `zpi doctor`" else if (err == error.ProviderNotConfigured) "configure models.json or set --provider; run `zpi doctor`" else if (err == error.MissingValue) "an option is missing its value; see `zpi --help`" else null;
-            if (hint) |text| stderr.interface.print("zpi: hint: {s}\n", .{text}) catch {};
-        }
+        error_hint.report(&stderr.interface, err, verbose_probe(init)) catch {};
         stderr.interface.flush() catch {};
-        std.process.exit(1);
+        std.process.exit(if (error_hint.hintFor(@errorName(err))) |hint| hint.exit_code else 1);
     };
 }
 
 fn runDoctor(init: std.process.Init, a: std.mem.Allocator, options: *const args_module.Options) !void {
-    var buffer: [4096]u8 = undefined;
+    doctor.tui_built = build_options.enable_tui;
+    var buffer: [8192]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &buffer);
-    try doctor.run(init.io, a, init.environ_map, build_options.enable_tui, &stdout.interface, .{
+    try doctor.run(init.io, a, init.environ_map, &stdout.interface, .{
         .host_cwd = try std.process.currentPathAlloc(init.io, a),
+        .home = init.environ_map.get("HOME"),
+        .environ = init.environ_map,
         .provider = options.provider,
+        .model = options.model,
+        .thinking = options.thinking,
+        .endpoint = options.endpoint,
+        .api_key = options.api_key,
         .models_file = options.models_file,
+        .cwd = options.cwd,
         .pi_sdk = options.pi_sdk,
+        .no_skills = options.no_skills,
+        .skills = options.skills.items,
+        .trust_project_skills = options.trust_project_skills,
+        .no_prompt_templates = options.no_prompt_templates,
+        .prompt_templates = options.prompt_templates.items,
+        .trust_project_prompts = options.trust_project_prompts,
     });
     try stdout.interface.flush();
+}
+
+fn verbose_probe(init: std.process.Init) bool {
+    var it = init.minimal.args.iterate();
+    while (it.next()) |arg| if (std.mem.eql(u8, arg, "--verbose")) return true;
+    return false;
+}
+
+fn loadProjectContext(init: std.process.Init, a: std.mem.Allocator, host_cwd: []const u8, h: *harness.Harness, options: args_module.Options) !void {
+    const opt_in: context_files.OptIn = .{
+        .flag = options.context_files,
+        .suppress = options.no_context_files,
+        .setting = h.projectContextSetting(a),
+    };
+    if (!opt_in.enabled()) return;
+    const doc = try context_files.load(init.io, a, a, host_cwd, opt_in);
+    const formatted = try context_files.formatPrompt(a, doc);
+    h.setProjectContext(formatted);
+    try h.applyProjectContext();
+}
+
+fn warnUnmatchedTools(io: std.Io, a: std.mem.Allocator, h: *harness.Harness, tools: ?[]const u8) !void {
+    if (tools == null) return;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const unmatched = try h.unmatchedToolPatterns(arena.allocator(), tools);
+    if (unmatched.len == 0) return;
+    var buffer: [512]u8 = undefined;
+    var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
+    try stderr.interface.writeAll("zpi: warning: --tools patterns matched no tool:");
+    for (unmatched) |entry| try stderr.interface.print(" \\\"{s}\\\"", .{entry});
+    try stderr.interface.writeByte('\n');
+    try stderr.interface.flush();
 }
 
 fn run(init: std.process.Init) !void {
@@ -264,6 +305,8 @@ fn run(init: std.process.Init) !void {
             std.Io.File.stderr().writeStreamingAll(init.io, "zpi: native plugin retained with undrained work\n") catch {};
         }
     }
+    try loadProjectContext(init, a, host_cwd, h, options);
+    if (options.mode != .rpc) try warnUnmatchedTools(init.io, a, h, options.tools);
     if (options.mode == .rpc) {
         const timings_enabled = std.mem.eql(u8, init.environ_map.get("ZPI_RPC_TIMINGS") orelse "", "1");
         return rpc.run(h, &interrupt.?, timings_enabled);

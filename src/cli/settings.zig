@@ -2,7 +2,7 @@
 //! JSON-with-comments subset as models.json and fails closed on invalid data.
 const std = @import("std");
 const zpi = @import("zpi");
-const models_json = @import("models_json.zig");
+const models_json = @import("models_json");
 
 const max_settings_bytes = 4 * 1024 * 1024;
 
@@ -34,6 +34,12 @@ pub const Settings = struct {
     hide_thinking_block: bool = false,
     tool_outputs_expanded: bool = false,
     quiet_startup: bool = false,
+    /// Project AGENTS.md/CLAUDE.md opt-in. It is honored only when the
+    /// settings file came from the project's own `.zpi/agent/settings.json`,
+    /// never from a user-level agent directory.
+    load_project_context: bool = false,
+    /// True when load() read `<project>/.zpi/agent/settings.json`.
+    project_scoped: bool = false,
 
     pub fn thinkingFor(self: Settings, allocator: std.mem.Allocator, provider: []const u8, model_id: []const u8) !?zpi.model.ThinkingLevel {
         if (self.model_thinking_levels.len > 0) {
@@ -64,9 +70,23 @@ pub const Settings = struct {
 };
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io, launch_cwd: []const u8, env: *const std.process.Environ.Map) !Settings {
-    const path = try settingsFilePath(allocator, launch_cwd, env) orelse return .{};
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_settings_bytes + 1)) catch |err| switch (err) {
-        error.FileNotFound => return .{},
+    return readSettings(allocator, io, try settingsFilePath(allocator, launch_cwd, env));
+}
+
+/// Read only the project's own `.zpi/agent/settings.json`, relative to the
+/// project directory. An agent-directory override cannot redirect this read.
+pub fn loadProjectScoped(allocator: std.mem.Allocator, io: std.Io, project_dir: []const u8, env: *const std.process.Environ.Map) !Settings {
+    _ = env;
+    const project_root = try std.fs.path.resolveAlloc(allocator, &.{project_dir});
+    const default_path = try std.fs.path.join(allocator, &.{ project_root, ".zpi", "agent", "settings.json" });
+    const project = try readSettings(allocator, io, default_path);
+    return .{ .load_project_context = project.load_project_context, .project_scoped = project.load_project_context };
+}
+
+fn readSettings(allocator: std.mem.Allocator, io: std.Io, path: ?[]const u8) !Settings {
+    const resolved = path orelse return .{};
+    const text = std.Io.Dir.cwd().readFileAlloc(io, resolved, allocator, .limited(max_settings_bytes + 1)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return .{},
         error.StreamTooLong => return error.SettingsFileTooLarge,
         else => return err,
     };
@@ -142,6 +162,10 @@ fn parseObject(allocator: std.mem.Allocator, root: std.json.Value) !Settings {
     if (obj.get("toolOutputsExpanded")) |v| {
         if (v != .bool) return error.InvalidSettings;
         out.tool_outputs_expanded = v.bool;
+    }
+    if (obj.get("loadProjectContext")) |v| {
+        if (v != .bool) return error.InvalidSettings;
+        out.load_project_context = v.bool;
     }
     if (obj.get("quietStartup")) |v| {
         switch (v) {
@@ -221,6 +245,7 @@ test "settings loads defaults, per-model overrides, tools, compaction, and retry
         \\  "hideThinkingBlock": true,
         \\  "toolOutputsExpanded": true,
         \\  "quietStartup": true,
+        \\  "loadProjectContext": true,
         \\  "compaction": {
         \\    "enabled": true,
         \\    "reserveTokens": 8192,
@@ -253,6 +278,7 @@ test "settings loads defaults, per-model overrides, tools, compaction, and retry
     try std.testing.expect(s.hide_thinking_block);
     try std.testing.expect(s.tool_outputs_expanded);
     try std.testing.expect(s.quiet_startup);
+    try std.testing.expect(s.load_project_context);
 
     const comp_default = try s.compactionFor(arena.allocator(), "anthropic", "claude-sonnet-4-5");
     try std.testing.expectEqual(@as(u64, 8192), comp_default.reserve_tokens);

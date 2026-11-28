@@ -3,8 +3,8 @@
 //! return values and `Event` callbacks.
 const std = @import("std");
 const zpi = @import("zpi");
-const config = @import("cli/config.zig");
-const settings_mod = @import("cli/settings.zig");
+const config = @import("config");
+const settings_mod = @import("settings");
 const tool_selection = @import("tool_selection");
 const system_prompt = @import("cli/system_prompt.zig");
 const recent_session = @import("cli/recent_session.zig");
@@ -256,6 +256,10 @@ pub const Harness = struct {
     mcp_server_names: []const []const u8 = &.{},
     extension_host: ?zpi.extensions.Host,
     enabled_tools: []agent.Tool,
+    /// Set when the subagent definition was registered; it can match `--tools`.
+    subagent_tool: ?agent.Tool = null,
+    /// Opted-in project context, framed as inert data for the system prompt.
+    project_context: ?[]const u8 = null,
     runtime: agent.Agent,
     sink: ?Sink = null,
     retained_native_warning: bool = false,
@@ -535,6 +539,7 @@ pub const Harness = struct {
         const builtins = try a.alloc(agent.Tool, self.tool_set.tools.len + 1);
         @memcpy(builtins[0..self.tool_set.tools.len], self.tool_set.tools);
         builtins[self.tool_set.tools.len] = try subagent.definition(a, delegation);
+        self.subagent_tool = builtins[self.tool_set.tools.len];
         var registered_tools: []const agent.Tool = builtins;
         self.native_modules = try a.alloc(zpi.native_runtime.Module, options.native_plugins.len);
         errdefer for (self.native_modules[0..self.native_loaded]) |*module| {
@@ -750,6 +755,42 @@ pub const Harness = struct {
     pub fn popBgNotifications(self: *Harness, allocator: std.mem.Allocator) ![]zpi.bg_tasks.Notification {
         if (self.tool_set.bg_manager) |mgr| return try mgr.popNotifications(allocator);
         return try allocator.alloc(zpi.bg_tasks.Notification, 0);
+    }
+
+    /// Report `--tools` patterns that matched no available tool. Selection is
+    /// already final; this only explains it. Entries are validated ASCII-ish
+    /// argv text and are rendered as `pattern "<entry>"` by callers.
+    pub fn unmatchedToolPatterns(self: *const Harness, allocator: std.mem.Allocator, tools: ?[]const u8) ![][]const u8 {
+        var candidates: std.ArrayList(tool_selection.Candidate) = .empty;
+        defer candidates.deinit(allocator);
+        for (self.tool_set.tools) |tool| try candidates.append(allocator, .{ .name = tool.definition.name, .builtin = true });
+        if (self.subagent_tool) |tool| try candidates.append(allocator, .{ .name = tool.definition.name, .builtin = true });
+        for (self.native_modules[0..self.native_loaded]) |*module| {
+            const count = module.toolCount() catch continue;
+            var index: u32 = 0;
+            while (index < count) : (index += 1) {
+                const tool = module.toolAt(index) catch continue;
+                const name = zpi.native_runtime.spanText(tool.name, 64) catch continue;
+                try candidates.append(allocator, .{ .name = name, .builtin = false });
+            }
+        }
+        var unmatched: std.ArrayList([]const u8) = .empty;
+        errdefer unmatched.deinit(allocator);
+        _ = try tool_selection.unmatchedPatterns(&unmatched, allocator, candidates.items, tools);
+        return unmatched.toOwnedSlice(allocator);
+    }
+
+    /// Project AGENTS.md/CLAUDE.md opt-in from the project's own
+    /// `.zpi/agent/settings.json`. A user-level settings file never grants it.
+    pub fn projectContextSetting(self: *Harness, scratch: std.mem.Allocator) bool {
+        const project = settings_mod.loadProjectScoped(scratch, self.io, self.host_cwd, self.environ) catch return false;
+        return project.load_project_context;
+    }
+
+    /// Install already framed project context. The caller owns opt-in,
+    /// loading and bounds; a null value leaves the default prompt untouched.
+    pub fn setProjectContext(self: *Harness, text: ?[]const u8) void {
+        self.project_context = text;
     }
 
     pub fn setSink(self: *Harness, sink: ?Sink) void {
@@ -1601,6 +1642,12 @@ pub const Harness = struct {
 
     fn attachSkills(self: *const Harness, runtime: *agent.Agent) !void {
         if (self.skills_prompt.len == 0) return;
+        try self.replaceSystemPromptUnnotified(runtime, &.{self.skills_prompt});
+    }
+
+    /// Re-emit the active system prompt with extra blocks appended. Project
+    /// context is framed by the caller as untrusted data.
+    fn replaceSystemPromptUnnotified(self: *const Harness, runtime: *agent.Agent, additions: []const []const u8) !void {
         var scratch = std.heap.ArenaAllocator.init(self.gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
@@ -1614,8 +1661,15 @@ pub const Harness = struct {
             };
         }
         const base = if (active.items.len == 0) system_prompt.default_prompt else try std.mem.join(a, "\n", active.items);
-        const indexed = try system_prompt.compose(a, base, &.{self.skills_prompt});
-        try runtime.append(.{ .role = .system, .content = &.{.{ .text = indexed }}, .system_prompt_replace = true });
+        const composed = try system_prompt.compose(a, base, additions);
+        try runtime.append(.{ .role = .system, .content = &.{.{ .text = composed }}, .system_prompt_replace = true });
+    }
+
+    /// Append already loaded project context to the active system prompt.
+    pub fn applyProjectContext(self: *Harness) !void {
+        const text = self.project_context orelse return;
+        try self.replaceSystemPromptUnnotified(&self.runtime, &.{text});
+        try agentEmitErased(self, .{ .message_appended = self.runtime.messages.items[self.runtime.messages.items.len - 1] });
     }
 
     fn summarizeBranch(self: *Harness, departing: []const zpi.session.EntryView) !?[]u8 {
@@ -1663,7 +1717,6 @@ test {
     _ = tool_selection;
     _ = system_prompt;
     _ = recent_session;
-    _ = @import("cli/models_json.zig");
 }
 
 test "harness runs prompt against loopback HTTP server without TTY and tracks stats/thinking/tree" {

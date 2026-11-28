@@ -48,7 +48,7 @@ pub const Options = struct {
     request_capabilities: std.ArrayList(zpi.security.Capability) = .empty,
     session_capabilities: std.ArrayList(zpi.security.Capability) = .empty,
     security_policy_file: ?[]const u8 = null,
-    enable_project_context: bool = false,
+    context_files: bool = false,
     no_context_files: bool = false,
     doctor_subcommand: bool = false,
     verbose: bool = false,
@@ -120,6 +120,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
             result.print_version = true;
             continue;
         }
+
         if (!positional_only and (std.mem.eql(u8, arg, "--image") or std.mem.startsWith(u8, arg, "--image="))) {
             const value = if (std.mem.eql(u8, arg, "--image")) try takeValue(args, &i) else arg[8..];
             if (value.len == 0) return error.EmptyImagePath;
@@ -173,7 +174,7 @@ pub fn parse(allocator: std.mem.Allocator, args: []const [:0]const u8, stdin_is_
             continue;
         }
         if (!positional_only and std.mem.eql(u8, arg, "--enable-project-context")) {
-            result.enable_project_context = true;
+            result.context_files = true;
             continue;
         }
         if (!positional_only and std.mem.eql(u8, arg, "--no-context-files")) {
