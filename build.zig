@@ -1,8 +1,20 @@
 const std = @import("std");
 
+fn defaultOptimizeOption(b: *std.Build) std.builtin.Optimize {
+    const requested = b.option(std.builtin.Optimize, "optimize", "Prioritize performance, safety, or binary size");
+    const debug = b.option(bool, "debug", "Build in Debug mode") orelse false;
+    if (requested) |mode| return mode;
+    if (debug) return .debug;
+    return switch (b.graph.release_mode) {
+        .off, .any, .safe => .safe,
+        .fast => .fast,
+        .small => .small,
+    };
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    const optimize = defaultOptimizeOption(b);
     const TuiMode = enum { native, none };
     const tui_mode = b.option(TuiMode, "tui", "Terminal UI frontend: native (default) or none (headless)") orelse .native;
     const build_options = b.addOptions();
